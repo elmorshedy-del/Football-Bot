@@ -286,7 +286,9 @@ class Engine:
                 "feed_lag_p95": round(lat[int(0.95 * len(lat))], 1) if len(lat) > 20 else None}
 
     async def start(self):
+        store.set_mode(self.mode)
         if self.mode == "live":
+            store.purge_non_live()  # clean demo/legacy rows so live P&L starts fresh
             self.ws = KalshiWS(self.handle_ws, lambda s: setattr(self, "ws_state", s))
             asyncio.create_task(self.ws.run())
             asyncio.create_task(self.discovery_task())

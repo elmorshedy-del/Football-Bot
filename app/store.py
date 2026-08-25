@@ -34,6 +34,9 @@ CREATE TABLE IF NOT EXISTS eventlog(
 """
 
 
+_mode = "demo"
+
+
 def init():
     global _conn
     os.makedirs(config.DATA_DIR, exist_ok=True)
@@ -41,7 +44,28 @@ def init():
                             check_same_thread=False)
     _conn.execute("PRAGMA journal_mode=WAL")
     _conn.executescript(SCHEMA)
+    # migrate: add mode column to older DBs (persisted on a volume)
+    for tbl in ("signals", "trades"):
+        try:
+            _conn.execute(f"ALTER TABLE {tbl} ADD COLUMN mode TEXT")
+        except sqlite3.OperationalError:
+            pass  # already exists
     _conn.commit()
+
+
+def set_mode(m):
+    global _mode
+    _mode = m
+
+
+def purge_non_live():
+    """On a live boot, drop demo/legacy rows so live stats start clean.
+    Live rows (mode='live') are preserved across redeploys; only demo/NULL go."""
+    with _lock:
+        for tbl in ("signals", "trades"):
+            _conn.execute(f"DELETE FROM {tbl} WHERE mode IS NULL OR mode!='live'")
+        _conn.execute("DELETE FROM eventlog")
+        _conn.commit()
 
 
 def ex(sql, args=()):
@@ -75,21 +99,21 @@ def upsert_market(ticker, event, series, title, close_time, status):
 
 def insert_signal(s):
     cur = ex("""INSERT INTO signals(ts_ms,local_ts,market,event,series,dir,dl,levels,size,
-                ref,ext,conf_lag_ms,late,outcome,detail)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ref,ext,conf_lag_ms,late,outcome,detail,mode)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
              (s["ts_ms"], s["local_ts"], s["market"], s["event"], s["series"], s["dir"],
               s["dl"], s["levels"], s["size"], s["ref"], s["ext"], s.get("conf_lag_ms"),
-              1 if s.get("late") else 0, s["outcome"], json.dumps(s.get("detail") or {})))
+              1 if s.get("late") else 0, s["outcome"], json.dumps(s.get("detail") or {}), _mode))
     return cur.lastrowid
 
 
 def insert_trade(t):
     cur = ex("""INSERT INTO trades(signal_id,market,event,series,dir,side,entry_ts,entry_px,
-                size,cap,notional,book_at_entry,status)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'open')""",
+                size,cap,notional,book_at_entry,status,mode)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?)""",
              (t["signal_id"], t["market"], t["event"], t["series"], t["dir"], t["side"],
               t["entry_ts"], t["entry_px"], t["size"], t["cap"], t["notional"],
-              json.dumps(t.get("book_at_entry") or {})))
+              json.dumps(t.get("book_at_entry") or {}), _mode))
     return cur.lastrowid
 
 
