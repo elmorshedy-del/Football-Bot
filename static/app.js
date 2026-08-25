@@ -148,6 +148,11 @@ function updStatus(st) {
   mb.textContent = st.mode === "live" ? "LIVE" : "DEMO";
   mb.className = "badge " + (st.mode === "live" ? "live" : "demo");
   $("demobanner").classList.toggle("hidden", st.mode !== "demo");
+  if (st.cred_error) {
+    $("demobanner").innerHTML = "⚠️ <b>CREDENTIAL ERROR</b> — running demo. " +
+      st.cred_error.replace(/</g, "&lt;") +
+      " &nbsp;Fix: set <b>KALSHI_PRIVATE_KEY_B64</b> (base64 of your .key file) in Railway.";
+  }
   $("demostatus").textContent = st.demo || "";
   const ws = $("chip-ws");
   ws.textContent = "WS " + (st.ws || "—");

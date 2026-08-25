@@ -24,7 +24,19 @@ class Engine:
     def __init__(self, queue):
         self.q = queue
         self.mode = config.mode()
-        self.client = KalshiClient()
+        self.cred_error = ""
+        try:
+            self.client = KalshiClient()
+        except Exception as e:
+            # Bad/mangled credentials must NOT take down the whole service.
+            # Fall back to demo, keep the dashboard up, surface the reason.
+            self.cred_error = str(e)
+            self.mode = "demo"
+            self.client = KalshiClient.__new__(KalshiClient)
+            self.client._key = None
+            import httpx as _httpx
+            self.client._http = _httpx.AsyncClient(base_url=config.KALSHI_REST, timeout=30)
+            self.client.n_requests = self.client.n_429 = self.client.n_retries = 0
         self.detector = Detector()
         self.desk = PaperDesk(self.broadcast)
         self.recorder = RawRecorder()
@@ -269,7 +281,7 @@ class Engine:
                 "markets": len(self.meta), "matches": len(self.event_markets),
                 "trades_seen": self.n_trades, "recorded": self.recorder.total,
                 "kill": self.desk.kill, "open_positions": len(self.desk.positions),
-                "demo": self.demo_status,
+                "demo": self.demo_status, "cred_error": self.cred_error,
                 "feed_lag_p50": round(lat[len(lat) // 2], 1) if lat else None,
                 "feed_lag_p95": round(lat[int(0.95 * len(lat))], 1) if len(lat) > 20 else None}
 

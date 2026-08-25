@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import json
+import re
 import time
 
 import httpx
@@ -12,14 +13,57 @@ from cryptography.hazmat.primitives.asymmetric import padding
 from . import config
 
 
+def _normalize_pem(raw):
+    """Rebuild a clean PEM from a value mangled by env-var/textbox pasting.
+
+    Handles: surrounding quotes, literal backslash-n instead of newlines, all
+    framing collapsed onto one line, stray whitespace in the base64 body.
+    Reconstructs BEGIN/END markers with the body rewrapped at 64 cols so
+    cryptography's parser accepts it regardless of how it arrived.
+    """
+    s = raw.strip().strip('"').strip("'")
+    if "\\n" in s or "\\r" in s:                       # literal escapes
+        s = s.replace("\\r\\n", "\n").replace("\\n", "\n").replace("\\r", "")
+    m = re.search(r"-----BEGIN ([A-Z0-9 ]+?)-----(.*?)-----END \1-----", s, re.DOTALL)
+    if not m:
+        return s                                        # not PEM-shaped; let loader try
+    label, body = m.group(1).strip(), m.group(2)
+    b64 = re.sub(r"[^A-Za-z0-9+/=]", "", body)          # keep only base64 chars
+    wrapped = "\n".join(b64[i:i + 64] for i in range(0, len(b64), 64))
+    return f"-----BEGIN {label}-----\n{wrapped}\n-----END {label}-----\n"
+
+
+def _raw_key_material():
+    if config.KALSHI_PRIVATE_KEY_B64:
+        try:
+            return base64.b64decode(config.KALSHI_PRIVATE_KEY_B64).decode()
+        except Exception as e:
+            raise ValueError(f"KALSHI_PRIVATE_KEY_B64 is not valid base64: {e}")
+    if config.KALSHI_PRIVATE_KEY:
+        return config.KALSHI_PRIVATE_KEY
+    if config.KALSHI_PRIVATE_KEY_PATH:
+        with open(config.KALSHI_PRIVATE_KEY_PATH, "r") as f:
+            return f.read()
+    return None
+
+
 def _load_private_key():
-    pem = config.KALSHI_PRIVATE_KEY
-    if not pem and config.KALSHI_PRIVATE_KEY_PATH:
-        with open(config.KALSHI_PRIVATE_KEY_PATH, "rb") as f:
-            pem = f.read().decode()
-    if not pem:
+    raw = _raw_key_material()
+    if not raw:
         return None
-    return serialization.load_pem_private_key(pem.encode(), password=None)
+    pem = _normalize_pem(raw)
+    try:
+        return serialization.load_pem_private_key(pem.encode(), password=None)
+    except Exception as e:
+        # one more attempt: maybe it was already fine but our regex over-normalized
+        try:
+            return serialization.load_pem_private_key(raw.encode(), password=None)
+        except Exception:
+            raise ValueError(
+                "Kalshi private key could not be parsed even after normalization. "
+                "Paste the FULL key including the BEGIN/END lines, or use "
+                "KALSHI_PRIVATE_KEY_B64 (base64 of the .key file). "
+                f"Underlying error: {e}")
 
 
 class KalshiClient:

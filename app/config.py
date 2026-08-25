@@ -21,6 +21,9 @@ def _b(name, default):
 KALSHI_API_KEY_ID = os.environ.get("KALSHI_API_KEY_ID", "")
 KALSHI_PRIVATE_KEY = os.environ.get("KALSHI_PRIVATE_KEY", "")  # PEM string
 KALSHI_PRIVATE_KEY_PATH = os.environ.get("KALSHI_PRIVATE_KEY_PATH", "")
+# Bulletproof escape hatch: base64 of the whole .key file (no newline issues).
+# Produce with:  base64 -w0 mykey.key   (or: python -c "import base64;print(base64.b64encode(open('mykey.key','rb').read()).decode())")
+KALSHI_PRIVATE_KEY_B64 = os.environ.get("KALSHI_PRIVATE_KEY_B64", "")
 KALSHI_REST = os.environ.get("KALSHI_REST", "https://api.elections.kalshi.com/trade-api/v2")
 KALSHI_WS = os.environ.get("KALSHI_WS", "wss://api.elections.kalshi.com/trade-api/ws/v2")
 
@@ -81,7 +84,8 @@ LEAGUE_PRIOR = {
 
 
 def has_credentials():
-    return bool(KALSHI_API_KEY_ID) and bool(KALSHI_PRIVATE_KEY or KALSHI_PRIVATE_KEY_PATH)
+    return bool(KALSHI_API_KEY_ID) and bool(
+        KALSHI_PRIVATE_KEY or KALSHI_PRIVATE_KEY_PATH or KALSHI_PRIVATE_KEY_B64)
 
 
 def mode():
