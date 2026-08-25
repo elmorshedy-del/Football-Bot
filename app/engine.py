@@ -50,6 +50,7 @@ class Engine:
         self.ws_state = "init"
         self.started = time.time()
         self.n_trades = 0
+        self.n_foreign = 0
         self.demo_status = ""
 
     # ---------- plumbing ----------
@@ -94,10 +95,15 @@ class Engine:
     # ---------- ws routing ----------
     def handle_ws(self, msg, wall, mono):
         t = msg.get("type")
-        if t in ("orderbook_snapshot", "orderbook_delta", "trade", "market_lifecycle_v2"):
-            self.recorder.write(msg, wall, mono)
         body = msg.get("msg") or {}
         ticker = body.get("market_ticker")
+        # defense-in-depth: ignore anything we didn't explicitly subscribe to
+        # (a filterless subscription upstream becomes an all-market firehose)
+        if ticker and ticker not in self.meta and self.mode == "live":
+            self.n_foreign += 1
+            return
+        if t in ("orderbook_snapshot", "orderbook_delta", "trade", "market_lifecycle_v2"):
+            self.recorder.write(msg, wall, mono)
         if t == "orderbook_snapshot":
             b = self.books.setdefault(ticker, Book())
             b.apply_snapshot(body, msg.get("seq"))
@@ -290,6 +296,7 @@ class Engine:
                 "trades_seen": self.n_trades, "recorded": self.recorder.total,
                 "kill": self.desk.kill, "open_positions": len(self.desk.positions),
                 "demo": self.demo_status, "cred_error": self.cred_error,
+                "foreign_dropped": self.n_foreign,
                 "feed_lag_p50": round(lat[len(lat) // 2], 1) if lat else None,
                 "feed_lag_p95": round(lat[int(0.95 * len(lat))], 1) if len(lat) > 20 else None}
 

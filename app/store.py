@@ -64,6 +64,8 @@ def purge_non_live():
     with _lock:
         for tbl in ("signals", "trades"):
             _conn.execute(f"DELETE FROM {tbl} WHERE mode IS NULL OR mode!='live'")
+        # drop firehose-era junk: signals on markets we never registered
+        _conn.execute("DELETE FROM signals WHERE event='?'")
         _conn.execute("DELETE FROM eventlog")
         _conn.commit()
 

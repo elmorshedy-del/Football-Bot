@@ -171,11 +171,25 @@ class KalshiWS:
         return self._cmd_id
 
     async def set_markets(self, tickers):
-        """Reconcile subscription set to `tickers` (adds/removes)."""
+        """Reconcile subscription set to `tickers` (adds/removes).
+
+        CRITICAL: never leave a subscription with zero market filters —
+        Kalshi treats a filterless subscription as ALL MARKETS (firehose).
+        If the wanted set empties, tear the subscription down entirely."""
         async with self._lock:
             want = set(tickers)
             if not self.connected or not want and not self._subscribed:
                 self._subscribed = want if self.connected else set()
+                return
+            if not want and self._subscribed:
+                for sid in (self._orderbook_sid, self._trade_sid):
+                    if sid is not None:
+                        try:
+                            await self._send("unsubscribe", {"sids": [sid]})
+                        except Exception:
+                            pass
+                self._orderbook_sid = self._trade_sid = None
+                self._subscribed = set()
                 return
             add = sorted(want - self._subscribed)
             rem = sorted(self._subscribed - want)
