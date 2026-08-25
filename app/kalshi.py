@@ -33,37 +33,53 @@ def _normalize_pem(raw):
     return f"-----BEGIN {label}-----\n{wrapped}\n-----END {label}-----\n"
 
 
-def _raw_key_material():
+def _candidate_blobs():
+    """Yield byte blobs to try loading, from every supported source/encoding.
+
+    Covers: base64 of a DER key, base64 of a PEM file, a PEM string (possibly
+    with mangled newlines), and a key file path. Order is cheap→robust."""
+    blobs = []
     if config.KALSHI_PRIVATE_KEY_B64:
+        raw = re.sub(r"\s+", "", config.KALSHI_PRIVATE_KEY_B64.strip().strip('"').strip("'"))
         try:
-            return base64.b64decode(config.KALSHI_PRIVATE_KEY_B64).decode()
+            dec = base64.b64decode(raw)          # bytes: could be DER or PEM-text
+            blobs.append(dec)
+            try:                                  # if it's actually PEM text, normalize it
+                blobs.append(_normalize_pem(dec.decode()).encode())
+            except Exception:
+                pass
         except Exception as e:
             raise ValueError(f"KALSHI_PRIVATE_KEY_B64 is not valid base64: {e}")
     if config.KALSHI_PRIVATE_KEY:
-        return config.KALSHI_PRIVATE_KEY
+        blobs.append(_normalize_pem(config.KALSHI_PRIVATE_KEY).encode())
+        blobs.append(config.KALSHI_PRIVATE_KEY.encode())
     if config.KALSHI_PRIVATE_KEY_PATH:
-        with open(config.KALSHI_PRIVATE_KEY_PATH, "r") as f:
-            return f.read()
-    return None
+        with open(config.KALSHI_PRIVATE_KEY_PATH, "rb") as f:
+            data = f.read()
+        blobs.append(data)
+        try:
+            blobs.append(_normalize_pem(data.decode()).encode())
+        except Exception:
+            pass
+    return blobs
 
 
 def _load_private_key():
-    raw = _raw_key_material()
-    if not raw:
+    blobs = _candidate_blobs()
+    if not blobs:
         return None
-    pem = _normalize_pem(raw)
-    try:
-        return serialization.load_pem_private_key(pem.encode(), password=None)
-    except Exception as e:
-        # one more attempt: maybe it was already fine but our regex over-normalized
-        try:
-            return serialization.load_pem_private_key(raw.encode(), password=None)
-        except Exception:
-            raise ValueError(
-                "Kalshi private key could not be parsed even after normalization. "
-                "Paste the FULL key including the BEGIN/END lines, or use "
-                "KALSHI_PRIVATE_KEY_B64 (base64 of the .key file). "
-                f"Underlying error: {e}")
+    errors = []
+    for data in blobs:
+        for loader in (serialization.load_pem_private_key,
+                       serialization.load_der_private_key):
+            try:
+                return loader(data, password=None)
+            except Exception as e:
+                errors.append(f"{loader.__name__.split('_')[1].upper()}: {type(e).__name__}")
+    raise ValueError(
+        "Kalshi private key could not be parsed (tried PEM and DER on all "
+        "provided forms). Ensure KALSHI_PRIVATE_KEY_B64 is the base64 of your "
+        "unencrypted .key file. Attempts: " + ", ".join(dict.fromkeys(errors)))
 
 
 class KalshiClient:
