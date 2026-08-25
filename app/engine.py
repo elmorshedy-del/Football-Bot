@@ -74,6 +74,9 @@ class Engine:
         return [t for t in self.event_markets.get(m["event"], []) if t != ticker]
 
     def is_late(self, ticker):
+        """Late-game gate keyed on the SCHEDULED match end (expected_expiration_time).
+        Production-legal: known before the match, unlike close_time which Kalshi
+        pads days past the game."""
         m = self.meta.get(ticker)
         if self.mode == "demo":
             return True
@@ -212,15 +215,20 @@ class Engine:
                     except Exception:
                         continue
                     for mkt in resp.get("markets") or []:
-                        ct = parse_iso(mkt.get("close_time") or "")
-                        if ct is None:
+                        # KEY: expected_expiration_time = scheduled match end.
+                        # close_time is padded ~3 days past the game — never use it
+                        # for match timing (verified Aug 2026, e.g. UCL close_time
+                        # = game day + 3 while expected_expiration = final whistle).
+                        exp = parse_iso(mkt.get("expected_expiration_time") or "") \
+                            or parse_iso(mkt.get("close_time") or "")
+                        if exp is None:
                             continue
-                        if -config.DROP_AFTER_CLOSE_MIN * 60 < ct - now < \
+                        if -config.DROP_AFTER_CLOSE_MIN * 60 < exp - now < \
                                 config.SUBSCRIBE_BEFORE_CLOSE_MIN * 60:
                             tk = mkt["ticker"]
                             self.register_market(tk, mkt.get("event_ticker", "?"), series,
                                                  mkt.get("title") or mkt.get("subtitle") or tk,
-                                                 mkt.get("close_time"))
+                                                 mkt.get("expected_expiration_time") or mkt.get("close_time"))
                             want.add(tk)
                 if self.ws:
                     await self.ws.set_markets(want)
