@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>Football-Bot — Late-Game Sniper</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;600;700&family=JetBrains+Mono:wght@400;600;800&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
+<link rel="stylesheet" href="style.css"/>
+</head>
+<body>
+<div id="goalflash"></div>
+
+<header>
+  <div class="brand">
+    <span class="ball">⚽</span>
+    <div>
+      <h1>FOOTBALL-BOT</h1>
+      <div class="sub">LATE-GAME SNIPER · KALSHI PAPER DESK</div>
+    </div>
+    <span id="modebadge" class="badge">…</span>
+  </div>
+  <div class="chips">
+    <span class="chip" id="chip-ws">WS —</span>
+    <span class="chip" id="chip-lag">LAG —</span>
+    <span class="chip" id="chip-mkts">0 MKTS</span>
+    <span class="chip" id="chip-rec">REC 0</span>
+    <span class="chip" id="chip-up">UP 0s</span>
+    <button id="soundbtn" class="chip btn" title="goal horn">🔇</button>
+    <button id="killbtn" class="killbtn">KILL SWITCH</button>
+  </div>
+</header>
+
+<div id="demobanner" class="hidden">🎬 <b>DEMO MODE</b> — replaying the real Espanyol–Real Madrid tape (Aug 22, 2026: the 90'+ winner that started this project). Add Kalshi API keys to go live. <span id="demostatus"></span></div>
+
+<section class="tiles">
+  <div class="tile hero"><label>NET P&amp;L (PAPER)</label><div class="v money" id="t-net">$0.00</div></div>
+  <div class="tile"><label>TRADES</label><div class="v" id="t-trades">0</div></div>
+  <div class="tile"><label>WIN RATE</label><div class="v" id="t-win">—</div></div>
+  <div class="tile"><label>NET / FILL</label><div class="v" id="t-npf">—</div></div>
+  <div class="tile"><label>95% CI / FILL</label><div class="v small" id="t-ci">collecting…</div></div>
+  <div class="tile"><label>SIGNALS</label><div class="v" id="t-sigs">0</div></div>
+  <div class="tile"><label>OPEN</label><div class="v" id="t-open">0</div></div>
+  <div class="tile"><label>FEES PAID</label><div class="v" id="t-fees">$0</div></div>
+</section>
+
+<main>
+  <div class="col main-col">
+    <div class="panel">
+      <h2>🏟 LIVE PITCH <span class="hint" id="pitch-hint">matches being watched</span></h2>
+      <div id="matches" class="matches"><div class="empty">waiting for matches…</div></div>
+    </div>
+    <div class="panel">
+      <h2>📡 SIGNAL WIRE <span class="hint">confirmed = sibling swept within ±50ms, opposite sign</span></h2>
+      <div id="signals" class="wire"></div>
+    </div>
+  </div>
+
+  <div class="col side-col">
+    <div class="panel">
+      <h2>💼 PAPER DESK</h2>
+      <div id="openpos"></div>
+      <div class="chart" id="equity"></div>
+      <h3>TRADE LOG</h3>
+      <div class="tablewrap">
+        <table id="tradetable">
+          <thead><tr><th>mkt</th><th>side</th><th>in</th><th>out</th><th>why</th><th>net</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</main>
+
+<section class="analytics">
+  <div class="panel"><h2>🏆 LEAGUE EDGE <span class="hint">live net $ by league · bars = backtest prior ¢/ct</span></h2><div class="chart" id="leagues"></div></div>
+  <div class="panel"><h2>⏱ FEED LATENCY <span class="hint">exchange→here ms (incl clock skew)</span></h2><div class="chart" id="latency"></div></div>
+  <div class="panel"><h2>🚪 EXITS</h2><div class="chart" id="exits"></div></div>
+  <div class="panel killpanel"><h2>💀 KILL CONDITIONS</h2><div id="killconds"></div></div>
+</section>
+
+<footer><div id="ticker" class="ticker"></div></footer>
+
+<script src="app.js"></script>
+</body>
+</html>
