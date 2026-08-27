@@ -12,13 +12,24 @@ from . import config
 
 
 class RawRecorder:
-    def __init__(self):
+    def __init__(self, on_error=None):
         self.dir = os.path.join(config.DATA_DIR, "raw")
-        os.makedirs(self.dir, exist_ok=True)
+        self.on_error = on_error
         self._fh = None
         self._hour = None
         self._n_since_flush = 0
+        self._last_alert_ts = 0.0
         self.total = 0
+        self.failures = 0
+        self.healthy = True
+        self.last_error = None
+        self.last_write_ts = None
+        try:
+            os.makedirs(self.dir, exist_ok=True)
+        except OSError as exc:
+            self.failures = 1
+            self.healthy = False
+            self.last_error = f"{type(exc).__name__}: {exc}"
 
     def _rotate(self):
         hour = time.strftime("%Y%m%d-%H", time.gmtime())
@@ -35,12 +46,35 @@ class RawRecorder:
                                        "lm": round(local_mono, 6), "m": msg},
                                       separators=(",", ":")) + "\n")
             self.total += 1
+            self.last_write_ts = local_wall
+            self.healthy = True
             self._n_since_flush += 1
             if self._n_since_flush >= 200:
                 self._fh.flush()
                 self._n_since_flush = 0
-        except Exception:
-            pass
+        except (OSError, TypeError, ValueError) as exc:
+            self.failures += 1
+            self.healthy = False
+            self.last_error = f"{type(exc).__name__}: {exc}"
+            try:
+                if self._fh:
+                    self._fh.close()
+            except OSError:
+                pass
+            self._fh = None
+            self._hour = None
+            now = time.time()
+            if self.on_error is not None and now - self._last_alert_ts >= 60:
+                self._last_alert_ts = now
+                self.on_error(self.last_error)
+
+    def status(self):
+        return {
+            "healthy": self.healthy,
+            "failures": self.failures,
+            "last_error": self.last_error,
+            "last_write_ts": self.last_write_ts,
+        }
 
     def close(self):
         if self._fh:

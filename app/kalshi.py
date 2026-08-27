@@ -11,6 +11,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
 from . import config
+from .sequence import SubscriptionSequenceTracker
 
 
 def _normalize_pem(raw):
@@ -147,7 +148,10 @@ class KalshiWS:
         self._cmd_id = 0
         self._orderbook_sid = None
         self._trade_sid = None
+        self._lifecycle_sid = None
         self._subscribed = set()
+        self._sequences = SubscriptionSequenceTracker()
+        self._recovering_orderbooks = {}
         self._lock = asyncio.Lock()
         self.connected = False
 
@@ -182,13 +186,16 @@ class KalshiWS:
                 self._subscribed = want if self.connected else set()
                 return
             if not want and self._subscribed:
-                for sid in (self._orderbook_sid, self._trade_sid):
+                for sid in self._subscription_sids():
                     if sid is not None:
                         try:
                             await self._send("unsubscribe", {"sids": [sid]})
                         except Exception:
                             pass
-                self._orderbook_sid = self._trade_sid = None
+                if self._orderbook_sid is not None:
+                    self._sequences.reset(self._orderbook_sid)
+                    self._recovering_orderbooks.pop(self._orderbook_sid, None)
+                self._orderbook_sid = self._trade_sid = self._lifecycle_sid = None
                 self._subscribed = set()
                 return
             add = sorted(want - self._subscribed)
@@ -201,17 +208,90 @@ class KalshiWS:
                 return
             for action, group in (("add_markets", add), ("delete_markets", rem)):
                 if group and self._orderbook_sid is not None:
-                    for sid in (self._orderbook_sid, self._trade_sid):
+                    for sid in self._subscription_sids():
                         if sid is not None:
                             await self._send("update_subscription",
                                              {"sid": sid, "action": action, "market_tickers": group})
             self._subscribed = want
+            for recovery_sid, pending in list(self._recovering_orderbooks.items()):
+                pending.intersection_update(want)
+                if not pending:
+                    self._recovering_orderbooks.pop(recovery_sid, None)
+
+    def _subscription_sids(self):
+        return tuple(dict.fromkeys(sid for sid in (
+            self._orderbook_sid, self._trade_sid, self._lifecycle_sid,
+        ) if sid is not None))
+
+    def _record_subscription(self, channel, sid):
+        if channel == "orderbook_delta":
+            self._orderbook_sid = sid
+        elif channel == "trade":
+            self._trade_sid = sid
+        elif channel == "market_lifecycle_v2":
+            self._lifecycle_sid = sid
 
     async def request_snapshot(self, ticker):
-        if self._orderbook_sid is not None:
-            await self._send("update_subscription", {"sid": self._orderbook_sid,
-                                                     "action": "get_snapshot",
-                                                     "market_tickers": [ticker]})
+        async with self._lock:
+            if self._orderbook_sid is not None and ticker in self._subscribed:
+                await self._send("update_subscription", {"sid": self._orderbook_sid,
+                                                         "action": "get_snapshot",
+                                                         "market_tickers": [ticker]})
+
+    async def _recover_orderbook(self, sid, expected, received):
+        """Invalidate books and request snapshots without replacing the stream.
+
+        Kalshi documents ``get_snapshot`` as a non-mutating subscription update.
+        Keeping the same subscription id avoids stale-stream and id-reuse races
+        caused by unsubscribe/resubscribe recovery.
+        """
+        async with self._lock:
+            active_sid = self._orderbook_sid if self._orderbook_sid is not None else sid
+            if active_sid is None or (self._orderbook_sid is not None and sid != active_sid):
+                return
+            tickers = sorted(self._subscribed)
+            self._recovering_orderbooks[active_sid] = set(tickers)
+            self.on_message({
+                "type": "orderbook_gap",
+                "msg": {"sid": active_sid, "expected": expected, "received": received,
+                        "market_tickers": tickers},
+            }, time.time(), time.monotonic())
+            if tickers:
+                await self._send("update_subscription", {
+                    "sid": active_sid,
+                    "action": "get_snapshot",
+                    "market_tickers": tickers,
+                })
+
+    async def _accept_orderbook_frame(self, message):
+        """Validate and recovery-gate one order-book frame."""
+        sid = message.get("sid")
+        if not self._subscribed:
+            return False
+        if self._orderbook_sid is not None and sid != self._orderbook_sid:
+            return False
+
+        seq = message.get("seq")
+        previous = self._sequences.last(sid)
+        status = self._sequences.track(sid, seq)
+        if status == "duplicate":
+            return False
+        if status == "gap":
+            expected = previous + 1 if previous is not None else seq
+            await self._recover_orderbook(sid, expected, seq)
+            return False
+
+        pending = self._recovering_orderbooks.get(sid)
+        if pending is None:
+            return True
+        body = message.get("msg") or {}
+        ticker = body.get("market_ticker")
+        if message.get("type") == "orderbook_snapshot" and ticker in pending:
+            pending.remove(ticker)
+            if not pending:
+                self._recovering_orderbooks.pop(sid, None)
+            return True
+        return ticker not in pending
 
     async def run(self):
         """Connect-consume-reconnect loop."""
@@ -222,7 +302,9 @@ class KalshiWS:
                                               max_size=2 ** 23) as ws:
                     self._ws = ws
                     self.connected = True
-                    self._orderbook_sid = self._trade_sid = None
+                    self._orderbook_sid = self._trade_sid = self._lifecycle_sid = None
+                    self._sequences.reset()
+                    self._recovering_orderbooks.clear()
                     subs = self._subscribed
                     self._subscribed = set()
                     self.on_state("connected")
@@ -235,9 +317,12 @@ class KalshiWS:
                             ch = (m.get("msg") or {}).get("channel")
                             sid = (m.get("msg") or {}).get("sid")
                             if ch == "orderbook_delta":
-                                self._orderbook_sid = sid
-                            elif ch == "trade":
-                                self._trade_sid = sid
+                                if self._orderbook_sid != sid and self._sequences.last(sid) is None:
+                                    self._sequences.reset(sid)
+                            self._record_subscription(ch, sid)
+                        if (t in ("orderbook_snapshot", "orderbook_delta")
+                                and not await self._accept_orderbook_frame(m)):
+                            continue
                         self.on_message(m, time.time(), time.monotonic())
             except Exception as e:
                 self.connected = False

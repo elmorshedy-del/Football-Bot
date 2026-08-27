@@ -21,9 +21,16 @@ class Book:
         self.last_seq = seq
         self.ok = True
 
-    def apply_delta(self, msg, seq):
-        """Returns False on sequence gap (caller should request a snapshot)."""
-        if self.last_seq is not None and seq is not None and seq != self.last_seq + 1:
+    def apply_delta(self, msg, seq, sequence_validated=False):
+        """Apply one delta after optional subscription-level validation.
+
+        Kalshi sequences the entire WebSocket subscription, not each ticker.
+        Live routing therefore validates sequence numbers once per ``sid`` and
+        passes ``sequence_validated=True``.  The legacy per-book check remains
+        available for isolated callers and old replay fixtures.
+        """
+        if (not sequence_validated and self.last_seq is not None and seq is not None
+                and seq != self.last_seq + 1):
             self.ok = False
             return False
         self.last_seq = seq if seq is not None else self.last_seq
