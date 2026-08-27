@@ -38,10 +38,11 @@ class Engine:
             self.client._http = _httpx.AsyncClient(base_url=config.KALSHI_REST, timeout=30)
             self.client.n_requests = self.client.n_429 = self.client.n_retries = 0
         self.detector = Detector()
-        self.desk = PaperDesk(self.broadcast)
+        self.desk = PaperDesk(self.broadcast, self.on_paper_entry_result)
         self.recorder = RawRecorder()
         self.books = {}
         self.meta = {}                 # ticker -> {event, series, title, close_time}
+        self.fee_schedules = {}        # series -> (fee_type, fee_multiplier)
         self.event_markets = {}        # event -> [tickers]
         self.prices = {}               # ticker -> {last,bid,ask,spark:deque,dirty}
         self.pending = []              # candidates awaiting sibling confirmation
@@ -60,9 +61,11 @@ class Engine:
         except asyncio.QueueFull:
             pass
 
-    def register_market(self, ticker, event, series, title, close_time):
+    def register_market(self, ticker, event, series, title, close_time,
+                        fee_type="quadratic", fee_multiplier=1.0):
         self.meta[ticker] = {"event": event, "series": series, "title": title,
-                             "close_time": close_time}
+                             "close_time": close_time, "fee_type": fee_type,
+                             "fee_multiplier": fee_multiplier}
         self.event_markets.setdefault(event, [])
         if ticker not in self.event_markets[event]:
             self.event_markets[event].append(ticker)
@@ -107,13 +110,16 @@ class Engine:
         if t == "orderbook_snapshot":
             b = self.books.setdefault(ticker, Book())
             b.apply_snapshot(body, msg.get("seq"))
+            self.desk.apply_book_snapshot(ticker, b)
             self.on_book(ticker)
         elif t == "orderbook_delta":
             b = self.books.setdefault(ticker, Book())
             if not b.apply_delta(body, msg.get("seq")):
+                self.desk.invalidate_books([ticker])
                 if self.ws:
                     asyncio.get_event_loop().create_task(self.ws.request_snapshot(ticker))
             else:
+                self.desk.apply_book_delta(ticker, body, msg.get("seq"))
                 self.on_book(ticker)
         elif t == "trade":
             ts_ms = body.get("ts_ms") or (body.get("ts", 0) * 1000)
@@ -200,6 +206,11 @@ class Engine:
             self.record_signal(cand, lag, "not_late")
             return
         m = self.meta.get(cand["ticker"], {"event": "?", "series": "?"})
+        if config.PAPER_EXECUTION_V2:
+            sid = self.record_signal(cand, lag, "queued")
+            self.desk.queue_enter(sid, cand, m)
+            store.add_latency("decision_ms", (time.monotonic() - decision_start) * 1000)
+            return
         book = self.books.get(cand["ticker"])
         sid = None
         outcome = self.desk.try_enter(0, cand, m, book)
@@ -208,7 +219,36 @@ class Engine:
         if outcome == "filled":
             self.detector.state(cand["ticker"]).last_entry_ms = cand["ts_ms"]
 
+    def on_paper_entry_result(self, signal_id, cand, outcome, detail):
+        """Finalize a queued paper signal after its simulated arrival."""
+        if outcome == "filled":
+            self.detector.state(cand["ticker"]).last_entry_ms = cand["ts_ms"]
+        self.broadcast({
+            "type": "signal_update",
+            "signal": {"id": signal_id, "outcome": outcome, "detail": detail},
+        })
+        store.log_event(
+            "signal", f"{outcome.upper()} {cand['ticker']} after "
+            f"{detail.get('paper_latency_ms', 0):.1f}ms paper latency",
+        )
+
     # ---------- background tasks ----------
+    async def _fee_schedule(self, series):
+        if series in self.fee_schedules:
+            return self.fee_schedules[series]
+        try:
+            response = await self.client.get(f"/series/{series}")
+            metadata = response.get("series") or {}
+            fee_type = metadata.get("fee_type")
+            multiplier = metadata.get("fee_multiplier")
+            if fee_type is None or multiplier is None:
+                return None, None
+            schedule = fee_type, float(multiplier)
+            self.fee_schedules[series] = schedule
+            return schedule
+        except (RuntimeError, TypeError, ValueError):
+            return None, None
+
     async def discovery_task(self):
         while True:
             try:
@@ -220,6 +260,7 @@ class Engine:
                                                      status="open", limit=1000)
                     except Exception:
                         continue
+                    fee_type, fee_multiplier = await self._fee_schedule(series)
                     for mkt in resp.get("markets") or []:
                         # KEY: expected_expiration_time = scheduled match end.
                         # close_time is padded ~3 days past the game — never use it
@@ -234,7 +275,8 @@ class Engine:
                             tk = mkt["ticker"]
                             self.register_market(tk, mkt.get("event_ticker", "?"), series,
                                                  mkt.get("title") or mkt.get("subtitle") or tk,
-                                                 mkt.get("expected_expiration_time") or mkt.get("close_time"))
+                                                 mkt.get("expected_expiration_time") or mkt.get("close_time"),
+                                                 fee_type, fee_multiplier)
                             want.add(tk)
                 if self.ws:
                     await self.ws.set_markets(want)
@@ -289,12 +331,24 @@ class Engine:
                 self.broadcast({"type": "stats", "stats": store.stats(),
                                 "status": self.status()})
 
+    async def paper_execution_task(self):
+        """Low-jitter clock for opt-in paper order arrivals."""
+        delay = max(config.PAPER_EXECUTION_POLL_MS, 1.0) / 1000.0
+        while True:
+            try:
+                self.desk.process_pending(self.books)
+            except Exception as exc:
+                store.log_event("paper", f"execution adapter error: {exc!r}")
+                self.broadcast({"type": "log", "text": f"paper execution error: {exc!r}"})
+            await asyncio.sleep(delay)
+
     def status(self):
         lat = sorted(self.feed_lag)
         return {"mode": self.mode, "ws": self.ws_state, "uptime_s": int(time.time() - self.started),
                 "markets": len(self.meta), "matches": len(self.event_markets),
                 "trades_seen": self.n_trades, "recorded": self.recorder.total,
                 "kill": self.desk.kill, "open_positions": len(self.desk.positions),
+                "paper_pending": len(self.desk.pending_entries) + len(self.desk.pending_exits),
                 "demo": self.demo_status, "cred_error": self.cred_error,
                 "foreign_dropped": self.n_foreign,
                 "feed_lag_p50": round(lat[len(lat) // 2], 1) if lat else None,
@@ -304,6 +358,8 @@ class Engine:
         store.set_mode(self.mode)
         if self.mode == "live":
             store.purge_non_live()  # clean demo/legacy rows so live P&L starts fresh
+            if config.PAPER_EXECUTION_V2:
+                self.desk.restore_open_positions(store.load_open_paper_positions())
             self.ws = KalshiWS(self.handle_ws, lambda s: setattr(self, "ws_state", s))
             asyncio.create_task(self.ws.run())
             asyncio.create_task(self.discovery_task())
@@ -314,4 +370,6 @@ class Engine:
             asyncio.create_task(DemoReplay(self).run())
             self.ws_state = "demo"
             store.log_event("sys", "engine started in DEMO mode (replaying real Madrid tapes)")
+        if config.PAPER_EXECUTION_V2:
+            asyncio.create_task(self.paper_execution_task())
         asyncio.create_task(self.periodic_task())

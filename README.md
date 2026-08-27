@@ -69,6 +69,26 @@ to the defaults. Notable ones:
 | `CONF_MS` / `CONF_SIGN` | 50 / true | sibling confirmation window / opposite-sign requirement |
 | `LATE_ONLY` | false | trade only within `LATE_WINDOW_MIN` of scheduled close |
 | `USE_STOP` | false | stops off per Gate A forensics (shadow-stop is always recorded) |
+| `PAPER_EXECUTION_V2` | false | opt into latency-aware paper arrivals, shadow liquidity, and entry/exit depth walking |
+
+### Realistic paper execution (opt-in)
+
+Set `PAPER_EXECUTION_V2=true` to route confirmed signals through the isolated V2
+paper adapter. The detector, Gate-A thresholds, sibling confirmation, price cap,
+notional, target, stop, and timeout rules remain unchanged. Only fill mechanics
+change: orders reach the latest valid book after configurable latency, consume a
+counterfactual shadow book, retain partial exit remainders, and record the actual
+volume-weighted average price across every level walked. The live Kalshi book is
+never mutated. Turning the flag off restores the original immediate paper desk.
+
+V2 also persists every entry/exit level and fee in `paper_fills`, commits the
+signal result and trade atomically, retries database failures without losing
+paper depth, resumes partial stop/timeout/flatten exits, and restores open paper
+positions after restart. Live fee type/multiplier metadata comes from Kalshi's
+`/series/{series_ticker}` endpoint; an unknown or unsupported schedule is
+recorded as `unsupported_fee` instead of guessing profitability. K1 verifies
+fills against the saved arrival book after 25 fills, K2 cannot pass before 50
+confirmed signals, and K4 measures total signal-to-paper-arrival latency.
 
 ## Architecture
 

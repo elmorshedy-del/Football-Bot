@@ -26,7 +26,14 @@ CREATE TABLE IF NOT EXISTS trades(
   entry_ts REAL, entry_px REAL, size REAL, cap REAL, notional REAL,
   exit_ts REAL, exit_px REAL, exit_reason TEXT,
   gross REAL, fees REAL, net REAL, mae REAL, shadow_stop_px REAL,
-  book_at_entry TEXT, status TEXT DEFAULT 'open');
+  book_at_entry TEXT, status TEXT DEFAULT 'open',
+  remaining REAL, realized_gross REAL DEFAULT 0, accrued_fees REAL DEFAULT 0,
+  exit_qty REAL DEFAULT 0, exit_vwap_num REAL DEFAULT 0,
+  fee_type TEXT, fee_multiplier REAL);
+CREATE TABLE IF NOT EXISTS paper_fills(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, trade_id INTEGER, signal_id INTEGER,
+  ts REAL, leg TEXT, side TEXT, price REAL, quantity REAL, notional REAL,
+  fee REAL, reason TEXT, mode TEXT);
 CREATE TABLE IF NOT EXISTS latency(
   ts REAL, kind TEXT, ms REAL);
 CREATE TABLE IF NOT EXISTS eventlog(
@@ -48,6 +55,19 @@ def init():
     for tbl in ("signals", "trades"):
         try:
             _conn.execute(f"ALTER TABLE {tbl} ADD COLUMN mode TEXT")
+        except sqlite3.OperationalError:
+            pass  # already exists
+    for column, definition in (
+        ("remaining", "REAL"),
+        ("realized_gross", "REAL DEFAULT 0"),
+        ("accrued_fees", "REAL DEFAULT 0"),
+        ("exit_qty", "REAL DEFAULT 0"),
+        ("exit_vwap_num", "REAL DEFAULT 0"),
+        ("fee_type", "TEXT"),
+        ("fee_multiplier", "REAL"),
+    ):
+        try:
+            _conn.execute(f"ALTER TABLE trades ADD COLUMN {column} {definition}")
         except sqlite3.OperationalError:
             pass  # already exists
     _conn.commit()
@@ -109,6 +129,28 @@ def insert_signal(s):
     return cur.lastrowid
 
 
+def update_signal_outcome(signal_id, outcome, detail=None):
+    ex("UPDATE signals SET outcome=?, detail=? WHERE id=?",
+       (outcome, json.dumps(detail or {}), signal_id))
+
+
+def finish_paper_signal(signal_id, outcome, detail, latency_ms, order_arrival_ms=None):
+    """Atomically finalize a non-fill paper signal and its latency sample."""
+    with _lock:
+        try:
+            _conn.execute("UPDATE signals SET outcome=?, detail=? WHERE id=?",
+                          (outcome, json.dumps(detail or {}), signal_id))
+            _conn.execute("INSERT INTO latency(ts,kind,ms) VALUES(?,?,?)",
+                          (time.time(), "paper_entry", latency_ms))
+            if order_arrival_ms is not None:
+                _conn.execute("INSERT INTO latency(ts,kind,ms) VALUES(?,?,?)",
+                              (time.time(), "order_arrival", order_arrival_ms))
+            _conn.commit()
+        except Exception:
+            _conn.rollback()
+            raise
+
+
 def insert_trade(t):
     cur = ex("""INSERT INTO trades(signal_id,market,event,series,dir,side,entry_ts,entry_px,
                 size,cap,notional,book_at_entry,status,mode)
@@ -119,10 +161,126 @@ def insert_trade(t):
     return cur.lastrowid
 
 
+def open_paper_trade(t, detail, fill_levels, entry_fee, latency_ms, order_arrival_ms=None):
+    """Atomically open a realistic paper trade, fills, and signal outcome."""
+    with _lock:
+        try:
+            cur = _conn.execute(
+                """INSERT INTO trades(signal_id,market,event,series,dir,side,entry_ts,entry_px,
+                       size,cap,notional,book_at_entry,status,mode,remaining,realized_gross,
+                       accrued_fees,exit_qty,exit_vwap_num,fee_type,fee_multiplier)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?, ?, 0, ?, 0, 0, ?, ?)""",
+                (t["signal_id"], t["market"], t["event"], t["series"], t["dir"], t["side"],
+                 t["entry_ts"], t["entry_px"], t["size"], t["cap"], t["notional"],
+                 json.dumps(t.get("book_at_entry") or {}), _mode, t["size"], entry_fee,
+                 t.get("fee_type"), t.get("fee_multiplier")),
+            )
+            trade_id = cur.lastrowid
+            _conn.execute("UPDATE signals SET outcome='filled', detail=? WHERE id=?",
+                          (json.dumps(detail or {}), t["signal_id"]))
+            _conn.execute("INSERT INTO latency(ts,kind,ms) VALUES(?,?,?)",
+                          (time.time(), "paper_entry", latency_ms))
+            if order_arrival_ms is not None:
+                _conn.execute("INSERT INTO latency(ts,kind,ms) VALUES(?,?,?)",
+                              (time.time(), "order_arrival", order_arrival_ms))
+            for price, quantity, fee in fill_levels:
+                _conn.execute(
+                    """INSERT INTO paper_fills(trade_id,signal_id,ts,leg,side,price,quantity,
+                           notional,fee,reason,mode) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (trade_id, t["signal_id"], t["entry_ts"], "entry", t["side"], price,
+                     quantity, price * quantity / 100.0, fee, "entry", _mode),
+                )
+            _conn.commit()
+            return trade_id
+        except Exception:
+            _conn.rollback()
+            raise
+
+
+def record_paper_exit(tid, signal_id, side, ts, reason, fill_levels, progress,
+                      latency_ms, final=None):
+    """Atomically persist exit fills, position progress, and optional close."""
+    with _lock:
+        try:
+            for price, quantity, fee in fill_levels:
+                _conn.execute(
+                    """INSERT INTO paper_fills(trade_id,signal_id,ts,leg,side,price,quantity,
+                           notional,fee,reason,mode) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (tid, signal_id, ts, "exit", side, price, quantity,
+                     price * quantity / 100.0, fee, reason, _mode),
+                )
+            fields = [
+                progress["remaining"], progress["realized_gross"],
+                progress["accrued_fees"], progress["exit_qty"],
+                progress["exit_vwap_num"], tid,
+            ]
+            _conn.execute(
+                """UPDATE trades SET remaining=?, realized_gross=?, accrued_fees=?,
+                       exit_qty=?, exit_vwap_num=? WHERE id=?""",
+                fields,
+            )
+            _conn.execute("INSERT INTO latency(ts,kind,ms) VALUES(?,?,?)",
+                          (time.time(), "paper_exit", latency_ms))
+            if final is not None:
+                _conn.execute(
+                    """UPDATE trades SET exit_ts=?, exit_px=?, exit_reason=?, gross=?, fees=?,
+                           net=?, mae=?, shadow_stop_px=?, status='closed' WHERE id=?""",
+                    (ts, final["exit_px"], reason, final["gross"], final["fees"],
+                     final["net"], final["mae"], final["shadow_stop_px"], tid),
+                )
+            _conn.commit()
+        except Exception:
+            _conn.rollback()
+            raise
+
+
+def load_open_paper_positions():
+    """Return durable open-position state for process restart recovery."""
+    return q(
+        """SELECT t.*, s.ref, s.ext,
+                  COALESCE((SELECT SUM(f.fee) FROM paper_fills f
+                            WHERE f.trade_id=t.id AND f.leg='entry'), 0) AS entry_fees
+             FROM trades t LEFT JOIN signals s ON s.id=t.signal_id
+            WHERE t.status='open' AND t.mode=? ORDER BY t.id""",
+        (_mode,),
+    )
+
+
 def close_trade(tid, exit_px, reason, gross, fees, net, mae, shadow_stop_px):
     ex("""UPDATE trades SET exit_ts=?, exit_px=?, exit_reason=?, gross=?, fees=?, net=?,
           mae=?, shadow_stop_px=?, status='closed' WHERE id=?""",
        (time.time(), exit_px, reason, gross, fees, net, mae, shadow_stop_px, tid))
+
+
+def _paper_fill_integrity(trade):
+    """Return True/False for trades with a recorded arrival-book fill model."""
+    try:
+        book = json.loads(trade.get("book_at_entry") or "{}")
+        levels = book.get("fill_levels")
+        if not isinstance(levels, list) or not levels:
+            return None
+        source_key = "no_bids" if trade["side"] == "yes" else "yes_bids"
+        source = {round(100.0 - float(price), 8): float(size)
+                  for price, size in book.get(source_key, [])}
+        used = {}
+        quantity = weighted = notional = 0.0
+        for price, size in levels:
+            price, size = float(price), float(size)
+            if size <= 0 or price <= 0 or price > float(trade["cap"]) + 1e-6:
+                return False
+            used[round(price, 8)] = used.get(round(price, 8), 0.0) + size
+            if used[round(price, 8)] > source.get(round(price, 8), 0.0) + 1e-6:
+                return False
+            quantity += size
+            weighted += price * size
+            notional += price * size / 100.0
+        if quantity <= 0 or abs(quantity - float(trade["size"])) > 0.11:
+            return False
+        if abs(weighted / quantity - float(trade["entry_px"])) > 0.02:
+            return False
+        return notional <= float(trade["notional"]) + 0.02
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return False
 
 
 def stats():
@@ -154,18 +312,33 @@ def stats():
         d["n"] += 1
         d["net"] += t["net"] or 0
         d["wins"] += 1 if (t["net"] or 0) > 0 else 0
-    # kill conditions
-    lat = q("SELECT ms FROM latency WHERE kind='feed_lag' ORDER BY ts DESC LIMIT 500")
+    # evidence gates
+    fill_checks = [(t["id"], _paper_fill_integrity(t)) for t in closed + open_t]
+    fill_checks = [(tid, ok) for tid, ok in fill_checks if ok is not None]
+    fill_failures = [tid for tid, ok in fill_checks if not ok]
+    k1_status = ("COLLECTING" if len(fill_checks) < 25 else
+                 "FAIL" if fill_failures else "PASS")
+    lat_kind = "order_arrival"
+    lat = q("SELECT ms FROM latency WHERE kind=? ORDER BY ts DESC LIMIT 500", (lat_kind,))
+    if not lat:
+        lat_kind = "feed_lag"
+        lat = q("SELECT ms FROM latency WHERE kind=? ORDER BY ts DESC LIMIT 500", (lat_kind,))
     lat_ms = sorted(x["ms"] for x in lat)
     p95 = lat_ms[int(0.95 * len(lat_ms))] if lat_ms else None
     n_conf = sum(s["n"] for s in sigs if s["outcome"] in
-                 ("filled", "rejected_cap", "no_book", "killed"))
+                 ("filled", "rejected_cap", "no_book", "killed", "expired",
+                  "unsupported_fee"))
     kill = {
-        "k1_fill_note": "requires recorded books vs print-model comparison (auto after 25+ signals)",
+        "k1_fill_integrity": {
+            "n_fills": len(fill_checks), "needed": 25,
+            "failures": fill_failures[:10], "status": k1_status,
+        },
         "k2_ci": {"n_signals": n_conf, "needed": 50, "ci": ci,
-                  "status": ("PASS" if ci and ci[0] > 0 else
-                             "FAIL" if ci and ci[1] < 0 else "COLLECTING")},
+                  "status": ("COLLECTING" if n_conf < 50 else
+                             "INSUFFICIENT_CLUSTERS" if ci is None else
+                             "PASS" if ci[0] > 0 else "FAIL")},
         "k4_latency_p95_ms": p95,
+        "k4_latency_source": lat_kind,
         "k4_status": "OK" if (p95 is None or p95 < 250) else "BREACH",
     }
     return {"closed": n, "open": len(open_t), "net": round(net, 2),
