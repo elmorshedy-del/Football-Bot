@@ -69,6 +69,17 @@ to the defaults. Notable ones:
 | `CONF_MS` / `CONF_SIGN` | 50 / true | sibling confirmation window / opposite-sign requirement |
 | `LATE_ONLY` | false | trade only within `LATE_WINDOW_MIN` of scheduled close |
 | `USE_STOP` | false | stops off per Gate A forensics (shadow-stop is always recorded) |
+| `PAPER_EXECUTION_V2` | false | opt into latency-aware paper arrivals, shadow liquidity, and entry/exit depth walking |
+
+### Realistic paper execution (opt-in)
+
+Set `PAPER_EXECUTION_V2=true` to route confirmed signals through the isolated V2
+paper adapter. The detector, Gate-A thresholds, sibling confirmation, price cap,
+notional, target, stop, and timeout rules remain unchanged. Only fill mechanics
+change: orders reach the latest valid book after configurable latency, consume a
+counterfactual shadow book, retain partial exit remainders, and record the actual
+volume-weighted average price across every level walked. The live Kalshi book is
+never mutated. Turning the flag off restores the original immediate paper desk.
 
 ## Architecture
 

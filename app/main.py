@@ -58,6 +58,7 @@ async def get_config():
             "notional_usd": config.NOTIONAL_USD, "target": config.TARGET,
             "timeout_s": config.TIMEOUT_S, "lockout_s": config.LOCKOUT_S,
             "late_only": config.LATE_ONLY, "use_stop": config.USE_STOP,
+            "paper_execution_v2": config.PAPER_EXECUTION_V2,
             "league_prior": config.LEAGUE_PRIOR}
 
 
