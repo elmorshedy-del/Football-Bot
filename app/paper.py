@@ -11,13 +11,28 @@ from . import config, store
 from .execution import ShadowBooks
 
 
-def fee_dollars(contracts, price_c):
+class UnsupportedFeeSchedule(ValueError):
+    pass
+
+
+def fee_dollars(contracts, price_c, fee_type="quadratic", fee_multiplier=1.0):
+    if fee_type != "quadratic" or fee_multiplier is None:
+        raise UnsupportedFeeSchedule(f"unsupported fee schedule: {fee_type!r}")
     p = price_c / 100.0
-    return math.ceil(0.07 * contracts * p * (1 - p) * 100) / 100.0
+    return math.ceil(0.07 * float(fee_multiplier) * contracts * p * (1 - p) * 100) / 100.0
+
+
+def level_fees(levels, fee_type="quadratic", fee_multiplier=1.0):
+    """Calculate fees at each executed price instead of at aggregate VWAP."""
+    return [
+        (price, quantity, fee_dollars(quantity, price, fee_type, fee_multiplier))
+        for price, quantity in levels
+    ]
 
 
 class Position:
-    def __init__(self, tid, signal_id, market, event, series, d, side, entry_px, size, ref, ext):
+    def __init__(self, tid, signal_id, market, event, series, d, side, entry_px, size, ref, ext,
+                 fee_type="quadratic", fee_multiplier=1.0):
         self.tid = tid
         self.signal_id = signal_id
         self.market = market
@@ -31,12 +46,15 @@ class Position:
         self.remaining = size
         self.ref = ref                # signal reference (yes-space)
         self.ext = ext
+        self.fee_type = fee_type
+        self.fee_multiplier = fee_multiplier
         self.entry_ts = time.time()
         self.mae = 0.0                # max adverse excursion (side-space cents)
         self.best_bid = entry_px
         self.shadow_stop_hit_px = None
         self.realized_gross = 0.0
         self.exit_fees = 0.0
+        self.entry_fees = 0.0
         self.exit_qty = 0.0
         self.exit_vwap_num = 0.0
 
@@ -51,6 +69,16 @@ class PendingEntry:
     meta: dict
     queued_wall: float
     due_mono: float
+    attempts: int = 0
+
+
+@dataclass
+class PendingExit:
+    due_mono: float
+    queued_wall: float
+    reason: str
+    price_floor: float
+    attempts: int = 0
 
 
 class PaperDesk:
@@ -62,11 +90,49 @@ class PaperDesk:
         self.realistic = config.PAPER_EXECUTION_V2 if realistic is None else realistic
         self.shadows = ShadowBooks()
         self.pending_entries = []
-        self.pending_exits = {}       # trade id -> (due_mono, queued_wall, reason, floor)
+        self.pending_exits = {}       # trade id -> PendingExit
+
+    def restore_open_positions(self, rows):
+        """Rehydrate durable positions after a process restart."""
+        if not self.realistic:
+            return 0
+        for row in rows:
+            size = float(row["size"] or 0.0)
+            remaining = float(row["remaining"] if row["remaining"] is not None else size)
+            if remaining <= 1e-9:
+                continue
+            pos = Position(
+                row["id"], row["signal_id"], row["market"], row["event"], row["series"],
+                row["dir"], row["side"], float(row["entry_px"]), size,
+                row.get("ref"), row.get("ext"), row.get("fee_type") or "quadratic",
+                row.get("fee_multiplier") if row.get("fee_multiplier") is not None else 1.0,
+            )
+            pos.entry_ts = float(row["entry_ts"])
+            pos.remaining = remaining
+            pos.realized_gross = float(row["realized_gross"] or 0.0)
+            pos.entry_fees = float(row["entry_fees"] or 0.0)
+            accrued_fees = float(row["accrued_fees"] or pos.entry_fees)
+            pos.exit_fees = max(0.0, accrued_fees - pos.entry_fees)
+            pos.exit_qty = float(row["exit_qty"] or 0.0)
+            pos.exit_vwap_num = float(row["exit_vwap_num"] or 0.0)
+            pos.mae = float(row["mae"] or 0.0)
+            pos.shadow_stop_hit_px = row["shadow_stop_px"]
+            self.positions[pos.tid] = pos
+        if self.positions:
+            self._safe_log("paper", f"restored {len(self.positions)} open paper positions")
+        return len(self.positions)
 
     def invalidate_books(self, tickers):
         if self.realistic:
             self.shadows.invalidate(tickers)
+
+    def apply_book_snapshot(self, ticker, book):
+        if self.realistic:
+            self.shadows.reset(ticker, book)
+
+    def apply_book_delta(self, ticker, message, sequence=None):
+        if self.realistic:
+            self.shadows.apply_delta(ticker, message, sequence)
 
     # ---------- entries ----------
     def queue_enter(self, signal_id, sig, meta, now_mono=None, now_wall=None):
@@ -86,35 +152,59 @@ class PaperDesk:
         """Execute every paper order whose simulated arrival time has passed."""
         now_mono = time.monotonic() if now_mono is None else now_mono
         now_wall = time.time() if now_wall is None else now_wall
-        ready = [p for p in self.pending_entries if p.due_mono <= now_mono]
-        self.pending_entries = [p for p in self.pending_entries if p.due_mono > now_mono]
-        for pending in ready:
-            self._execute_entry(pending, live_books, now_wall)
+        for pending in list(self.pending_entries):
+            if pending.due_mono > now_mono:
+                continue
+            try:
+                terminal = self._execute_entry(pending, live_books, now_wall)
+            except Exception as exc:
+                pending.attempts += 1
+                pending.due_mono = now_mono + 0.1
+                self._safe_log("paper", f"entry retry {pending.signal_id}: {exc!r}")
+                self._safe_broadcast({"type": "log", "text":
+                                      f"paper entry retry {pending.signal_id}: {exc!r}"})
+                continue
+            if terminal and pending in self.pending_entries:
+                self.pending_entries.remove(pending)
         for tid, order in list(self.pending_exits.items()):
-            due_mono, queued_wall, reason, floor = order
-            if due_mono <= now_mono:
-                self._execute_exit(tid, live_books, now_wall, queued_wall, reason, floor)
+            if order.due_mono > now_mono:
+                continue
+            try:
+                self._execute_exit(tid, order, live_books, now_mono, now_wall)
+            except Exception as exc:
+                self._reschedule_exit(order, now_mono, now_wall)
+                self._safe_log("paper", f"exit retry {tid}: {exc!r}")
+                self._safe_broadcast({"type": "log", "text":
+                                      f"paper exit retry {tid}: {exc!r}"})
 
     def _execute_entry(self, pending, live_books, now_wall):
         if self.kill:
-            self._report_entry(pending, "killed", now_wall, [])
-            return
+            return self._finalize_entry_outcome(pending, "killed", now_wall, [])
         book = live_books.get(pending.sig["ticker"])
         if book is None or not book.ok:
-            self._report_entry(pending, "no_book", now_wall, [])
-            return
+            return self._finalize_entry_outcome(pending, "no_book", now_wall, [])
         shadow = self.shadows.ensure(pending.sig["ticker"], book)
         if not shadow.ok:
-            self._report_entry(pending, "no_book", now_wall, [])
-            return
+            return self._finalize_entry_outcome(pending, "no_book", now_wall, [])
         side = "yes" if pending.sig["dir"] > 0 else "no"
         arrival_book = shadow.snapshot_dict()
-        fill = shadow.buy(side, config.NOTIONAL_USD, config.PRICE_CAP)
+        fill = shadow.buy(side, config.NOTIONAL_USD, config.PRICE_CAP, consume=False)
         if fill.quantity < 1 or fill.vwap is None:
-            self._report_entry(pending, "rejected_cap", now_wall, fill.levels)
-            return
+            return self._finalize_entry_outcome(
+                pending, "rejected_cap", now_wall, fill.levels,
+            )
         arrival_book["fill_levels"] = fill.levels
-        tid = store.insert_trade({
+        latency_ms, order_arrival_ms, detail = self._entry_timing(pending, now_wall, fill.levels)
+        fee_type = pending.meta.get("fee_type", "quadratic")
+        fee_multiplier = pending.meta.get("fee_multiplier", 1.0)
+        try:
+            fees = level_fees(fill.levels, fee_type, fee_multiplier)
+        except UnsupportedFeeSchedule:
+            return self._finalize_entry_outcome(
+                pending, "unsupported_fee", now_wall, fill.levels,
+            )
+        entry_fee = sum(level[2] for level in fees)
+        trade = {
             "signal_id": pending.signal_id,
             "market": pending.sig["ticker"],
             "event": pending.meta["event"],
@@ -123,31 +213,84 @@ class PaperDesk:
             "side": side,
             "entry_ts": now_wall,
             "entry_px": round(fill.vwap, 2),
-            "size": round(fill.quantity, 1),
+            "size": fill.quantity,
             "cap": config.PRICE_CAP,
             "notional": config.NOTIONAL_USD,
             "book_at_entry": arrival_book,
-        })
+            "fee_type": fee_type,
+            "fee_multiplier": fee_multiplier,
+        }
         pos = Position(
-            tid, pending.signal_id, pending.sig["ticker"], pending.meta["event"],
+            0, pending.signal_id, pending.sig["ticker"], pending.meta["event"],
             pending.meta["series"], pending.sig["dir"], side, fill.vwap,
             fill.quantity, pending.sig["ref"], pending.sig["ext"],
+            fee_type, fee_multiplier,
         )
         pos.entry_ts = now_wall
+        pos.entry_fees = entry_fee
+        source = shadow.no_bids if side == "yes" else shadow.yes_bids
+        before = dict(source)
+        shadow.consume_buy(side, fill)
+        try:
+            tid = store.open_paper_trade(
+                trade, detail, fees, entry_fee, latency_ms, order_arrival_ms,
+            )
+        except Exception:
+            source.clear()
+            source.update(before)
+            raise
+        pos.tid = tid
         self.positions[tid] = pos
-        self.broadcast({"type": "trade_open", "trade": self.pos_dict(pos)})
-        store.log_event(
+        self._safe_broadcast({"type": "trade_open", "trade": self.pos_dict(pos)})
+        self._safe_log(
             "trade", f"OPEN {side.upper()} {pending.sig['ticker']} "
             f"{fill.quantity:.1f}@{fill.vwap:.1f} across {len(fill.levels)} levels",
         )
-        self._report_entry(pending, "filled", now_wall, fill.levels)
+        self._notify_entry(pending, "filled", detail)
+        return True
 
-    def _report_entry(self, pending, outcome, now_wall, levels):
+    def _finalize_entry_outcome(self, pending, outcome, now_wall, levels):
+        latency_ms, order_arrival_ms, detail = self._entry_timing(pending, now_wall, levels)
+        store.finish_paper_signal(
+            pending.signal_id, outcome, detail, latency_ms, order_arrival_ms,
+        )
+        self._notify_entry(pending, outcome, detail)
+        return True
+
+    @staticmethod
+    def _entry_timing(pending, now_wall, levels):
         latency_ms = max(0.0, (now_wall - pending.queued_wall) * 1000.0)
-        store.add_latency("paper_entry", latency_ms)
-        detail = {"paper_latency_ms": round(latency_ms, 3), "fill_levels": levels}
+        signal_ts_ms = pending.sig.get("ts_ms")
+        order_arrival_ms = (
+            max(0.0, now_wall * 1000.0 - signal_ts_ms)
+            if isinstance(signal_ts_ms, (int, float)) else None
+        )
+        detail = {
+            "paper_latency_ms": round(latency_ms, 3),
+            "order_arrival_ms": round(order_arrival_ms, 3) if order_arrival_ms is not None else None,
+            "fill_levels": levels,
+        }
+        return latency_ms, order_arrival_ms, detail
+
+    def _notify_entry(self, pending, outcome, detail):
         if self.entry_result is not None:
-            self.entry_result(pending.signal_id, pending.sig, outcome, detail)
+            try:
+                self.entry_result(pending.signal_id, pending.sig, outcome, detail)
+            except Exception as exc:
+                self._safe_log("paper", f"entry notification failed: {exc!r}")
+
+    def _safe_broadcast(self, message):
+        try:
+            self.broadcast(message)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _safe_log(kind, text):
+        try:
+            store.log_event(kind, text)
+        except Exception:
+            pass
 
     def try_enter(self, signal_id, sig, meta, book):
         """Original immediate paper path, preserved exactly while V2 is off."""
@@ -205,11 +348,16 @@ class PaperDesk:
             if adverse > pos.mae:
                 pos.mae = adverse
             # shadow stop (recorded, not acted on unless USE_STOP)
-            ext_side = pos.ext if pos.side == "yes" else 100 - pos.ext
-            ref_side = pos.ref if pos.side == "yes" else 100 - pos.ref
-            stop_lvl = ext_side - config.STOP_FRAC * (ext_side - ref_side)
-            if bid <= stop_lvl and pos.shadow_stop_hit_px is None:
-                pos.shadow_stop_hit_px = bid
+            has_stop_inputs = pos.ext is not None and pos.ref is not None
+            if has_stop_inputs:
+                ext_side = pos.ext if pos.side == "yes" else 100 - pos.ext
+                ref_side = pos.ref if pos.side == "yes" else 100 - pos.ref
+                stop_lvl = ext_side - config.STOP_FRAC * (ext_side - ref_side)
+            else:
+                stop_lvl = None
+            if stop_lvl is not None and bid <= stop_lvl:
+                if pos.shadow_stop_hit_px is None:
+                    pos.shadow_stop_hit_px = bid
                 if config.USE_STOP:
                     if self.realistic:
                         self._queue_exit(pos, "stop", 0.0)
@@ -232,58 +380,102 @@ class PaperDesk:
                     self.close(pos, pos.best_bid, "timeout")
 
     def _queue_exit(self, pos, reason, price_floor):
-        if pos.tid in self.pending_exits:
+        priority = {"target": 1, "timeout": 2, "stop": 3, "flatten": 4, "kill": 5}
+        current = self.pending_exits.get(pos.tid)
+        if current is not None and priority.get(current.reason, 0) >= priority.get(reason, 0):
             return
-        self.pending_exits[pos.tid] = (
-            time.monotonic() + config.PAPER_EXIT_LATENCY_MS / 1000.0,
-            time.time(),
-            reason,
-            price_floor,
+        self.pending_exits[pos.tid] = PendingExit(
+            due_mono=time.monotonic() + config.PAPER_EXIT_LATENCY_MS / 1000.0,
+            queued_wall=time.time(),
+            reason=reason,
+            price_floor=price_floor,
         )
 
-    def _execute_exit(self, tid, live_books, now_wall, queued_wall, reason, price_floor):
+    @staticmethod
+    def _reschedule_exit(order, now_mono, now_wall):
+        order.attempts += 1
+        order.queued_wall = now_wall
+        order.due_mono = now_mono + config.PAPER_EXIT_LATENCY_MS / 1000.0
+
+    def _execute_exit(self, tid, order, live_books, now_mono, now_wall):
         pos = self.positions.get(tid)
         if pos is None:
             self.pending_exits.pop(tid, None)
             return
         book = live_books.get(pos.market)
         if book is None or not book.ok:
-            self.pending_exits.pop(tid, None)
+            self._reschedule_exit(order, now_mono, now_wall)
             return
         shadow = self.shadows.ensure(pos.market, book)
         if not shadow.ok:
-            self.pending_exits.pop(tid, None)
+            self._reschedule_exit(order, now_mono, now_wall)
             return
-        fill = shadow.sell(pos.side, pos.remaining, price_floor)
-        self.pending_exits.pop(tid, None)
-        store.add_latency("paper_exit", max(0.0, (now_wall - queued_wall) * 1000.0))
+        fill = shadow.sell(pos.side, pos.remaining, order.price_floor, consume=False)
         if fill.quantity <= 1e-9 or fill.vwap is None:
+            self._reschedule_exit(order, now_mono, now_wall)
             return
-        pos.remaining = max(0.0, pos.remaining - fill.quantity)
-        pos.realized_gross += (fill.vwap - pos.entry_px) * fill.quantity / 100.0
-        pos.exit_qty += fill.quantity
-        pos.exit_vwap_num += fill.vwap * fill.quantity
-        if config.FEE_EXIT_TAKER:
-            pos.exit_fees += fee_dollars(fill.quantity, fill.vwap)
+        fees = level_fees(
+            fill.levels, pos.fee_type, pos.fee_multiplier,
+        ) if config.FEE_EXIT_TAKER else [
+            (price, quantity, 0.0) for price, quantity in fill.levels
+        ]
+        exit_fee = sum(level[2] for level in fees)
+        remaining = max(0.0, pos.remaining - fill.quantity)
+        realized_gross = pos.realized_gross + (
+            (fill.vwap - pos.entry_px) * fill.quantity / 100.0
+        )
+        exit_fees = pos.exit_fees + exit_fee
+        exit_qty = pos.exit_qty + fill.quantity
+        exit_vwap_num = pos.exit_vwap_num + fill.vwap * fill.quantity
+        progress = {
+            "remaining": remaining,
+            "realized_gross": realized_gross,
+            "accrued_fees": pos.entry_fees + exit_fees,
+            "exit_qty": exit_qty,
+            "exit_vwap_num": exit_vwap_num,
+        }
+        final = None
+        if remaining <= 1e-9:
+            final = self._final_values(
+                pos, realized_gross, pos.entry_fees + exit_fees, exit_qty, exit_vwap_num,
+            )
+        source = shadow.yes_bids if pos.side == "yes" else shadow.no_bids
+        before = dict(source)
+        shadow.consume_sell(pos.side, fill)
+        try:
+            store.record_paper_exit(
+                pos.tid, pos.signal_id, pos.side, now_wall, order.reason, fees, progress,
+                max(0.0, (now_wall - order.queued_wall) * 1000.0), final,
+            )
+        except Exception:
+            source.clear()
+            source.update(before)
+            raise
+        pos.remaining = remaining
+        pos.realized_gross = realized_gross
+        pos.exit_fees = exit_fees
+        pos.exit_qty = exit_qty
+        pos.exit_vwap_num = exit_vwap_num
         if pos.remaining > 1e-9:
-            self.broadcast({"type": "trade_partial", "trade": {
+            self._safe_broadcast({"type": "trade_partial", "trade": {
                 "id": pos.tid, "market": pos.market, "side": pos.side,
                 "filled": round(fill.quantity, 1), "remaining": round(pos.remaining, 1),
-                "exit_px": round(fill.vwap, 2), "reason": reason,
+                "exit_px": round(fill.vwap, 2), "reason": order.reason,
             }})
-            store.log_event(
+            self._safe_log(
                 "trade", f"PARTIAL CLOSE {pos.market} {fill.quantity:.1f}@{fill.vwap:.1f}; "
                 f"{pos.remaining:.1f} remains",
             )
+            self._reschedule_exit(order, now_mono, now_wall)
             return
-        self._finalize_realistic(pos, reason)
+        self._complete_realistic(pos, order.reason, final)
 
     def settle_market(self, ticker, result):
         """result: 'yes'|'no' in market (YES) space."""
         still_pending = []
         for pending in self.pending_entries:
             if pending.sig["ticker"] == ticker:
-                self._report_entry(pending, "expired", time.time(), [])
+                self._finalize_entry_outcome(pending, "expired", time.time(), [])
             else:
                 still_pending.append(pending)
         self.pending_entries = still_pending
@@ -292,31 +484,53 @@ class PaperDesk:
             exit_px = 100.0 if won else 0.0
             if self.realistic:
                 qty = pos.remaining
-                pos.realized_gross += (exit_px - pos.entry_px) * qty / 100.0
-                pos.exit_qty += qty
-                pos.exit_vwap_num += exit_px * qty
+                realized_gross = pos.realized_gross + (exit_px - pos.entry_px) * qty / 100.0
+                exit_qty = pos.exit_qty + qty
+                exit_vwap_num = pos.exit_vwap_num + exit_px * qty
+                progress = {
+                    "remaining": 0.0,
+                    "realized_gross": realized_gross,
+                    "accrued_fees": pos.entry_fees + pos.exit_fees,
+                    "exit_qty": exit_qty,
+                    "exit_vwap_num": exit_vwap_num,
+                }
+                final = self._final_values(
+                    pos, realized_gross, pos.entry_fees + pos.exit_fees,
+                    exit_qty, exit_vwap_num,
+                )
+                store.record_paper_exit(
+                    pos.tid, pos.signal_id, pos.side, time.time(), "settle",
+                    [(exit_px, qty, 0.0)], progress, 0.0, final,
+                )
+                pos.realized_gross = realized_gross
+                pos.exit_qty = exit_qty
+                pos.exit_vwap_num = exit_vwap_num
                 pos.remaining = 0.0
-                self._finalize_realistic(pos, "settle")
+                self._complete_realistic(pos, "settle", final)
             else:
                 self.close(pos, exit_px, "settle")
 
-    def _finalize_realistic(self, pos, reason):
-        exit_px = pos.exit_vwap_num / pos.exit_qty if pos.exit_qty > 1e-9 else pos.entry_px
-        gross = pos.realized_gross
-        fees = fee_dollars(pos.initial_size, pos.entry_px) + pos.exit_fees
-        net = gross - fees
-        store.close_trade(
-            pos.tid, round(exit_px, 2), reason, round(gross, 2), round(fees, 2),
-            round(net, 2), round(pos.mae, 2), pos.shadow_stop_hit_px,
-        )
+    @staticmethod
+    def _final_values(pos, gross, fees, exit_qty, exit_vwap_num):
+        exit_px = exit_vwap_num / exit_qty if exit_qty > 1e-9 else pos.entry_px
+        return {
+            "exit_px": round(exit_px, 2),
+            "gross": round(gross, 2),
+            "fees": round(fees, 2),
+            "net": round(gross - fees, 2),
+            "mae": round(pos.mae, 2),
+            "shadow_stop_px": pos.shadow_stop_hit_px,
+        }
+
+    def _complete_realistic(self, pos, reason, final):
         self.positions.pop(pos.tid, None)
         self.pending_exits.pop(pos.tid, None)
-        self.broadcast({"type": "trade_close", "trade": {
+        self._safe_broadcast({"type": "trade_close", "trade": {
             "id": pos.tid, "market": pos.market, "series": pos.series, "side": pos.side,
-            "entry_px": round(pos.entry_px, 2), "exit_px": round(exit_px, 2),
-            "size": round(pos.initial_size, 1), "reason": reason, "net": round(net, 2),
+            "entry_px": round(pos.entry_px, 2), "exit_px": final["exit_px"],
+            "size": round(pos.initial_size, 1), "reason": reason, "net": final["net"],
         }})
-        store.log_event("trade", f"CLOSE {pos.market} {reason} net ${net:+.2f}")
+        self._safe_log("trade", f"CLOSE {pos.market} {reason} net ${final['net']:+.2f}")
 
     def close(self, pos, exit_px, reason):
         exit_px = min(max(exit_px, 0.0), 100.0)

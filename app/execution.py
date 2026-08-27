@@ -35,32 +35,35 @@ class ShadowBook:
         shadow.reset(book)
         return shadow
 
-    def reset(self, book):
-        self.yes_bids = dict(book.yes_bids)
-        self.no_bids = dict(book.no_bids)
-        self._observed_yes = dict(book.yes_bids)
-        self._observed_no = dict(book.no_bids)
-        self.ok = bool(book.ok)
-        self.seq = book.last_seq
-
-    def reconcile(self, book):
-        """Apply changes in the live book without restoring simulated fills."""
-        self._reconcile_side(self.yes_bids, self._observed_yes, book.yes_bids)
-        self._reconcile_side(self.no_bids, self._observed_no, book.no_bids)
+    def reset(self, book, preserve_depletion=False):
+        if preserve_depletion:
+            yes_depletion = self._depletion(self._observed_yes, self.yes_bids)
+            no_depletion = self._depletion(self._observed_no, self.no_bids)
+            self.yes_bids = self._subtract_depletion(book.yes_bids, yes_depletion)
+            self.no_bids = self._subtract_depletion(book.no_bids, no_depletion)
+        else:
+            self.yes_bids = dict(book.yes_bids)
+            self.no_bids = dict(book.no_bids)
         self._observed_yes = dict(book.yes_bids)
         self._observed_no = dict(book.no_bids)
         self.ok = bool(book.ok)
         self.seq = book.last_seq
 
     @staticmethod
-    def _reconcile_side(shadow, observed, current):
-        for price in set(observed) | set(current):
-            delta = current.get(price, 0.0) - observed.get(price, 0.0)
-            new_size = shadow.get(price, 0.0) + delta
-            if new_size <= _EPS:
-                shadow.pop(price, None)
-            else:
-                shadow[price] = new_size
+    def _depletion(observed, shadow):
+        return {
+            price: max(0.0, size - shadow.get(price, 0.0))
+            for price, size in observed.items()
+            if size - shadow.get(price, 0.0) > _EPS
+        }
+
+    @staticmethod
+    def _subtract_depletion(observed, depletion):
+        return {
+            price: available
+            for price, size in observed.items()
+            if (available := size - depletion.get(price, 0.0)) > _EPS
+        }
 
     def invalidate(self):
         self.ok = False
@@ -70,15 +73,23 @@ class ShadowBook:
             return
         px = float(msg["price_dollars"]) * 100
         delta = float(msg["delta_fp"])
-        side = self.yes_bids if msg.get("side") == "yes" else self.no_bids
-        new_size = side.get(px, 0.0) + delta
-        if new_size <= _EPS:
-            side.pop(px, None)
+        if msg.get("side") == "yes":
+            shadow, observed = self.yes_bids, self._observed_yes
         else:
-            side[px] = new_size
+            shadow, observed = self.no_bids, self._observed_no
+        self._apply_size_delta(observed, px, delta)
+        self._apply_size_delta(shadow, px, delta)
         self.seq = seq if seq is not None else self.seq
 
-    def buy(self, side, notional_usd, price_cap):
+    @staticmethod
+    def _apply_size_delta(side, price, delta):
+        new_size = side.get(price, 0.0) + delta
+        if new_size <= _EPS:
+            side.pop(price, None)
+        else:
+            side[price] = new_size
+
+    def buy(self, side, notional_usd, price_cap, consume=True):
         """Buy YES/NO by walking asks, consuming every filled shadow level."""
         source = self.no_bids if side == "yes" else self.yes_bids
         ladder = sorted((100 - price, size, price) for price, size in source.items())
@@ -94,7 +105,8 @@ class ShadowBook:
             cost += take * price / 100.0
             weighted += take * price
             levels.append((price, take))
-            self._consume(source, source_price, take)
+            if consume:
+                self._consume(source, source_price, take)
             if cost >= notional_usd - 0.01:
                 break
         return DepthFill(
@@ -105,7 +117,12 @@ class ShadowBook:
             levels=levels,
         )
 
-    def sell(self, side, quantity, price_floor=0.0):
+    def consume_buy(self, side, fill):
+        source = self.no_bids if side == "yes" else self.yes_bids
+        for price, quantity in fill.levels:
+            self._consume(source, 100 - price, quantity)
+
+    def sell(self, side, quantity, price_floor=0.0, consume=True):
         """Sell YES/NO by walking bids, preserving an unfilled remainder."""
         source = self.yes_bids if side == "yes" else self.no_bids
         ladder = sorted(source.items(), reverse=True)
@@ -121,7 +138,8 @@ class ShadowBook:
             proceeds += take * price / 100.0
             weighted += take * price
             levels.append((price, take))
-            self._consume(source, price, take)
+            if consume:
+                self._consume(source, price, take)
             if filled >= quantity - _EPS:
                 break
         return DepthFill(
@@ -131,6 +149,11 @@ class ShadowBook:
             complete=filled >= quantity - _EPS,
             levels=levels,
         )
+
+    def consume_sell(self, side, fill):
+        source = self.yes_bids if side == "yes" else self.no_bids
+        for price, quantity in fill.levels:
+            self._consume(source, price, quantity)
 
     @staticmethod
     def _consume(source, price, quantity):
@@ -159,12 +182,14 @@ class ShadowBooks:
         if shadow is None:
             shadow = ShadowBook.from_live(live_book)
             self._books[ticker] = shadow
-        else:
-            shadow.reconcile(live_book)
         return shadow
 
     def reset(self, ticker, live_book):
-        self._books[ticker] = ShadowBook.from_live(live_book)
+        shadow = self._books.get(ticker)
+        if shadow is None:
+            self._books[ticker] = ShadowBook.from_live(live_book)
+        else:
+            shadow.reset(live_book, preserve_depletion=True)
 
     def apply_delta(self, ticker, msg, seq=None):
         shadow = self._books.get(ticker)
