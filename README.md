@@ -69,6 +69,11 @@ to the defaults. Notable ones:
 | `CONF_MS` / `CONF_SIGN` | 50 / true | sibling confirmation window / opposite-sign requirement |
 | `LATE_ONLY` | false | trade only within `LATE_WINDOW_MIN` of scheduled close |
 | `USE_STOP` | false | stops off per Gate A forensics (shadow-stop is always recorded) |
+| `ADMIN_TOKEN` | empty | required `X-Admin-Token` for kill/flatten actions; empty fails closed |
+
+Recorder health is exposed at `/api/status` under `recorder`. A write failure
+marks it unhealthy, records the last error/failure count, alerts the dashboard,
+and retries on later messages instead of silently losing the raw feed.
 
 ## Architecture
 

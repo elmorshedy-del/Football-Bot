@@ -147,6 +147,7 @@ class KalshiWS:
         self._cmd_id = 0
         self._orderbook_sid = None
         self._trade_sid = None
+        self._lifecycle_sid = None
         self._subscribed = set()
         self._lock = asyncio.Lock()
         self.connected = False
@@ -182,13 +183,13 @@ class KalshiWS:
                 self._subscribed = want if self.connected else set()
                 return
             if not want and self._subscribed:
-                for sid in (self._orderbook_sid, self._trade_sid):
+                for sid in self._subscription_sids():
                     if sid is not None:
                         try:
                             await self._send("unsubscribe", {"sids": [sid]})
                         except Exception:
                             pass
-                self._orderbook_sid = self._trade_sid = None
+                self._orderbook_sid = self._trade_sid = self._lifecycle_sid = None
                 self._subscribed = set()
                 return
             add = sorted(want - self._subscribed)
@@ -201,11 +202,24 @@ class KalshiWS:
                 return
             for action, group in (("add_markets", add), ("delete_markets", rem)):
                 if group and self._orderbook_sid is not None:
-                    for sid in (self._orderbook_sid, self._trade_sid):
+                    for sid in self._subscription_sids():
                         if sid is not None:
                             await self._send("update_subscription",
                                              {"sid": sid, "action": action, "market_tickers": group})
             self._subscribed = want
+
+    def _subscription_sids(self):
+        return tuple(dict.fromkeys(sid for sid in (
+            self._orderbook_sid, self._trade_sid, self._lifecycle_sid,
+        ) if sid is not None))
+
+    def _record_subscription(self, channel, sid):
+        if channel == "orderbook_delta":
+            self._orderbook_sid = sid
+        elif channel == "trade":
+            self._trade_sid = sid
+        elif channel == "market_lifecycle_v2":
+            self._lifecycle_sid = sid
 
     async def request_snapshot(self, ticker):
         if self._orderbook_sid is not None:
@@ -222,7 +236,7 @@ class KalshiWS:
                                               max_size=2 ** 23) as ws:
                     self._ws = ws
                     self.connected = True
-                    self._orderbook_sid = self._trade_sid = None
+                    self._orderbook_sid = self._trade_sid = self._lifecycle_sid = None
                     subs = self._subscribed
                     self._subscribed = set()
                     self.on_state("connected")
@@ -234,10 +248,7 @@ class KalshiWS:
                         if t == "subscribed":
                             ch = (m.get("msg") or {}).get("channel")
                             sid = (m.get("msg") or {}).get("sid")
-                            if ch == "orderbook_delta":
-                                self._orderbook_sid = sid
-                            elif ch == "trade":
-                                self._trade_sid = sid
+                            self._record_subscription(ch, sid)
                         self.on_message(m, time.time(), time.monotonic())
             except Exception as e:
                 self.connected = False

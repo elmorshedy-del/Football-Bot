@@ -29,6 +29,7 @@ KALSHI_WS = os.environ.get("KALSHI_WS", "wss://api.elections.kalshi.com/trade-ap
 
 MODE = os.environ.get("MODE", "auto")  # auto | live | demo
 DATA_DIR = os.environ.get("DATA_DIR", "./data")
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
 # --- Strategy (frozen Gate A primary unless overridden) ---
 DL_MIN = _f("DL_MIN", 0.8)              # min log-odds displacement of the sweep
