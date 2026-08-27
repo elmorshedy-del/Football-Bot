@@ -96,6 +96,18 @@ class Engine:
     def handle_ws(self, msg, wall, mono):
         t = msg.get("type")
         body = msg.get("msg") or {}
+        if t == "orderbook_gap":
+            tickers = body.get("market_tickers") or list(self.books)
+            for tk in tickers:
+                book = self.books.get(tk)
+                if book is not None:
+                    book.ok = False
+            store.log_event(
+                "book",
+                f"sequence gap sid={body.get('sid')} expected={body.get('expected')} "
+                f"received={body.get('received')}; awaiting fresh snapshots",
+            )
+            return
         ticker = body.get("market_ticker")
         # defense-in-depth: ignore anything we didn't explicitly subscribe to
         # (a filterless subscription upstream becomes an all-market firehose)
@@ -110,7 +122,7 @@ class Engine:
             self.on_book(ticker)
         elif t == "orderbook_delta":
             b = self.books.setdefault(ticker, Book())
-            if not b.apply_delta(body, msg.get("seq")):
+            if not b.apply_delta(body, msg.get("seq"), sequence_validated=True):
                 if self.ws:
                     asyncio.get_event_loop().create_task(self.ws.request_snapshot(ticker))
             else:

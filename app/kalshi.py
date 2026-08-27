@@ -11,6 +11,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
 from . import config
+from .sequence import SubscriptionSequenceTracker
 
 
 def _normalize_pem(raw):
@@ -148,6 +149,8 @@ class KalshiWS:
         self._orderbook_sid = None
         self._trade_sid = None
         self._subscribed = set()
+        self._sequences = SubscriptionSequenceTracker()
+        self._ignored_orderbook_sids = set()
         self._lock = asyncio.Lock()
         self.connected = False
 
@@ -213,6 +216,34 @@ class KalshiWS:
                                                      "action": "get_snapshot",
                                                      "market_tickers": [ticker]})
 
+    async def _recover_orderbook(self, sid, expected, received):
+        """Invalidate the current book stream and subscribe for fresh snapshots."""
+        tickers = sorted(self._subscribed)
+        self.on_message({
+            "type": "orderbook_gap",
+            "msg": {"sid": sid, "expected": expected, "received": received,
+                    "market_tickers": tickers},
+        }, time.time(), time.monotonic())
+        async with self._lock:
+            if isinstance(sid, int):
+                self._ignored_orderbook_sids.add(sid)
+                self._sequences.reset(sid)
+            current_sid = self._orderbook_sid
+            stale_sid = current_sid if current_sid is not None else sid
+            if stale_sid is not None:
+                self._ignored_orderbook_sids.add(stale_sid)
+                self._sequences.reset(stale_sid)
+                try:
+                    await self._send("unsubscribe", {"sids": [stale_sid]})
+                except Exception:
+                    pass
+            self._orderbook_sid = None
+            if tickers:
+                await self._send("subscribe", {
+                    "channels": ["orderbook_delta"],
+                    "market_tickers": tickers,
+                })
+
     async def run(self):
         """Connect-consume-reconnect loop."""
         while True:
@@ -223,6 +254,8 @@ class KalshiWS:
                     self._ws = ws
                     self.connected = True
                     self._orderbook_sid = self._trade_sid = None
+                    self._sequences.reset()
+                    self._ignored_orderbook_sids.clear()
                     subs = self._subscribed
                     self._subscribed = set()
                     self.on_state("connected")
@@ -238,6 +271,19 @@ class KalshiWS:
                                 self._orderbook_sid = sid
                             elif ch == "trade":
                                 self._trade_sid = sid
+                        if t in ("orderbook_snapshot", "orderbook_delta"):
+                            sid = m.get("sid")
+                            if sid in self._ignored_orderbook_sids:
+                                continue
+                            seq = m.get("seq")
+                            previous = self._sequences.last(sid)
+                            status = self._sequences.track(sid, seq)
+                            if status == "duplicate":
+                                continue
+                            if status == "gap":
+                                expected = previous + 1 if previous is not None else seq
+                                await self._recover_orderbook(sid, expected, seq)
+                                continue
                         self.on_message(m, time.time(), time.monotonic())
             except Exception as e:
                 self.connected = False
