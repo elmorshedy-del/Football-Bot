@@ -29,6 +29,7 @@ KALSHI_WS = os.environ.get("KALSHI_WS", "wss://api.elections.kalshi.com/trade-ap
 
 MODE = os.environ.get("MODE", "auto")  # auto | live | demo
 DATA_DIR = os.environ.get("DATA_DIR", "./data")
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
 # --- Strategy (frozen Gate A primary unless overridden) ---
 DL_MIN = _f("DL_MIN", 0.8)              # min log-odds displacement of the sweep
@@ -47,6 +48,12 @@ LATE_WINDOW_MIN = _i("LATE_WINDOW_MIN", 20)
 USE_STOP = _b("USE_STOP", False)        # Gate A: stops off; shadow-stop is always recorded
 STOP_FRAC = _f("STOP_FRAC", 0.35)
 FEE_EXIT_TAKER = _b("FEE_EXIT_TAKER", True)  # charge taker fee on exits (conservative)
+
+# --- Paper execution adapter (off preserves the original paper desk exactly) ---
+PAPER_EXECUTION_V2 = _b("PAPER_EXECUTION_V2", False)
+PAPER_ENTRY_LATENCY_MS = _f("PAPER_ENTRY_LATENCY_MS", 150.0)
+PAPER_EXIT_LATENCY_MS = _f("PAPER_EXIT_LATENCY_MS", 150.0)
+PAPER_EXECUTION_POLL_MS = _f("PAPER_EXECUTION_POLL_MS", 5.0)
 
 # --- Market discovery ---
 DISCOVERY_INTERVAL_S = _i("DISCOVERY_INTERVAL_S", 180)

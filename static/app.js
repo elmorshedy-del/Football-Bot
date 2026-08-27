@@ -107,7 +107,9 @@ function updExits(stats) {
 function updKill(stats) {
   const k = stats.kill || {};
   const ci = (k.k2_ci || {});
+  const fill = (k.k1_fill_integrity || {});
   const prog = Math.min(100, ((ci.n_signals || 0) / (ci.needed || 50)) * 100);
+  const fillProg = Math.min(100, ((fill.n_fills || 0) / (fill.needed || 25)) * 100);
   const ciTxt = ci.ci ? `[${fmt$(ci.ci[0])}, ${fmt$(ci.ci[1])}]` : "collecting";
   const lat = k.k4_latency_p95_ms;
   const latPct = lat != null ? Math.min(100, lat / 250 * 100) : 0;
@@ -117,12 +119,13 @@ function updKill(stats) {
         <span class="st">${ci.status || "…"} ${ciTxt}</span></label>
       <div class="kbar"><i style="width:${prog}%"></i></div></div>
     <div class="kc ${k.k4_status === "BREACH" ? "bad" : ""}">
-      <label><span>K4 · FEED LAG P95 vs 250ms</span>
+      <label><span>K4 · ORDER ARRIVAL P95 vs 250ms</span>
         <span class="st">${lat != null ? lat.toFixed(0) + "ms" : "—"} ${k.k4_status || ""}</span></label>
       <div class="kbar"><i style="width:${latPct}%"></i></div></div>
-    <div class="kc warn"><label><span>K1 · FILL MODEL vs REALITY</span>
-      <span class="st">recording books…</span></label>
-      <div class="kbar"><i style="width:8%"></i></div></div>
+    <div class="kc ${fill.status === "FAIL" ? "bad" : fill.status === "PASS" ? "" : "warn"}">
+      <label><span>K1 · FILL vs ARRIVAL BOOK (need ${fill.needed || 25})</span>
+      <span class="st">${fill.status || "…"} ${fill.n_fills || 0} checked</span></label>
+      <div class="kbar"><i style="width:${fillProg}%"></i></div></div>
     <div class="kc"><label><span>K3 · ROLLING LEAGUE EV vs FEES</span>
       <span class="st">${Object.keys(stats.leagues || {}).length} leagues tracked</span></label>
       <div class="kbar"><i style="width:30%"></i></div></div>`;
@@ -305,9 +308,21 @@ function connect() {
   ws.onclose = () => setTimeout(connect, 2500);
 }
 
-$("killbtn").onclick = () =>
-  fetch("/api/kill", {method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({on: !killOn})}).then(() => {});
+async function adminPost(path, body) {
+  let token = sessionStorage.getItem("footballbot_admin_token");
+  if (!token) token = prompt("Admin token");
+  if (!token) return;
+  sessionStorage.setItem("footballbot_admin_token", token);
+  const response = await fetch(path, {method: "POST", headers: {
+    "Content-Type": "application/json", "X-Admin-Token": token,
+  }, body: body == null ? null : JSON.stringify(body)});
+  if (!response.ok) {
+    sessionStorage.removeItem("footballbot_admin_token");
+    alert((await response.json()).detail || "Admin action failed");
+  }
+}
+
+$("killbtn").onclick = () => adminPost("/api/kill", {on: !killOn});
 $("soundbtn").onclick = () => { sound = !sound; $("soundbtn").textContent = sound ? "🔊" : "🔇"; };
 
 mkCharts();
