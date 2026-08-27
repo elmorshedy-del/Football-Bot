@@ -109,6 +109,11 @@ def insert_signal(s):
     return cur.lastrowid
 
 
+def update_signal_outcome(signal_id, outcome, detail=None):
+    ex("UPDATE signals SET outcome=?, detail=? WHERE id=?",
+       (outcome, json.dumps(detail or {}), signal_id))
+
+
 def insert_trade(t):
     cur = ex("""INSERT INTO trades(signal_id,market,event,series,dir,side,entry_ts,entry_px,
                 size,cap,notional,book_at_entry,status,mode)

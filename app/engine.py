@@ -39,7 +39,7 @@ class Engine:
             self.client.n_requests = self.client.n_429 = self.client.n_retries = 0
         self.detector = Detector()
         self.desk = PaperDesk(self.broadcast)
-        self.recorder = RawRecorder()
+        self.recorder = RawRecorder(self.on_recorder_error)
         self.books = {}
         self.meta = {}                 # ticker -> {event, series, title, close_time}
         self.event_markets = {}        # event -> [tickers]
@@ -59,6 +59,14 @@ class Engine:
             self.q.put_nowait(msg)
         except asyncio.QueueFull:
             pass
+
+    def on_recorder_error(self, error):
+        text = f"raw recorder unhealthy: {error}"
+        try:
+            store.log_event("recorder", text)
+        except Exception:
+            pass
+        self.broadcast({"type": "log", "text": text})
 
     def register_market(self, ticker, event, series, title, close_time):
         self.meta[ticker] = {"event": event, "series": series, "title": title,
@@ -173,7 +181,7 @@ class Engine:
             else:
                 self.record_signal(cand, None, "unconfirmed")
 
-    def record_signal(self, cand, lag, outcome):
+    def record_signal(self, cand, lag, outcome, announce=True):
         m = self.meta.get(cand["ticker"], {})
         sid = store.insert_signal({
             "ts_ms": cand["ts_ms"], "local_ts": cand["local_ts"], "market": cand["ticker"],
@@ -183,6 +191,12 @@ class Engine:
             "conf_lag_ms": lag, "late": self.is_late(cand["ticker"]), "outcome": outcome,
             "detail": {},
         })
+        if announce:
+            self._announce_signal(sid, cand, lag, outcome)
+        return sid
+
+    def _announce_signal(self, sid, cand, lag, outcome):
+        m = self.meta.get(cand["ticker"], {})
         self.broadcast({"type": "signal", "signal": {
             "id": sid, "market": cand["ticker"], "series": m.get("series", "?"),
             "dir": cand["dir"], "dl": cand["dl"], "levels": cand["levels"],
@@ -192,7 +206,6 @@ class Engine:
         store.log_event("signal", f"{icon} {outcome.upper()} {cand['ticker']} "
                                   f"dl={cand['dl']} lv={cand['levels']} "
                                   f"conf={f'{lag:+.0f}ms' if lag is not None else '—'}")
-        return sid
 
     def act_on_signal(self, cand, lag):
         decision_start = time.monotonic()
@@ -201,10 +214,16 @@ class Engine:
             return
         m = self.meta.get(cand["ticker"], {"event": "?", "series": "?"})
         book = self.books.get(cand["ticker"])
-        sid = None
-        outcome = self.desk.try_enter(0, cand, m, book)
+        sid = self.record_signal(cand, lag, "executing", announce=False)
+        try:
+            outcome = self.desk.try_enter(sid, cand, m, book)
+            detail = {}
+        except Exception as exc:
+            outcome = "execution_error"
+            detail = {"error": f"{type(exc).__name__}: {exc}"}
         store.add_latency("decision_ms", (time.monotonic() - decision_start) * 1000)
-        sid = self.record_signal(cand, lag, outcome)
+        store.update_signal_outcome(sid, outcome, detail)
+        self._announce_signal(sid, cand, lag, outcome)
         if outcome == "filled":
             self.detector.state(cand["ticker"]).last_entry_ms = cand["ts_ms"]
 
@@ -294,6 +313,7 @@ class Engine:
         return {"mode": self.mode, "ws": self.ws_state, "uptime_s": int(time.time() - self.started),
                 "markets": len(self.meta), "matches": len(self.event_markets),
                 "trades_seen": self.n_trades, "recorded": self.recorder.total,
+                "recorder": self.recorder.status(),
                 "kill": self.desk.kill, "open_positions": len(self.desk.positions),
                 "demo": self.demo_status, "cred_error": self.cred_error,
                 "foreign_dropped": self.n_foreign,

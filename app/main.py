@@ -2,28 +2,49 @@
 import asyncio
 import json
 import os
+import secrets
 import time
+from contextlib import asynccontextmanager, suppress
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import config, store
 from .engine import Engine
 
-app = FastAPI(title="Football-Bot")
 _clients = set()
 _queue = asyncio.Queue(maxsize=2000)
 engine = None
 
 
-@app.on_event("startup")
-async def startup():
-    global engine
+def require_admin(x_admin_token: str | None = Header(default=None)):
+    if not config.ADMIN_TOKEN:
+        raise HTTPException(status_code=503, detail="ADMIN_TOKEN is not configured")
+    if not secrets.compare_digest(x_admin_token or "", config.ADMIN_TOKEN):
+        raise HTTPException(status_code=401, detail="invalid admin token")
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    global engine, _queue
+    _queue = asyncio.Queue(maxsize=2000)
     store.init()
     engine = Engine(_queue)
     await engine.start()
-    asyncio.create_task(_pump())
+    pump_task = asyncio.create_task(_pump())
+    try:
+        yield
+    finally:
+        pump_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await pump_task
+        with suppress(OSError):
+            engine.recorder.close()
+        await engine.client.close()
+
+
+app = FastAPI(title="Football-Bot", lifespan=lifespan)
 
 
 async def _pump():
@@ -125,7 +146,7 @@ async def eventlog(limit: int = 80):
     return store.q("SELECT * FROM eventlog ORDER BY rowid DESC LIMIT ?", (limit,))
 
 
-@app.post("/api/kill")
+@app.post("/api/kill", dependencies=[Depends(require_admin)])
 async def kill(payload: dict):
     engine.desk.kill = bool(payload.get("on"))
     store.log_event("sys", f"KILL SWITCH {'ENGAGED' if engine.desk.kill else 'RELEASED'}")
@@ -133,7 +154,7 @@ async def kill(payload: dict):
     return {"kill": engine.desk.kill}
 
 
-@app.post("/api/flatten")
+@app.post("/api/flatten", dependencies=[Depends(require_admin)])
 async def flatten():
     engine.desk.flatten_all()
     return {"ok": True}

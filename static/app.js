@@ -305,9 +305,21 @@ function connect() {
   ws.onclose = () => setTimeout(connect, 2500);
 }
 
-$("killbtn").onclick = () =>
-  fetch("/api/kill", {method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({on: !killOn})}).then(() => {});
+async function adminPost(path, body) {
+  let token = sessionStorage.getItem("footballbot_admin_token");
+  if (!token) token = prompt("Admin token");
+  if (!token) return;
+  sessionStorage.setItem("footballbot_admin_token", token);
+  const response = await fetch(path, {method: "POST", headers: {
+    "Content-Type": "application/json", "X-Admin-Token": token,
+  }, body: body == null ? null : JSON.stringify(body)});
+  if (!response.ok) {
+    sessionStorage.removeItem("footballbot_admin_token");
+    alert((await response.json()).detail || "Admin action failed");
+  }
+}
+
+$("killbtn").onclick = () => adminPost("/api/kill", {on: !killOn});
 $("soundbtn").onclick = () => { sound = !sound; $("soundbtn").textContent = sound ? "🔊" : "🔇"; };
 
 mkCharts();
