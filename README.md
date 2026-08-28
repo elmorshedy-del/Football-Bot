@@ -24,6 +24,8 @@ Built from a 2,377-event backtest over the entire history of Kalshi soccer marke
   (the isotonic zero-crossing), exits at target/timeout/settlement, verified Kalshi fees
 - **Tracks kill conditions** from the research memo: live EV confidence interval,
   fill-model-vs-reality, feed latency p95, per-league rolling edge
+- **Measures goal-feed latency** without affecting trading: batches Kalshi milestone
+  score polls and timestamps numeric score changes beside received book/trade changes
 - **Dashboard**: live match cards, signal wire, paper desk, equity curve, league edge,
   latency histograms, kill switch — all streaming over WebSocket
 
@@ -70,6 +72,8 @@ to the defaults. Notable ones:
 | `LATE_ONLY` | false | trade only within `LATE_WINDOW_MIN` of scheduled close |
 | `USE_STOP` | false | stops off per Gate A forensics (shadow-stop is always recorded) |
 | `PAPER_EXECUTION_V2` | false | opt into latency-aware paper arrivals, shadow liquidity, and entry/exit depth walking |
+| `GOAL_LATENCY_OBSERVER` | true | read-only Kalshi score-vs-market arrival experiment; never enters the signal path |
+| `GOAL_LATENCY_POLL_MS` | 250 | target interval for batched score polling; actual uncertainty is saved per observation |
 | `ADMIN_TOKEN` | empty | required `X-Admin-Token` for kill/flatten actions; empty fails closed |
 
 Recorder health is exposed at `/api/status` under `recorder`. A write failure
@@ -94,6 +98,20 @@ positions after restart. Live fee type/multiplier metadata comes from Kalshi's
 recorded as `unsupported_fee` instead of guessing profitability. K1 verifies
 fills against the saved arrival book after 25 fills, K2 cannot pass before 50
 confirmed signals, and K4 measures total signal-to-paper-arrival latency.
+
+### Goal latency observer
+
+The observer resolves each watched event to a Kalshi milestone, polls every mapped
+milestone through one `/live_data/batch` request, and compares only numeric fields
+under score-shaped keys. It does not use a language model and has no reference to the
+detector or paper desk. The first response containing a changed score is bounded by
+the previous successful poll and current receipt; both timestamps and request duration
+are saved instead of claiming a more precise provider event time.
+
+Results are available at `/api/goal-latency`. Positive `last_book_lead_ms` or
+`last_trade_lead_ms` means market activity reached this process before the score
+change. Each result retains the raw live-data object and complete pre-score market
+window in `detail` for independent review.
 
 ## Architecture
 

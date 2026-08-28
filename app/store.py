@@ -38,6 +38,27 @@ CREATE TABLE IF NOT EXISTS latency(
   ts REAL, kind TEXT, ms REAL);
 CREATE TABLE IF NOT EXISTS eventlog(
   ts REAL, kind TEXT, text TEXT);
+CREATE TABLE IF NOT EXISTS goal_latency_observations(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  observed_ts REAL NOT NULL,
+  event TEXT NOT NULL,
+  milestone_id TEXT NOT NULL,
+  change_kind TEXT NOT NULL,
+  live_type TEXT,
+  score_before TEXT NOT NULL,
+  score_after TEXT NOT NULL,
+  previous_poll_ts REAL,
+  poll_started_ts REAL NOT NULL,
+  response_ms REAL NOT NULL,
+  last_book_change_ts REAL,
+  last_book_lead_ms REAL,
+  last_trade_ts REAL,
+  last_trade_lead_ms REAL,
+  first_book_after_ts REAL,
+  first_book_after_ms REAL,
+  first_trade_after_ts REAL,
+  first_trade_after_ms REAL,
+  detail TEXT NOT NULL);
 """
 
 
@@ -110,6 +131,44 @@ def log_event(kind, text):
 
 def add_latency(kind, ms):
     ex("INSERT INTO latency(ts,kind,ms) VALUES(?,?,?)", (time.time(), kind, ms))
+
+
+def insert_goal_latency(row):
+    cur = ex(
+        """INSERT INTO goal_latency_observations(
+               observed_ts,event,milestone_id,change_kind,live_type,
+               score_before,score_after,previous_poll_ts,poll_started_ts,response_ms,
+               last_book_change_ts,last_book_lead_ms,last_trade_ts,last_trade_lead_ms,
+               detail)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            row["observed_ts"], row["event"], row["milestone_id"],
+            row["change_kind"], row.get("live_type"),
+            json.dumps(row["score_before"], separators=(",", ":")),
+            json.dumps(row["score_after"], separators=(",", ":")),
+            row.get("previous_poll_ts"), row["poll_started_ts"], row["response_ms"],
+            row.get("last_book_change_ts"), row.get("last_book_lead_ms"),
+            row.get("last_trade_ts"), row.get("last_trade_lead_ms"),
+            json.dumps(row.get("detail") or {}, separators=(",", ":")),
+        ),
+    )
+    return cur.lastrowid
+
+
+def finish_goal_latency(row_id, first_book=None, first_trade=None):
+    ex(
+        """UPDATE goal_latency_observations
+              SET first_book_after_ts=?, first_book_after_ms=?,
+                  first_trade_after_ts=?, first_trade_after_ms=?
+            WHERE id=?""",
+        (
+            first_book.get("wall") if first_book else None,
+            first_book.get("delta_ms") if first_book else None,
+            first_trade.get("wall") if first_trade else None,
+            first_trade.get("delta_ms") if first_trade else None,
+            row_id,
+        ),
+    )
 
 
 def upsert_market(ticker, event, series, title, close_time, status):

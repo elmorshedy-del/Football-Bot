@@ -55,6 +55,15 @@ PAPER_ENTRY_LATENCY_MS = _f("PAPER_ENTRY_LATENCY_MS", 150.0)
 PAPER_EXIT_LATENCY_MS = _f("PAPER_EXIT_LATENCY_MS", 150.0)
 PAPER_EXECUTION_POLL_MS = _f("PAPER_EXECUTION_POLL_MS", 5.0)
 
+# --- Read-only Kalshi goal/market latency observer ---
+# This never participates in signal generation or paper execution.  It polls
+# Kalshi's milestone live-data endpoint and timestamps score changes beside the
+# already-received market stream so feed latency can be measured empirically.
+GOAL_LATENCY_OBSERVER = _b("GOAL_LATENCY_OBSERVER", True)
+GOAL_LATENCY_POLL_MS = _f("GOAL_LATENCY_POLL_MS", 250.0)
+GOAL_LATENCY_LOOKBACK_S = _f("GOAL_LATENCY_LOOKBACK_S", 10.0)
+GOAL_LATENCY_AFTER_S = _f("GOAL_LATENCY_AFTER_S", 2.0)
+
 # --- Market discovery ---
 DISCOVERY_INTERVAL_S = _i("DISCOVERY_INTERVAL_S", 180)
 SUBSCRIBE_BEFORE_CLOSE_MIN = _i("SUBSCRIBE_BEFORE_CLOSE_MIN", 150)  # watch markets closing within this

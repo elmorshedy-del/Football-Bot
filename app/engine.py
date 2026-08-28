@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from . import config, store
 from .books import Book
 from .detector import Detector
+from .goal_latency import GoalLatencyObserver
 from .kalshi import KalshiClient, KalshiWS
 from .paper import PaperDesk
 from .recorder import RawRecorder
@@ -44,9 +45,13 @@ class Engine:
         self.meta = {}                 # ticker -> {event, series, title, close_time}
         self.fee_schedules = {}        # series -> (fee_type, fee_multiplier)
         self.event_markets = {}        # event -> [tickers]
+        self.watched_events = set()    # current discovery window only
         self.prices = {}               # ticker -> {last,bid,ask,spark:deque,dirty}
         self.pending = []              # candidates awaiting sibling confirmation
         self.feed_lag = deque(maxlen=600)
+        self.market_observations = {}  # event -> recent locally timestamped price changes
+        self._last_market_state = {}   # (kind, ticker) -> tuple, suppress unchanged frames
+        self.goal_latency = None
         self.ws = None
         self.ws_state = "init"
         self.started = time.time()
@@ -103,6 +108,40 @@ class Engine:
                                    "spark": deque(maxlen=180), "dirty": False}
         return self.prices[ticker]
 
+    def _record_market_observation(self, ticker, kind, wall, mono):
+        """Keep an in-memory arrival timeline; never calls strategy code or SQLite."""
+        meta = self.meta.get(ticker)
+        if not meta:
+            return
+        price = self.price_state(ticker)
+        state = ((price.get("bid"), price.get("ask")) if kind == "book"
+                 else (price.get("last"),))
+        key = kind, ticker
+        previous = self._last_market_state.get(key)
+        self._last_market_state[key] = state
+        if previous == state:
+            return
+        # An initial order-book snapshot is baseline, not a market movement.
+        # The first observed trade is a genuine timestamped market event.
+        if previous is None and kind == "book":
+            return
+        event = meta["event"]
+        observations = self.market_observations.setdefault(event, deque(maxlen=4000))
+        observations.append({
+            "wall": wall,
+            "mono": mono,
+            "kind": kind,
+            "ticker": ticker,
+            "bid": price.get("bid"),
+            "ask": price.get("ask"),
+            "last": price.get("last"),
+        })
+
+    def market_window(self, event, anchor_mono, before_s, after_s):
+        lower, upper = anchor_mono - before_s, anchor_mono + after_s
+        return [row for row in self.market_observations.get(event, ())
+                if lower <= row["mono"] <= upper]
+
     # ---------- ws routing ----------
     def handle_ws(self, msg, wall, mono):
         t = msg.get("type")
@@ -133,6 +172,7 @@ class Engine:
             b.apply_snapshot(body, msg.get("seq"))
             self.desk.apply_book_snapshot(ticker, b)
             self.on_book(ticker)
+            self._record_market_observation(ticker, "book", wall, mono)
         elif t == "orderbook_delta":
             b = self.books.setdefault(ticker, Book())
             if not b.apply_delta(body, msg.get("seq"), sequence_validated=True):
@@ -142,6 +182,7 @@ class Engine:
             else:
                 self.desk.apply_book_delta(ticker, body, msg.get("seq"))
                 self.on_book(ticker)
+                self._record_market_observation(ticker, "book", wall, mono)
         elif t == "trade":
             ts_ms = body.get("ts_ms") or (body.get("ts", 0) * 1000)
             px = float(body.get("yes_price_dollars", 0)) * 100
@@ -151,6 +192,7 @@ class Engine:
             if self.n_trades % 20 == 0:
                 store.add_latency("feed_lag", lag)
             self.process_trade(ticker, int(ts_ms), px, sz, body.get("taker_side"), wall)
+            self._record_market_observation(ticker, "trade", wall, mono)
         elif t == "market_lifecycle_v2":
             res = body.get("settled_result") or body.get("result")
             if res in ("yes", "no"):
@@ -312,6 +354,9 @@ class Engine:
                             want.add(tk)
                 if self.ws:
                     await self.ws.set_markets(want)
+                self.watched_events = {
+                    self.meta[t]["event"] for t in want if t in self.meta
+                }
                 self.broadcast({"type": "log", "text":
                                 f"discovery: watching {len(want)} markets "
                                 f"({len(set(self.meta[t]['event'] for t in want if t in self.meta))} matches)"})
@@ -384,6 +429,8 @@ class Engine:
                 "paper_pending": len(self.desk.pending_entries) + len(self.desk.pending_exits),
                 "demo": self.demo_status, "cred_error": self.cred_error,
                 "foreign_dropped": self.n_foreign,
+                "goal_latency": (self.goal_latency.status() if self.goal_latency else
+                                 {"enabled": False}),
                 "feed_lag_p50": round(lat[len(lat) // 2], 1) if lat else None,
                 "feed_lag_p95": round(lat[int(0.95 * len(lat))], 1) if len(lat) > 20 else None}
 
@@ -397,6 +444,13 @@ class Engine:
             asyncio.create_task(self.ws.run())
             asyncio.create_task(self.discovery_task())
             asyncio.create_task(self.settle_poll_task())
+            if config.GOAL_LATENCY_OBSERVER:
+                self.goal_latency = GoalLatencyObserver(
+                    self.client,
+                    lambda: self.watched_events,
+                    self.market_window,
+                )
+                asyncio.create_task(self.goal_latency.run())
             store.log_event("sys", "engine started in LIVE mode")
         else:
             from .replay import DemoReplay

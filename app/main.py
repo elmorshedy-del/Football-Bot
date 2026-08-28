@@ -80,6 +80,8 @@ async def get_config():
             "timeout_s": config.TIMEOUT_S, "lockout_s": config.LOCKOUT_S,
             "late_only": config.LATE_ONLY, "use_stop": config.USE_STOP,
             "paper_execution_v2": config.PAPER_EXECUTION_V2,
+            "goal_latency_observer": config.GOAL_LATENCY_OBSERVER,
+            "goal_latency_poll_ms": config.GOAL_LATENCY_POLL_MS,
             "league_prior": config.LEAGUE_PRIOR}
 
 
@@ -140,6 +142,21 @@ async def latency():
                   "p95": round(v[int(0.95 * len(v))], 1) if len(v) > 20 else None,
                   "hist": v[-200:]}
     return out
+
+
+@app.get("/api/goal-latency")
+async def goal_latency(limit: int = 100):
+    limit = max(1, min(limit, 500))
+    rows = store.q(
+        "SELECT * FROM goal_latency_observations ORDER BY id DESC LIMIT ?", (limit,),
+    )
+    for row in rows:
+        for field in ("score_before", "score_after", "detail"):
+            try:
+                row[field] = json.loads(row[field])
+            except (TypeError, json.JSONDecodeError):
+                pass
+    return rows
 
 
 @app.get("/api/eventlog")

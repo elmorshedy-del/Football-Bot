@@ -37,6 +37,41 @@ class PaperExecutionStoreTests(unittest.TestCase):
             "outcome": "queued",
         })
 
+    def test_goal_latency_observation_persists_both_sides_of_market_window(self):
+        row_id = store.insert_goal_latency({
+            "observed_ts": 10.0,
+            "event": "E",
+            "milestone_id": "M",
+            "change_kind": "goal",
+            "live_type": "soccer",
+            "score_before": {"homeScore": 0.0},
+            "score_after": {"homeScore": 1.0},
+            "previous_poll_ts": 9.75,
+            "poll_started_ts": 9.99,
+            "response_ms": 12.5,
+            "last_book_change_ts": 9.9,
+            "last_book_lead_ms": 100.0,
+            "last_trade_ts": 9.8,
+            "last_trade_lead_ms": 200.0,
+            "detail": {"poll_uncertainty_ms": 250.0},
+        })
+        store.finish_goal_latency(
+            row_id,
+            {"wall": 10.1, "delta_ms": 100.0},
+            {"wall": 10.2, "delta_ms": 200.0},
+        )
+
+        rows = store.q(
+            """SELECT change_kind,last_book_lead_ms,first_book_after_ms,
+                      first_trade_after_ms FROM goal_latency_observations"""
+        )
+        self.assertEqual(rows, [{
+            "change_kind": "goal",
+            "last_book_lead_ms": 100.0,
+            "first_book_after_ms": 100.0,
+            "first_trade_after_ms": 200.0,
+        }])
+
     def test_open_and_close_persist_each_level_and_progress_atomically(self):
         signal_id = self.insert_signal()
         trade = {
