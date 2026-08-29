@@ -15,8 +15,19 @@ class UnsupportedFeeSchedule(ValueError):
     pass
 
 
+TAKER_QUADRATIC_FEE_TYPES = frozenset({
+    "quadratic",
+    "quadratic_with_maker_fees",
+})
+
+
 def fee_dollars(contracts, price_c, fee_type="quadratic", fee_multiplier=1.0):
-    if fee_type != "quadratic" or fee_multiplier is None:
+    """Return the taker fee for a fill under a supported live series schedule.
+
+    Maker-enabled series still use Kalshi's standard quadratic formula for an
+    immediately executable (taker) order. V2 never posts resting maker orders.
+    """
+    if fee_type not in TAKER_QUADRATIC_FEE_TYPES or fee_multiplier is None:
         raise UnsupportedFeeSchedule(f"unsupported fee schedule: {fee_type!r}")
     p = price_c / 100.0
     return math.ceil(0.07 * float(fee_multiplier) * contracts * p * (1 - p) * 100) / 100.0

@@ -94,8 +94,10 @@ V2 also persists every entry/exit level and fee in `paper_fills`, commits the
 signal result and trade atomically, retries database failures without losing
 paper depth, resumes partial stop/timeout/flatten exits, and restores open paper
 positions after restart. Live fee type/multiplier metadata comes from Kalshi's
-`/series/{series_ticker}` endpoint; an unknown or unsupported schedule is
-recorded as `unsupported_fee` instead of guessing profitability. K1 verifies
+`/series/{series_ticker}` endpoint. Taker fills support both `quadratic` and
+`quadratic_with_maker_fees`; V2 never posts maker orders, so maker fees are not
+simulated. An unknown or unsupported schedule is recorded as `unsupported_fee`
+instead of guessing profitability. K1 verifies
 fills against the saved arrival book after 25 fills, K2 cannot pass before 50
 confirmed signals, and K4 measures total signal-to-paper-arrival latency.
 

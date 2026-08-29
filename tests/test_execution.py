@@ -3,7 +3,13 @@ from unittest.mock import patch
 
 from app.books import Book
 from app.execution import ShadowBook, ShadowBooks
-from app.paper import PaperDesk, PendingExit, Position, level_fees
+from app.paper import (
+    PaperDesk,
+    PendingExit,
+    Position,
+    UnsupportedFeeSchedule,
+    level_fees,
+)
 
 
 def live_book(yes=None, no=None):
@@ -104,6 +110,18 @@ class ShadowBookTests(unittest.TestCase):
             level_fees([(45.0, 2.0), (50.0, 3.0)], "quadratic", 2.0),
             [(45.0, 2.0, 0.07), (50.0, 3.0, 0.11)],
         )
+
+    def test_maker_enabled_schedule_uses_same_taker_fee(self):
+        levels = [(45.0, 2.0), (50.0, 3.0)]
+
+        self.assertEqual(
+            level_fees(levels, "quadratic_with_maker_fees", 1.0),
+            level_fees(levels, "quadratic", 1.0),
+        )
+
+    def test_other_fee_schedules_still_fail_closed(self):
+        with self.assertRaises(UnsupportedFeeSchedule):
+            level_fees([(45.0, 2.0)], "flat", 1.0)
 
 
 class PaperDeskV2Tests(unittest.TestCase):
@@ -212,6 +230,35 @@ class PaperDeskV2Tests(unittest.TestCase):
         self.assertFalse(desk.pending_entries)
         self.assertEqual(desk.shadows.ensure("T", book).no_bids, {55.0: 2.0})
         self.assertEqual(finish_signal.call_args.args[1], "unsupported_fee")
+
+    @patch("app.paper.store.log_event")
+    @patch("app.paper.store.open_paper_trade", return_value=10)
+    def test_maker_enabled_series_executes_as_taker(self, open_trade, _log):
+        results = []
+        desk = PaperDesk(lambda msg: None, lambda *args: results.append(args), realistic=True)
+        book = live_book(no={55.0: 2.0})
+        sig = {"ticker": "KXEPLGAME-TEST", "dir": 1, "ref": 40.0, "ext": 60.0}
+        meta = {
+            "event": "KXEPLGAME-EVENT",
+            "series": "KXEPLGAME",
+            "fee_type": "quadratic_with_maker_fees",
+            "fee_multiplier": 1.0,
+        }
+
+        with patch("app.paper.config.PAPER_ENTRY_LATENCY_MS", 0.0), \
+                patch("app.paper.config.NOTIONAL_USD", 0.90), \
+                patch("app.paper.config.PRICE_CAP", 50.0):
+            desk.queue_enter(43, sig, meta, 0.0, 100.0)
+            desk.process_pending({sig["ticker"]: book}, now_mono=1.0, now_wall=100.1)
+
+        self.assertEqual(results[0][2], "filled")
+        self.assertIn(10, desk.positions)
+        self.assertEqual(
+            open_trade.call_args.args[0]["fee_type"],
+            "quadratic_with_maker_fees",
+        )
+        self.assertEqual(open_trade.call_args.args[2], [(45.0, 2.0, 0.04)])
+        self.assertEqual(open_trade.call_args.args[3], 0.04)
 
     @patch("app.paper.store.log_event")
     @patch("app.paper.store.record_paper_exit", side_effect=RuntimeError("db unavailable"))
