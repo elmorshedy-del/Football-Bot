@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from app.engine import Engine
+from app.late_score_sleeve import SleeveDecision
 
 
 class SignalPersistenceTests(unittest.TestCase):
@@ -10,10 +11,13 @@ class SignalPersistenceTests(unittest.TestCase):
         engine = Engine.__new__(Engine)
         engine.meta = {"T": {"event": "E", "series": "S"}}
         engine.books = {"T": object()}
+        engine.event_markets = {"E": ["T", "D", "A"]}
         engine.desk = Mock()
         engine.detector = Mock()
+        engine.late_score_sleeve = Mock()
         engine.detector.state.return_value = SimpleNamespace(last_entry_ms=None)
         engine.is_late = Mock(return_value=True)
+        engine.is_sleeve_window = Mock(return_value=True)
         engine.record_signal = Mock(return_value=42)
         engine._announce_signal = Mock()
         return engine
@@ -50,6 +54,27 @@ class SignalPersistenceTests(unittest.TestCase):
 
         self.assertEqual(update_outcome.call_args.args[1], "execution_error")
         self.assertIn("database unavailable", update_outcome.call_args.args[2]["error"])
+
+    def test_price_only_sleeve_rejection_never_reaches_execution(self):
+        engine = self.make_engine()
+        engine.late_score_sleeve.classify.return_value = SleeveDecision(
+            False,
+            "incoherent_sibling_rise",
+            {"strategy": "price_only_late_score_v1", "feed_independent": True},
+        )
+        candidate = {
+            "ticker": "T", "ts_ms": 1000, "local_ts": 1.0, "dir": 1,
+            "dl": 1.0, "levels": 5, "size": 200.0, "ref": 40.0, "ext": 60.0,
+        }
+
+        with patch("app.engine.config.PRICE_ONLY_SLEEVE_MODE", "enforce"):
+            engine.act_on_signal(candidate, 10.0)
+
+        engine.record_signal.assert_called_once_with(
+            candidate, 10.0, "sleeve_incoherent_sibling_rise",
+        )
+        engine.desk.try_enter.assert_not_called()
+        self.assertEqual(candidate["sleeve"]["decision"], "incoherent_sibling_rise")
 
 
 if __name__ == "__main__":

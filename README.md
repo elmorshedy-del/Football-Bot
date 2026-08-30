@@ -26,6 +26,9 @@ Built from a 2,377-event backtest over the entire history of Kalshi soccer marke
   fill-model-vs-reality, feed latency p95, per-league rolling edge
 - **Measures goal-feed latency** without affecting trading: batches Kalshi milestone
   score polls and timestamps numeric score changes beside received book/trade changes
+- **Optionally infers late +1/equalizer transitions from prices alone**: normalizes the
+  Home/Draw/Away triplet, rejects incoherent one-leg moves, and manages reversion with
+  fee-aware scratch, trailing-profit, reversal, oscillation, and short-timeout exits
 - **Dashboard**: live match cards, signal wire, paper desk, equity curve, league edge,
   latency histograms, kill switch — all streaming over WebSocket
 
@@ -71,6 +74,7 @@ to the defaults. Notable ones:
 | `CONF_MS` / `CONF_SIGN` | 50 / true | sibling confirmation window / opposite-sign requirement |
 | `LATE_ONLY` | false | trade only within `LATE_WINDOW_MIN` of scheduled close |
 | `USE_STOP` | false | stops off per Gate A forensics (shadow-stop is always recorded) |
+| `PRICE_ONLY_SLEEVE_MODE` | off | `enforce` admits only price-inferred +1/equalizer transitions in the minute-88 window |
 | `PAPER_EXECUTION_V2` | false | opt into latency-aware paper arrivals, shadow liquidity, and entry/exit depth walking |
 | `GOAL_LATENCY_OBSERVER` | true | read-only Kalshi score-vs-market arrival experiment; never enters the signal path |
 | `GOAL_LATENCY_POLL_MS` | 250 | target interval for batched score polling; actual uncertainty is saved per observation |
@@ -100,6 +104,46 @@ simulated. An unknown or unsupported schedule is recorded as `unsupported_fee`
 instead of guessing profitability. K1 verifies
 fills against the saved arrival book after 25 fills, K2 cannot pass before 50
 confirmed signals, and K4 measures total signal-to-paper-arrival latency.
+
+### Price-only late-score sleeve
+
+Set both `PRICE_ONLY_SLEEVE_MODE=enforce` and `PAPER_EXECUTION_V2=true` to run the
+new sleeve with realistic paper fills. It never reads a score, goal, VAR, penalty,
+or other match-event feed. Minute 88 is approximated from the market's scheduled
+`expected_expiration_time`; the default window begins two minutes before that time
+and stays open for twelve minutes of possible stoppage.
+
+For each complete 1X2 market, the sleeve converts executable midpoints into a
+normalized state vector:
+
+`q_i(t) = midpoint_i(t) / sum_j midpoint_j(t)`
+
+A rising team leg is labeled a *latent +1 transition*; a rising draw leg is labeled
+a *latent equalizer*. Entry still requires the frozen Gate-A sweep and sibling
+confirmation, plus a sufficiently large normalized gain, a sufficiently strong
+post-state, no materially rising sibling, and at least 85% of the target gain
+explained by probability leaving the other two legs. Ambiguous/missing triplets,
+wide books, missing baselines, and negative sweeps fail closed. These are market
+state inferences, not claims that the score was observed.
+
+After entry, exits use executable bids. Once maximum favorable excursion is large
+enough, the sleeve estimates round-trip taker fees per contract and scratches on a
+return toward that break-even level. A larger move arms a trailing-profit exit.
+Rapid full reversion exits as `sleeve_reversal`; oscillatory paths, profit decay,
+and a 30-second hold limit also flatten through the latency-aware depth walker.
+Because exit latency, spread gaps, and disappearing liquidity exist, a scratch
+trigger cannot guarantee a no-loss fill.
+
+The numeric defaults are deliberately bootstrap parameters, not an optimized edge.
+Every decision stores its normalized triplet features in `signals.detail`, every
+fill/fee/exit is stored in the paper ledger, and the raw feed is already retained for
+counterfactual replay. Reconfiguration should be done only with event-grouped,
+chronological walk-forward evaluation: fit on earlier matches, choose the candidate
+with the best lower event-clustered 95% confidence bound after fees and latency, then
+promote it only if an untouched later-match holdout is also positive with at least 50
+independent events and acceptable drawdown/tail loss. Do not let live observations
+continuously retune the active thresholds; use frozen champion/challenger versions
+so the holdout remains meaningful.
 
 ### Goal latency observer
 

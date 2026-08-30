@@ -4,11 +4,14 @@ This is the module that answers the question backtests cannot: what depth
 actually rests at the moment our order would arrive. Fees use the verified
 official formula. No real orders are ever sent."""
 import math
+import json
 import time
+from collections import deque
 from dataclasses import dataclass
 
 from . import config, store
 from .execution import ShadowBooks
+from .late_score_sleeve import sleeve_exit_reason
 
 
 class UnsupportedFeeSchedule(ValueError):
@@ -43,7 +46,7 @@ def level_fees(levels, fee_type="quadratic", fee_multiplier=1.0):
 
 class Position:
     def __init__(self, tid, signal_id, market, event, series, d, side, entry_px, size, ref, ext,
-                 fee_type="quadratic", fee_multiplier=1.0):
+                 fee_type="quadratic", fee_multiplier=1.0, sleeve=None):
         self.tid = tid
         self.signal_id = signal_id
         self.market = market
@@ -68,6 +71,10 @@ class Position:
         self.entry_fees = 0.0
         self.exit_qty = 0.0
         self.exit_vwap_num = 0.0
+        self.sleeve = dict(sleeve or {})
+        self.sleeve_anchor_bid = None
+        self.peak_bid = entry_px
+        self.bid_path = deque(maxlen=240)
 
     def unrealized(self, bid):
         return self.realized_gross + (bid - self.entry_px) * self.remaining / 100.0
@@ -112,11 +119,21 @@ class PaperDesk:
             remaining = float(row["remaining"] if row["remaining"] is not None else size)
             if remaining <= 1e-9:
                 continue
+            signal_detail = row.get("signal_detail") or {}
+            if isinstance(signal_detail, str):
+                try:
+                    signal_detail = json.loads(signal_detail)
+                except (TypeError, json.JSONDecodeError):
+                    signal_detail = {}
+            sleeve = signal_detail.get("sleeve") or (
+                signal_detail if signal_detail.get("strategy") == "price_only_late_score_v1" else {}
+            )
             pos = Position(
                 row["id"], row["signal_id"], row["market"], row["event"], row["series"],
                 row["dir"], row["side"], float(row["entry_px"]), size,
                 row.get("ref"), row.get("ext"), row.get("fee_type") or "quadratic",
                 row.get("fee_multiplier") if row.get("fee_multiplier") is not None else 1.0,
+                sleeve,
             )
             pos.entry_ts = float(row["entry_ts"])
             pos.remaining = remaining
@@ -235,7 +252,7 @@ class PaperDesk:
             0, pending.signal_id, pending.sig["ticker"], pending.meta["event"],
             pending.meta["series"], pending.sig["dir"], side, fill.vwap,
             fill.quantity, pending.sig["ref"], pending.sig["ext"],
-            fee_type, fee_multiplier,
+            fee_type, fee_multiplier, pending.sig.get("sleeve"),
         )
         pos.entry_ts = now_wall
         pos.entry_fees = entry_fee
@@ -281,6 +298,8 @@ class PaperDesk:
             "order_arrival_ms": round(order_arrival_ms, 3) if order_arrival_ms is not None else None,
             "fill_levels": levels,
         }
+        if pending.sig.get("sleeve"):
+            detail["sleeve"] = pending.sig["sleeve"]
         return latency_ms, order_arrival_ms, detail
 
     def _notify_entry(self, pending, outcome, detail):
@@ -335,7 +354,8 @@ class PaperDesk:
             "book_at_entry": book.snapshot_dict(),
         })
         pos = Position(tid, signal_id, sig["ticker"], meta["event"], meta["series"],
-                       sig["dir"], side, entry_px, size, sig["ref"], sig["ext"])
+                       sig["dir"], side, entry_px, size, sig["ref"], sig["ext"],
+                       sleeve=sig.get("sleeve"))
         self.positions[tid] = pos
         self.broadcast({"type": "trade_open", "trade": self.pos_dict(pos)})
         store.log_event("trade", f"OPEN {side.upper()} {sig['ticker']} {size:.0f}@{entry_px:.1f}")
@@ -346,7 +366,8 @@ class PaperDesk:
                 "side": pos.side, "dir": pos.dir, "entry_px": round(pos.entry_px, 2),
                 "size": round(pos.remaining if self.realistic else pos.size, 1),
                 "initial_size": round(pos.initial_size, 1), "entry_ts": pos.entry_ts,
-                "bid": bid, "upnl": round(pos.unrealized(bid), 2) if bid is not None else None}
+                "bid": bid, "upnl": round(pos.unrealized(bid), 2) if bid is not None else None,
+                "strategy": pos.sleeve.get("strategy") if pos.sleeve else "gate_a"}
 
     def on_book(self, ticker, book):
         """Mark open positions on this market; handle target exits + shadow metrics."""
@@ -380,18 +401,41 @@ class PaperDesk:
                     self._queue_exit(pos, "target", config.TARGET)
                 else:
                     self.close(pos, config.TARGET, "target")
+                continue
+            reason = sleeve_exit_reason(pos, bid, time.time(), fee_dollars)
+            if reason:
+                if self.realistic:
+                    # The trigger uses the observed executable bid.  A zero floor
+                    # models a taker exit after latency instead of assuming the
+                    # scratch or trailing level remains available.
+                    self._queue_exit(pos, reason, 0.0)
+                else:
+                    self.close(pos, bid, reason)
 
     def check_timeouts(self):
         now = time.time()
         for pos in list(self.positions.values()):
-            if now - pos.entry_ts > config.TIMEOUT_S:
+            timeout_s = config.SLEEVE_TIMEOUT_S if pos.sleeve else config.TIMEOUT_S
+            if now - pos.entry_ts > timeout_s:
+                reason = "sleeve_timeout" if pos.sleeve else "timeout"
                 if self.realistic:
-                    self._queue_exit(pos, "timeout", 0.0)
+                    self._queue_exit(pos, reason, 0.0)
                 else:
-                    self.close(pos, pos.best_bid, "timeout")
+                    self.close(pos, pos.best_bid, reason)
 
     def _queue_exit(self, pos, reason, price_floor):
-        priority = {"target": 1, "timeout": 2, "stop": 3, "flatten": 4, "kill": 5}
+        priority = {
+            "target": 1,
+            "timeout": 2,
+            "sleeve_timeout": 2,
+            "sleeve_profit_lock": 3,
+            "sleeve_scratch": 3,
+            "sleeve_oscillation": 3,
+            "stop": 4,
+            "sleeve_reversal": 4,
+            "flatten": 5,
+            "kill": 6,
+        }
         current = self.pending_exits.get(pos.tid)
         if current is not None and priority.get(current.reason, 0) >= priority.get(reason, 0):
             return
