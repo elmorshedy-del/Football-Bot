@@ -268,11 +268,13 @@ Status: `PASSED`
 
 Evidence reviewed:
 
-- Pull request: `#8`, `codex/dual-sleeve-audit-dashboard` into `main`; one commit, 32 files,
+- Pull request: `#8`, `codex/dual-sleeve-audit-dashboard` into `main`; scoped implementation and
+  audit-record commits across 32 implementation/review paths,
   mergeable without conflicts, no unresolved review threads, and independently revertible from
   the original price-only sleeve pull request.
-- GitHub Continuous Integration run `33322017843` completed successfully. It executed all 98 tests,
-  compile checks, and the repository's pinned Ruff fatal-error checks on Python 3.12.
+- GitHub Continuous Integration runs `33322017843` and `33322118820` completed successfully. The
+  latest head executed all 98 tests, compile checks, and the repository's pinned Ruff fatal-error
+  checks on Python 3.12.
 - GitHub tree `2666249838148d64a6f3b44c72773dc88744464b` exactly matched the locally tested
   commit tree; the connector-created commit changed precisely the 32 reviewed paths.
 
