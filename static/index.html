@@ -1,87 +1,193 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>Football-Bot — Late-Game Sniper</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Oswald:wght@400;600;700&family=JetBrains+Mono:wght@400;600;800&display=swap" rel="stylesheet">
-<script src="https://cdn.jsdelivr.net/npm/echarts@5/dist/echarts.min.js"></script>
-<link rel="stylesheet" href="style.css"/>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Stoppage Lab · Dual-Sleeve Paper Study</title>
+  <link rel="stylesheet" href="style.css">
 </head>
 <body>
-<div id="goalflash"></div>
-
-<header>
-  <div class="brand">
-    <span class="ball">⚽</span>
-    <div>
-      <h1>FOOTBALL-BOT</h1>
-      <div class="sub">LATE-GAME SNIPER · KALSHI PAPER DESK</div>
-    </div>
-    <span id="modebadge" class="badge">…</span>
-  </div>
-  <div class="chips">
-    <span class="chip" id="chip-ws">WS —</span>
-    <span class="chip" id="chip-lag">LAG —</span>
-    <span class="chip" id="chip-mkts">0 MKTS</span>
-    <span class="chip" id="chip-rec">REC 0</span>
-    <span class="chip" id="chip-up">UP 0s</span>
-    <button id="soundbtn" class="chip btn" title="goal horn">🔇</button>
-    <button id="killbtn" class="killbtn">KILL SWITCH</button>
-  </div>
-</header>
-
-<div id="demobanner" class="hidden">🎬 <b>DEMO MODE</b> — replaying the real Espanyol–Real Madrid tape (Aug 22, 2026: the 90'+ winner that started this project). Add Kalshi API keys to go live. <span id="demostatus"></span></div>
-
-<section class="tiles">
-  <div class="tile hero"><label>NET P&amp;L (PAPER)</label><div class="v money" id="t-net">$0.00</div></div>
-  <div class="tile"><label>TRADES</label><div class="v" id="t-trades">0</div></div>
-  <div class="tile"><label>WIN RATE</label><div class="v" id="t-win">—</div></div>
-  <div class="tile"><label>NET / FILL</label><div class="v" id="t-npf">—</div></div>
-  <div class="tile"><label>95% CI / FILL</label><div class="v small" id="t-ci">collecting…</div></div>
-  <div class="tile"><label>SIGNALS</label><div class="v" id="t-sigs">0</div></div>
-  <div class="tile"><label>OPEN</label><div class="v" id="t-open">0</div></div>
-  <div class="tile"><label>FEES PAID</label><div class="v" id="t-fees">$0</div></div>
-</section>
-
-<main>
-  <div class="col main-col">
-    <div class="panel">
-      <h2>🏟 LIVE PITCH <span class="hint" id="pitch-hint">matches being watched</span></h2>
-      <div id="matches" class="matches"><div class="empty">waiting for matches…</div></div>
-    </div>
-    <div class="panel">
-      <h2>📡 SIGNAL WIRE <span class="hint">confirmed = sibling swept within ±50ms, opposite sign</span></h2>
-      <div id="signals" class="wire"></div>
-    </div>
-  </div>
-
-  <div class="col side-col">
-    <div class="panel">
-      <h2>💼 PAPER DESK</h2>
-      <div id="openpos"></div>
-      <div class="chart" id="equity"></div>
-      <h3>TRADE LOG</h3>
-      <div class="tablewrap">
-        <table id="tradetable">
-          <thead><tr><th>mkt</th><th>side</th><th>in</th><th>out</th><th>why</th><th>net</th></tr></thead>
-          <tbody></tbody>
-        </table>
+  <header class="topbar">
+    <div class="brand-block">
+      <div class="brand-mark" aria-hidden="true">SL</div>
+      <div>
+        <h1>Stoppage Lab</h1>
+        <p>Dual-sleeve football market paper study</p>
       </div>
+      <span id="mode-badge" class="status-pill neutral">Starting</span>
     </div>
+    <div class="header-actions">
+      <button id="sound-button" class="button secondary" type="button">Sound off</button>
+      <button id="export-button" class="button secondary" type="button">Download study data</button>
+      <button id="kill-button" class="button danger" type="button">Kill switch</button>
+    </div>
+  </header>
+
+  <div class="study-notice">
+    <strong>Paper study only.</strong> Returns are not guaranteed. The match feed is diagnostic
+    and never participates in entries or exits; event matches show proximity and consistency,
+    not proven causation.
   </div>
-</main>
 
-<section class="analytics">
-  <div class="panel"><h2>🏆 LEAGUE EDGE <span class="hint">live net $ by league · bars = backtest prior ¢/ct</span></h2><div class="chart" id="leagues"></div></div>
-  <div class="panel"><h2>⏱ FEED LATENCY <span class="hint">exchange→here ms (incl clock skew)</span></h2><div class="chart" id="latency"></div></div>
-  <div class="panel"><h2>🚪 EXITS</h2><div class="chart" id="exits"></div></div>
-  <div class="panel killpanel"><h2>💀 KILL CONDITIONS</h2><div id="killconds"></div></div>
-</section>
+  <main class="page-shell">
+    <section id="health-panel" class="health-panel checking" aria-live="polite">
+      <div class="section-heading health-heading">
+        <div>
+          <p class="eyebrow">System status</p>
+          <h2 id="health-title">Checking every connection</h2>
+          <p id="health-summary" class="section-copy">Waiting for the first complete status response.</p>
+        </div>
+        <span id="health-indicator" class="health-indicator">Checking</span>
+      </div>
+      <div id="health-checks" class="health-checks"></div>
+      <details id="error-details" class="error-details">
+        <summary>Recent errors and disconnects <span id="error-count">0</span></summary>
+        <div id="error-list" class="error-list"></div>
+      </details>
+    </section>
 
-<footer><div id="ticker" class="ticker"></div></footer>
+    <section class="runtime-strip" aria-label="Live runtime metrics">
+      <div><span>Dashboard link</span><strong id="runtime-dashboard">Connecting</strong></div>
+      <div><span>Market stream</span><strong id="runtime-market">Checking</strong></div>
+      <div><span>Match-event feed</span><strong id="runtime-event">Checking</strong></div>
+      <div><span>Last match-feed poll</span><strong id="runtime-event-poll">Not recorded</strong></div>
+      <div><span>Match-feed response</span><strong id="runtime-event-response">Collecting</strong></div>
+      <div><span>Median market delay</span><strong id="runtime-feed-lag">—</strong></div>
+      <div><span>Watched matches</span><strong id="runtime-matches">0</strong></div>
+      <div><span>Raw messages recorded</span><strong id="runtime-recorded">0</strong></div>
+      <div><span>Service uptime</span><strong id="runtime-uptime">—</strong></div>
+    </section>
 
-<script src="app.js"></script>
+    <section>
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Independent simulations</p>
+          <h2>Paper profit and loss by sleeve</h2>
+          <p class="section-copy">Headline net is closed, realized P&amp;L after fees. Open marks are shown separately.</p>
+        </div>
+        <div id="combined-summary" class="combined-summary">Combined results are loading.</div>
+      </div>
+      <div id="sleeve-cards" class="sleeve-grid"></div>
+    </section>
+
+    <section class="dashboard-grid two-one">
+      <article class="panel span-two">
+        <div class="section-heading compact">
+          <div>
+            <p class="eyebrow">Live market</p>
+            <h2>Matches and contracts</h2>
+          </div>
+          <p class="section-copy">Prices are cents per contract. Raw identifiers remain in each audit detail.</p>
+        </div>
+        <div id="match-list" class="match-grid"><div class="empty-state">Waiting for watched matches.</div></div>
+      </article>
+
+      <article class="panel">
+        <div class="section-heading compact">
+          <div>
+            <p class="eyebrow">Current risk</p>
+            <h2>Open paper positions</h2>
+          </div>
+        </div>
+        <div id="position-list" class="stack-list"><div class="empty-state">No open paper positions.</div></div>
+      </article>
+    </section>
+
+    <section class="panel">
+      <div class="section-heading">
+        <div>
+          <p class="eyebrow">Decision ledger</p>
+          <h2>What triggered, what happened, and what it matched</h2>
+          <p class="section-copy">Every row retains exact timestamps, thresholds, observed values, canonical match event, and raw IDs.</p>
+        </div>
+      </div>
+      <div id="signal-list" class="audit-list"><div class="empty-state">No detector episodes recorded yet.</div></div>
+    </section>
+
+    <section class="dashboard-grid equal">
+      <article class="panel">
+        <div class="section-heading compact">
+          <div>
+            <p class="eyebrow">Diagnostic feed</p>
+            <h2>Canonical match events</h2>
+          </div>
+          <p class="section-copy">Observed locally; provider clock appears only when supplied.</p>
+        </div>
+        <div id="event-list" class="event-list"><div class="empty-state">No score change observed yet.</div></div>
+      </article>
+
+      <article class="panel">
+        <div class="section-heading compact">
+          <div>
+            <p class="eyebrow">Closed realized results</p>
+            <h2>Cumulative P&amp;L after fees</h2>
+          </div>
+          <p class="section-copy">Independent strategy lines; dollars on the vertical axis.</p>
+        </div>
+        <div id="equity-chart" class="chart-frame" role="img" aria-label="Cumulative realized paper profit and loss by sleeve"></div>
+      </article>
+    </section>
+
+    <section class="dashboard-grid thirds">
+      <article class="panel">
+        <div class="section-heading compact">
+          <div>
+            <p class="eyebrow">Timing</p>
+            <h2>Recorded latency</h2>
+          </div>
+          <p class="section-copy">Median and 95th percentile in milliseconds; smaller is better.</p>
+        </div>
+        <div id="latency-chart" class="metric-bars"></div>
+      </article>
+
+      <article class="panel">
+        <div class="section-heading compact">
+          <div>
+            <p class="eyebrow">Outcomes</p>
+            <h2>Why positions closed</h2>
+          </div>
+          <p class="section-copy">Counts are separated by strategy.</p>
+        </div>
+        <div id="exit-chart" class="metric-bars"></div>
+      </article>
+
+      <article class="panel">
+        <div class="section-heading compact">
+          <div>
+            <p class="eyebrow">Promotion discipline</p>
+            <h2>Evidence gates</h2>
+          </div>
+          <p class="section-copy">Collecting is not passing. No live promotion is implied.</p>
+        </div>
+        <div id="evidence-list" class="evidence-list"></div>
+      </article>
+    </section>
+
+    <section class="dashboard-grid equal">
+      <article class="panel">
+        <div class="section-heading compact">
+          <div>
+            <p class="eyebrow">Execution ledger</p>
+            <h2>Closed paper trades</h2>
+          </div>
+        </div>
+        <div id="trade-list" class="trade-list"><div class="empty-state">No closed paper trades.</div></div>
+      </article>
+
+      <article class="panel">
+        <div class="section-heading compact">
+          <div>
+            <p class="eyebrow">Operations</p>
+            <h2>Recent service activity</h2>
+          </div>
+        </div>
+        <div id="activity-list" class="activity-list"><div class="empty-state">No activity recorded.</div></div>
+      </article>
+    </section>
+  </main>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="app.js"></script>
 </body>
 </html>

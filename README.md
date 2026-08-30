@@ -1,8 +1,8 @@
 # ⚽ Football-Bot — Late-Game Sniper
 
 A Kalshi **paper-trading engine + live mission-control dashboard** for the late-game
-soccer microstructure strategy: when a decisive stoppage-time event hits, one leg of a
-match's Home/Draw/Away triplet sweeps the book, its sibling confirms within ~1ms, and
+soccer microstructure study: when one leg of a match's Home/Draw/Away triplet sweeps
+the book, its sibling confirms, and
 the rest of the market takes hundreds of milliseconds to finish repricing. This bot
 detects that first sweep, requires sibling confirmation, and paper-buys the remaining
 underreaction against the **live recorded order book** — measuring exactly what a real
@@ -10,7 +10,8 @@ order would have gotten.
 
 Built from a 2,377-event backtest over the entire history of Kalshi soccer markets
 (all 10.5 weeks of it), with a pre-registered out-of-sample holdout pass
-(95% CI on net-per-fill [+$1.28, +$5.76], P(no edge)=0.0005). Paper first. Always.
+(95% CI on net-per-fill [+$1.28, +$5.76], P(no edge)=0.0005). That historical result
+does not guarantee future performance. Paper first. Always.
 
 ## What it does
 
@@ -26,11 +27,14 @@ Built from a 2,377-event backtest over the entire history of Kalshi soccer marke
   fill-model-vs-reality, feed latency p95, per-league rolling edge
 - **Measures goal-feed latency** without affecting trading: batches Kalshi milestone
   score polls and timestamps numeric score changes beside received book/trade changes
-- **Optionally infers late +1/equalizer transitions from prices alone**: normalizes the
+- **Independently paper-tests Gate A and a late-score sleeve**: each gets its own admission,
+  lockout, positions, exits, P&L, and counterfactual shadow liquidity
+- **Infers possible late +1/equalizer transitions from prices alone**: normalizes the
   Home/Draw/Away triplet, rejects incoherent one-leg moves, and manages reversion with
   fee-aware scratch, trailing-profit, reversal, oscillation, and short-timeout exits
-- **Dashboard**: live match cards, signal wire, paper desk, equity curve, league edge,
-  latency histograms, kill switch — all streaming over WebSocket
+- **Auditable dashboard**: human match/contract names, exact UTC timing, normalized event
+  diagnostics, two sleeve ledgers/P&Ls, latency and exit charts, persistent health/errors,
+  phone-safe layouts, and a protected downloadable research bundle
 
 **No credentials? DEMO mode** auto-starts: it replays the real Espanyol–Real Madrid
 tape (Aug 22, 2026 — the 90'+ winner that started this project) through the exact same
@@ -74,11 +78,12 @@ to the defaults. Notable ones:
 | `CONF_MS` / `CONF_SIGN` | 50 / true | sibling confirmation window / opposite-sign requirement |
 | `LATE_ONLY` | false | trade only within `LATE_WINDOW_MIN` of scheduled close |
 | `USE_STOP` | false | stops off per Gate A forensics (shadow-stop is always recorded) |
-| `PRICE_ONLY_SLEEVE_MODE` | off | `enforce` admits only price-inferred +1/equalizer transitions in the minute-88 window |
+| `PRICE_ONLY_SLEEVE_MODE` | off | `parallel` paper-tests both sleeves independently; `enforce` runs only price-only |
 | `PAPER_EXECUTION_V2` | false | opt into latency-aware paper arrivals, shadow liquidity, and entry/exit depth walking |
 | `GOAL_LATENCY_OBSERVER` | true | read-only Kalshi score-vs-market arrival experiment; never enters the signal path |
 | `GOAL_LATENCY_POLL_MS` | 250 | target interval for batched score polling; actual uncertainty is saved per observation |
-| `ADMIN_TOKEN` | empty | required `X-Admin-Token` for kill/flatten actions; empty fails closed |
+| `EVENT_MATCH_WINDOW_S` | 20 | fixed ±seconds for diagnostic signal/event consistency matching |
+| `ADMIN_TOKEN` | empty | required `X-Admin-Token` for kill, flatten, and study export; empty fails closed |
 
 Recorder health is exposed at `/api/status` under `recorder`. A write failure
 marks it unhealthy, records the last error/failure count, alerts the dashboard,
@@ -107,8 +112,9 @@ confirmed signals, and K4 measures total signal-to-paper-arrival latency.
 
 ### Price-only late-score sleeve
 
-Set both `PRICE_ONLY_SLEEVE_MODE=enforce` and `PAPER_EXECUTION_V2=true` to run the
-new sleeve with realistic paper fills. It never reads a score, goal, VAR, penalty,
+Set `PRICE_ONLY_SLEEVE_MODE=parallel` and `PAPER_EXECUTION_V2=true` to paper-test
+Gate A and the new sleeve independently with realistic fills. Use `enforce` only when
+you intentionally want to suppress Gate A. The new sleeve never reads a score, goal, VAR, penalty,
 or other match-event feed. Minute 88 is approximated from the market's scheduled
 `expected_expiration_time`; the default window begins two minutes before that time
 and stays open for twelve minutes of possible stoppage.
@@ -145,6 +151,22 @@ independent events and acceptable drawdown/tail loss. Do not let live observatio
 continuously retune the active thresholds; use frozen champion/challenger versions
 so the holdout remains meaningful.
 
+### Downloadable research bundle
+
+The dashboard's **Download study data** action calls the admin-protected `/api/export`
+endpoint. It freezes a transactionally consistent SQLite snapshot at the same boundary as
+the selected raw gzip segments and returns:
+
+- the database and SQL schema;
+- CSV and JSONL versions of markets, signals, trades, fills, latency, canonical match-event
+  observations, and event/error logs;
+- immutable raw WebSocket gzip files;
+- an allowlisted non-secret configuration, table counts, byte sizes, and SHA-256 hashes; and
+- the external [backtest architecture and validation contract](docs/PRICE_ONLY_BACKTEST_HANDOFF.md).
+
+Match-event observations remain post-trade diagnostics. They are explicitly prohibited as
+entry/exit inputs in the handoff contract.
+
 ### Goal latency observer
 
 The observer resolves each watched event to a Kalshi milestone, polls every mapped
@@ -161,21 +183,17 @@ window in `detail` for independent review.
 
 ## Architecture
 
-```
-discovery (REST, 3min) ──► subscriptions (WS: orderbook_delta, trade, lifecycle)
-                                  │
-                     ┌────────────┼──────────────┐
-                     ▼            ▼              ▼
-                raw recorder   in-memory      detector (sweep + sibling
-               (gzip hourly)     books         coherence, frozen params)
-                                  │              │ confirmed signal
-                                  ▼              ▼
-                            paper desk ◄── IOC vs live book, price cap,
-                                  │         verified fees, target/timeout/settle
-                                  ▼
-                       SQLite (signals, trades, latency, eventlog)
-                                  │
-                            FastAPI + WS ──► dashboard
+```mermaid
+flowchart TD
+    A["Kalshi REST + WebSocket"] --> B["Immutable live books + raw recorder"]
+    B --> C["Confirmed market episode"]
+    C --> D["Gate A paper sleeve"]
+    C --> E["Price-only late-score paper sleeve"]
+    D --> F["Independent shadow depth + ledger"]
+    E --> F
+    F --> G["SQLite audit store"]
+    H["Match feed diagnostic"] --> G
+    G --> I["FastAPI dashboard + study export"]
 ```
 
 ## The road to real money

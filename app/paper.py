@@ -46,7 +46,8 @@ def level_fees(levels, fee_type="quadratic", fee_multiplier=1.0):
 
 class Position:
     def __init__(self, tid, signal_id, market, event, series, d, side, entry_px, size, ref, ext,
-                 fee_type="quadratic", fee_multiplier=1.0, sleeve=None):
+                 fee_type="quadratic", fee_multiplier=1.0, sleeve=None,
+                 strategy="gate_a"):
         self.tid = tid
         self.signal_id = signal_id
         self.market = market
@@ -72,6 +73,7 @@ class Position:
         self.exit_qty = 0.0
         self.exit_vwap_num = 0.0
         self.sleeve = dict(sleeve or {})
+        self.strategy = strategy or "gate_a"
         self.sleeve_anchor_bid = None
         self.peak_bid = entry_px
         self.bid_path = deque(maxlen=240)
@@ -100,13 +102,20 @@ class PendingExit:
 
 
 class PaperDesk:
-    def __init__(self, broadcast, entry_result=None, realistic=None):
+    def __init__(self, broadcast, entry_result=None, realistic=None, error_result=None):
         self.positions = {}           # tid -> Position
         self.broadcast = broadcast
         self.entry_result = entry_result
+        self.error_result = error_result
         self.kill = False
         self.realistic = config.PAPER_EXECUTION_V2 if realistic is None else realistic
-        self.shadows = ShadowBooks()
+        self.shadow_books = {
+            "gate_a": ShadowBooks(),
+            "price_only_late_score": ShadowBooks(),
+        }
+        # Stable aliases retained for existing tests and operational tooling.
+        self.shadows = self.shadow_books["gate_a"]
+        self.sleeve_shadows = self.shadow_books["price_only_late_score"]
         self.pending_entries = []
         self.pending_exits = {}       # trade id -> PendingExit
 
@@ -128,12 +137,17 @@ class PaperDesk:
             sleeve = signal_detail.get("sleeve") or (
                 signal_detail if signal_detail.get("strategy") == "price_only_late_score_v1" else {}
             )
+            strategy = row.get("strategy") or (
+                "price_only_late_score" if sleeve else "gate_a"
+            )
+            if strategy == "price_only_late_score_v1":
+                strategy = "price_only_late_score"
             pos = Position(
                 row["id"], row["signal_id"], row["market"], row["event"], row["series"],
                 row["dir"], row["side"], float(row["entry_px"]), size,
                 row.get("ref"), row.get("ext"), row.get("fee_type") or "quadratic",
                 row.get("fee_multiplier") if row.get("fee_multiplier") is not None else 1.0,
-                sleeve,
+                sleeve, strategy,
             )
             pos.entry_ts = float(row["entry_ts"])
             pos.remaining = remaining
@@ -152,15 +166,24 @@ class PaperDesk:
 
     def invalidate_books(self, tickers):
         if self.realistic:
-            self.shadows.invalidate(tickers)
+            for shadows in self.shadow_books.values():
+                shadows.invalidate(tickers)
 
     def apply_book_snapshot(self, ticker, book):
         if self.realistic:
-            self.shadows.reset(ticker, book)
+            for shadows in self.shadow_books.values():
+                shadows.reset(ticker, book)
 
     def apply_book_delta(self, ticker, message, sequence=None):
         if self.realistic:
-            self.shadows.apply_delta(ticker, message, sequence)
+            for shadows in self.shadow_books.values():
+                shadows.apply_delta(ticker, message, sequence)
+
+    def _shadow_for(self, strategy):
+        try:
+            return self.shadow_books[strategy or "gate_a"]
+        except KeyError as exc:
+            raise ValueError(f"unknown paper strategy: {strategy!r}") from exc
 
     # ---------- entries ----------
     def queue_enter(self, signal_id, sig, meta, now_mono=None, now_wall=None):
@@ -188,6 +211,7 @@ class PaperDesk:
             except Exception as exc:
                 pending.attempts += 1
                 pending.due_mono = now_mono + 0.1
+                self._report_error("paper_entry", exc)
                 self._safe_log("paper", f"entry retry {pending.signal_id}: {exc!r}")
                 self._safe_broadcast({"type": "log", "text":
                                       f"paper entry retry {pending.signal_id}: {exc!r}"})
@@ -201,6 +225,7 @@ class PaperDesk:
                 self._execute_exit(tid, order, live_books, now_mono, now_wall)
             except Exception as exc:
                 self._reschedule_exit(order, now_mono, now_wall)
+                self._report_error("paper_exit", exc)
                 self._safe_log("paper", f"exit retry {tid}: {exc!r}")
                 self._safe_broadcast({"type": "log", "text":
                                       f"paper exit retry {tid}: {exc!r}"})
@@ -211,7 +236,8 @@ class PaperDesk:
         book = live_books.get(pending.sig["ticker"])
         if book is None or not book.ok:
             return self._finalize_entry_outcome(pending, "no_book", now_wall, [])
-        shadow = self.shadows.ensure(pending.sig["ticker"], book)
+        strategy = pending.sig.get("strategy") or "gate_a"
+        shadow = self._shadow_for(strategy).ensure(pending.sig["ticker"], book)
         if not shadow.ok:
             return self._finalize_entry_outcome(pending, "no_book", now_wall, [])
         side = "yes" if pending.sig["dir"] > 0 else "no"
@@ -247,12 +273,13 @@ class PaperDesk:
             "book_at_entry": arrival_book,
             "fee_type": fee_type,
             "fee_multiplier": fee_multiplier,
+            "strategy": strategy,
         }
         pos = Position(
             0, pending.signal_id, pending.sig["ticker"], pending.meta["event"],
             pending.meta["series"], pending.sig["dir"], side, fill.vwap,
             fill.quantity, pending.sig["ref"], pending.sig["ext"],
-            fee_type, fee_multiplier, pending.sig.get("sleeve"),
+            fee_type, fee_multiplier, pending.sig.get("sleeve"), strategy,
         )
         pos.entry_ts = now_wall
         pos.entry_fees = entry_fee
@@ -297,6 +324,7 @@ class PaperDesk:
             "paper_latency_ms": round(latency_ms, 3),
             "order_arrival_ms": round(order_arrival_ms, 3) if order_arrival_ms is not None else None,
             "fill_levels": levels,
+            "strategy": pending.sig.get("strategy") or "gate_a",
         }
         if pending.sig.get("sleeve"):
             detail["sleeve"] = pending.sig["sleeve"]
@@ -307,7 +335,16 @@ class PaperDesk:
             try:
                 self.entry_result(pending.signal_id, pending.sig, outcome, detail)
             except Exception as exc:
+                self._report_error("paper_entry_callback", exc)
                 self._safe_log("paper", f"entry notification failed: {exc!r}")
+
+    def _report_error(self, component, error):
+        if self.error_result is None:
+            return
+        try:
+            self.error_result(component, error)
+        except Exception:
+            pass
 
     def _safe_broadcast(self, message):
         try:
@@ -352,22 +389,25 @@ class PaperDesk:
             "entry_ts": time.time(), "entry_px": round(entry_px, 2), "size": round(size, 1),
             "cap": config.PRICE_CAP, "notional": want_usd,
             "book_at_entry": book.snapshot_dict(),
+            "strategy": sig.get("strategy") or "gate_a",
         })
         pos = Position(tid, signal_id, sig["ticker"], meta["event"], meta["series"],
                        sig["dir"], side, entry_px, size, sig["ref"], sig["ext"],
-                       sleeve=sig.get("sleeve"))
+                       sleeve=sig.get("sleeve"),
+                       strategy=sig.get("strategy") or "gate_a")
         self.positions[tid] = pos
         self.broadcast({"type": "trade_open", "trade": self.pos_dict(pos)})
         store.log_event("trade", f"OPEN {side.upper()} {sig['ticker']} {size:.0f}@{entry_px:.1f}")
         return "filled"
 
     def pos_dict(self, pos, bid=None):
-        return {"id": pos.tid, "market": pos.market, "event": pos.event, "series": pos.series,
+        return {"id": pos.tid, "signal_id": pos.signal_id,
+                "market": pos.market, "event": pos.event, "series": pos.series,
                 "side": pos.side, "dir": pos.dir, "entry_px": round(pos.entry_px, 2),
                 "size": round(pos.remaining if self.realistic else pos.size, 1),
                 "initial_size": round(pos.initial_size, 1), "entry_ts": pos.entry_ts,
                 "bid": bid, "upnl": round(pos.unrealized(bid), 2) if bid is not None else None,
-                "strategy": pos.sleeve.get("strategy") if pos.sleeve else "gate_a"}
+                "strategy": pos.strategy}
 
     def on_book(self, ticker, book):
         """Mark open positions on this market; handle target exits + shadow metrics."""
@@ -461,7 +501,7 @@ class PaperDesk:
         if book is None or not book.ok:
             self._reschedule_exit(order, now_mono, now_wall)
             return
-        shadow = self.shadows.ensure(pos.market, book)
+        shadow = self._shadow_for(pos.strategy).ensure(pos.market, book)
         if not shadow.ok:
             self._reschedule_exit(order, now_mono, now_wall)
             return
@@ -516,6 +556,7 @@ class PaperDesk:
                 "id": pos.tid, "market": pos.market, "side": pos.side,
                 "filled": round(fill.quantity, 1), "remaining": round(pos.remaining, 1),
                 "exit_px": round(fill.vwap, 2), "reason": order.reason,
+                "strategy": pos.strategy,
             }})
             self._safe_log(
                 "trade", f"PARTIAL CLOSE {pos.market} {fill.quantity:.1f}@{fill.vwap:.1f}; "
@@ -584,6 +625,7 @@ class PaperDesk:
             "id": pos.tid, "market": pos.market, "series": pos.series, "side": pos.side,
             "entry_px": round(pos.entry_px, 2), "exit_px": final["exit_px"],
             "size": round(pos.initial_size, 1), "reason": reason, "net": final["net"],
+            "strategy": pos.strategy,
         }})
         self._safe_log("trade", f"CLOSE {pos.market} {reason} net ${final['net']:+.2f}")
 
@@ -601,7 +643,8 @@ class PaperDesk:
         self.broadcast({"type": "trade_close", "trade": {
             "id": pos.tid, "market": pos.market, "series": pos.series, "side": pos.side,
             "entry_px": round(pos.entry_px, 2), "exit_px": round(exit_px, 2),
-            "size": round(pos.size, 1), "reason": reason, "net": round(net, 2)}})
+            "size": round(pos.size, 1), "reason": reason, "net": round(net, 2),
+            "strategy": pos.strategy}})
         store.log_event("trade", f"CLOSE {pos.market} {reason} net ${net:+.2f}")
 
     def flatten_all(self, reason="flatten"):

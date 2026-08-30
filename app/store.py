@@ -7,6 +7,7 @@ import threading
 import time
 
 from . import config
+from .match_events import normalize_match_event
 
 _lock = threading.Lock()
 _conn = None
@@ -14,7 +15,7 @@ _conn = None
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS markets(
   ticker TEXT PRIMARY KEY, event TEXT, series TEXT, title TEXT,
-  close_time TEXT, status TEXT, added_ts REAL);
+  close_time TEXT, status TEXT, added_ts REAL, display_game TEXT, display_leg TEXT);
 CREATE TABLE IF NOT EXISTS signals(
   id INTEGER PRIMARY KEY AUTOINCREMENT, ts_ms INTEGER, local_ts REAL,
   market TEXT, event TEXT, series TEXT, dir INTEGER, dl REAL, levels INTEGER,
@@ -29,7 +30,7 @@ CREATE TABLE IF NOT EXISTS trades(
   book_at_entry TEXT, status TEXT DEFAULT 'open',
   remaining REAL, realized_gross REAL DEFAULT 0, accrued_fees REAL DEFAULT 0,
   exit_qty REAL DEFAULT 0, exit_vwap_num REAL DEFAULT 0,
-  fee_type TEXT, fee_multiplier REAL);
+  fee_type TEXT, fee_multiplier REAL, strategy TEXT);
 CREATE TABLE IF NOT EXISTS paper_fills(
   id INTEGER PRIMARY KEY AUTOINCREMENT, trade_id INTEGER, signal_id INTEGER,
   ts REAL, leg TEXT, side TEXT, price REAL, quantity REAL, notional REAL,
@@ -58,6 +59,9 @@ CREATE TABLE IF NOT EXISTS goal_latency_observations(
   first_book_after_ms REAL,
   first_trade_after_ts REAL,
   first_trade_after_ms REAL,
+  canonical_type TEXT,
+  canonical_side TEXT,
+  normalized_event TEXT,
   detail TEXT NOT NULL);
 """
 
@@ -86,11 +90,28 @@ def init():
         ("exit_vwap_num", "REAL DEFAULT 0"),
         ("fee_type", "TEXT"),
         ("fee_multiplier", "REAL"),
+        ("strategy", "TEXT"),
     ):
         try:
             _conn.execute(f"ALTER TABLE trades ADD COLUMN {column} {definition}")
         except sqlite3.OperationalError:
             pass  # already exists
+    for column in ("display_game", "display_leg"):
+        try:
+            _conn.execute(f"ALTER TABLE markets ADD COLUMN {column} TEXT")
+        except sqlite3.OperationalError:
+            pass
+    for column, definition in (
+        ("canonical_type", "TEXT"),
+        ("canonical_side", "TEXT"),
+        ("normalized_event", "TEXT"),
+    ):
+        try:
+            _conn.execute(
+                f"ALTER TABLE goal_latency_observations ADD COLUMN {column} {definition}"
+            )
+        except sqlite3.OperationalError:
+            pass
     _conn.commit()
 
 
@@ -125,6 +146,35 @@ def q(sql, args=()):
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
+def database_health():
+    """Return a non-mutating SQLite connectivity check for the status panel."""
+    try:
+        with _lock:
+            if _conn is None:
+                return {"healthy": False, "status": "not_initialized"}
+            _conn.execute("SELECT 1").fetchone()
+        return {"healthy": True, "status": "connected"}
+    except Exception as exc:  # noqa: BLE001 - health must report, never mask the API
+        return {
+            "healthy": False,
+            "status": "error",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def backup_database(path):
+    """Create a transactionally consistent SQLite snapshot at ``path``."""
+    with _lock:
+        if _conn is None:
+            raise RuntimeError("database is not initialized")
+        destination = sqlite3.connect(path)
+        try:
+            _conn.backup(destination)
+            destination.commit()
+        finally:
+            destination.close()
+
+
 def log_event(kind, text):
     ex("INSERT INTO eventlog(ts,kind,text) VALUES(?,?,?)", (time.time(), kind, text))
 
@@ -134,13 +184,17 @@ def add_latency(kind, ms):
 
 
 def insert_goal_latency(row):
+    live_data = ((row.get("detail") or {}).get("live_data") or {})
+    normalized = row.get("normalized_event") or normalize_match_event(
+        row["change_kind"], row["score_before"], row["score_after"], live_data,
+    )
     cur = ex(
         """INSERT INTO goal_latency_observations(
                observed_ts,event,milestone_id,change_kind,live_type,
                score_before,score_after,previous_poll_ts,poll_started_ts,response_ms,
                last_book_change_ts,last_book_lead_ms,last_trade_ts,last_trade_lead_ms,
-               detail)
-             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               canonical_type,canonical_side,normalized_event,detail)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             row["observed_ts"], row["event"], row["milestone_id"],
             row["change_kind"], row.get("live_type"),
@@ -149,6 +203,8 @@ def insert_goal_latency(row):
             row.get("previous_poll_ts"), row["poll_started_ts"], row["response_ms"],
             row.get("last_book_change_ts"), row.get("last_book_lead_ms"),
             row.get("last_trade_ts"), row.get("last_trade_lead_ms"),
+            normalized["canonical_type"], normalized["side"],
+            json.dumps(normalized, separators=(",", ":")),
             json.dumps(row.get("detail") or {}, separators=(",", ":")),
         ),
     )
@@ -171,11 +227,16 @@ def finish_goal_latency(row_id, first_book=None, first_trade=None):
     )
 
 
-def upsert_market(ticker, event, series, title, close_time, status):
-    ex("""INSERT INTO markets(ticker,event,series,title,close_time,status,added_ts)
-          VALUES(?,?,?,?,?,?,?) ON CONFLICT(ticker) DO UPDATE SET
-          close_time=excluded.close_time, status=excluded.status, title=excluded.title""",
-       (ticker, event, series, title, close_time, status, time.time()))
+def upsert_market(ticker, event, series, title, close_time, status,
+                  display_game=None, display_leg=None):
+    ex("""INSERT INTO markets(
+                ticker,event,series,title,close_time,status,added_ts,display_game,display_leg)
+          VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(ticker) DO UPDATE SET
+          close_time=excluded.close_time, status=excluded.status, title=excluded.title,
+          display_game=COALESCE(excluded.display_game,markets.display_game),
+          display_leg=COALESCE(excluded.display_leg,markets.display_leg)""",
+       (ticker, event, series, title, close_time, status, time.time(),
+        display_game, display_leg))
 
 
 def insert_signal(s):
@@ -212,11 +273,12 @@ def finish_paper_signal(signal_id, outcome, detail, latency_ms, order_arrival_ms
 
 def insert_trade(t):
     cur = ex("""INSERT INTO trades(signal_id,market,event,series,dir,side,entry_ts,entry_px,
-                size,cap,notional,book_at_entry,status,mode)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?)""",
+                size,cap,notional,book_at_entry,status,mode,strategy)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?,?)""",
              (t["signal_id"], t["market"], t["event"], t["series"], t["dir"], t["side"],
               t["entry_ts"], t["entry_px"], t["size"], t["cap"], t["notional"],
-              json.dumps(t.get("book_at_entry") or {}), _mode))
+              json.dumps(t.get("book_at_entry") or {}), _mode,
+              t.get("strategy") or "gate_a"))
     return cur.lastrowid
 
 
@@ -227,12 +289,13 @@ def open_paper_trade(t, detail, fill_levels, entry_fee, latency_ms, order_arriva
             cur = _conn.execute(
                 """INSERT INTO trades(signal_id,market,event,series,dir,side,entry_ts,entry_px,
                        size,cap,notional,book_at_entry,status,mode,remaining,realized_gross,
-                       accrued_fees,exit_qty,exit_vwap_num,fee_type,fee_multiplier)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?, ?, 0, ?, 0, 0, ?, ?)""",
+                       accrued_fees,exit_qty,exit_vwap_num,fee_type,fee_multiplier,strategy)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?, ?, 0, ?, 0, 0, ?, ?,?)""",
                 (t["signal_id"], t["market"], t["event"], t["series"], t["dir"], t["side"],
                  t["entry_ts"], t["entry_px"], t["size"], t["cap"], t["notional"],
                  json.dumps(t.get("book_at_entry") or {}), _mode, t["size"], entry_fee,
-                 t.get("fee_type"), t.get("fee_multiplier")),
+                 t.get("fee_type"), t.get("fee_multiplier"),
+                 t.get("strategy") or "gate_a"),
             )
             trade_id = cur.lastrowid
             _conn.execute("UPDATE signals SET outcome='filled', detail=? WHERE id=?",
@@ -342,20 +405,35 @@ def _paper_fill_integrity(trade):
         return False
 
 
-def stats():
-    closed = q("SELECT * FROM trades WHERE status='closed'")
-    open_t = q("SELECT * FROM trades WHERE status='open'")
-    sigs = q("SELECT outcome, COUNT(*) n FROM signals GROUP BY outcome")
-    n = len(closed)
-    net = sum(t["net"] or 0 for t in closed)
-    wins = sum(1 for t in closed if (t["net"] or 0) > 0)
-    fees = sum(t["fees"] or 0 for t in closed)
-    # event-clustered bootstrap CI on net/fill
-    ci = None
+def _strategy_key(value):
+    """Map durable/legacy strategy labels into the two supported paper sleeves."""
+    if value in {"price_only_late_score", "price_only_late_score_v1"}:
+        return "price_only_late_score"
+    return "gate_a"
+
+
+def _signal_strategy(row):
+    raw = row.get("trade_strategy")
+    if not raw:
+        if isinstance(row.get("detail"), dict):
+            detail = row["detail"]
+        else:
+            try:
+                detail = json.loads(row.get("detail") or "{}")
+            except (TypeError, json.JSONDecodeError):
+                detail = {}
+        sleeve = detail.get("sleeve") if isinstance(detail.get("sleeve"), dict) else {}
+        raw = detail.get("strategy") or sleeve.get("strategy")
+    return _strategy_key(raw)
+
+
+def _event_cluster_ci(closed):
+    """Deterministic event-clustered bootstrap interval for closed net per fill."""
     by_ev = {}
     for t in closed:
         by_ev.setdefault(t["event"], []).append(t["net"] or 0)
     evs = list(by_ev.values())
+    ci = None
     if len(evs) >= 5:
         rnd = random.Random(7)
         means = []
@@ -364,19 +442,10 @@ def stats():
             means.append(sum(flat) / len(flat))
         means.sort()
         ci = [round(means[int(0.025 * len(means))], 2), round(means[int(0.975 * len(means))], 2)]
-    # per-league
-    lg = {}
-    for t in closed:
-        d = lg.setdefault(t["series"], {"n": 0, "net": 0.0, "wins": 0})
-        d["n"] += 1
-        d["net"] += t["net"] or 0
-        d["wins"] += 1 if (t["net"] or 0) > 0 else 0
-    # evidence gates
-    fill_checks = [(t["id"], _paper_fill_integrity(t)) for t in closed + open_t]
-    fill_checks = [(tid, ok) for tid, ok in fill_checks if ok is not None]
-    fill_failures = [tid for tid, ok in fill_checks if not ok]
-    k1_status = ("COLLECTING" if len(fill_checks) < 25 else
-                 "FAIL" if fill_failures else "PASS")
+    return ci
+
+
+def _latency_evidence():
     lat_kind = "order_arrival"
     lat = q("SELECT ms FROM latency WHERE kind=? ORDER BY ts DESC LIMIT 500", (lat_kind,))
     if not lat:
@@ -384,23 +453,126 @@ def stats():
         lat = q("SELECT ms FROM latency WHERE kind=? ORDER BY ts DESC LIMIT 500", (lat_kind,))
     lat_ms = sorted(x["ms"] for x in lat)
     p95 = lat_ms[int(0.95 * len(lat_ms))] if lat_ms else None
-    n_conf = sum(s["n"] for s in sigs if s["outcome"] in
-                 ("filled", "rejected_cap", "no_book", "killed", "expired",
-                  "unsupported_fee"))
-    kill = {
+    return {
+        "p95_ms": p95,
+        "source": lat_kind,
+        "status": "OK" if (p95 is None or p95 < 250) else "BREACH",
+        "scope": "shared_execution_adapter",
+    }
+
+
+def _strategy_summary(closed, open_t, signals, latency_evidence):
+    n = len(closed)
+    gross = sum(t.get("gross") or 0 for t in closed)
+    fees = sum(t.get("fees") or 0 for t in closed)
+    net = sum(t.get("net") or 0 for t in closed)
+    wins = sum(1 for t in closed if (t.get("net") or 0) > 0)
+    ci = _event_cluster_ci(closed)
+    signal_counts = {}
+    for row in signals:
+        outcome = row.get("outcome") or "unknown"
+        signal_counts[outcome] = signal_counts.get(outcome, 0) + 1
+    confirmed_outcomes = {
+        "filled", "rejected_cap", "no_book", "killed", "expired", "unsupported_fee",
+    }
+    n_conf = sum(count for outcome, count in signal_counts.items()
+                 if outcome in confirmed_outcomes)
+    fill_checks = [(t["id"], _paper_fill_integrity(t)) for t in closed + open_t]
+    fill_checks = [(tid, ok) for tid, ok in fill_checks if ok is not None]
+    fill_failures = [tid for tid, ok in fill_checks if not ok]
+    k1_status = ("COLLECTING" if len(fill_checks) < 25 else
+                 "FAIL" if fill_failures else "PASS")
+    exits = {}
+    for trade in closed:
+        reason = trade.get("exit_reason") or "unknown"
+        exits[reason] = exits.get(reason, 0) + 1
+    open_realized_gross = sum(t.get("realized_gross") or 0 for t in open_t)
+    open_accrued_fees = sum(t.get("accrued_fees") or 0 for t in open_t)
+    open_remaining = sum(
+        t.get("remaining") if t.get("remaining") is not None else (t.get("size") or 0)
+        for t in open_t
+    )
+    evidence = {
         "k1_fill_integrity": {
             "n_fills": len(fill_checks), "needed": 25,
             "failures": fill_failures[:10], "status": k1_status,
         },
-        "k2_ci": {"n_signals": n_conf, "needed": 50, "ci": ci,
-                  "status": ("COLLECTING" if n_conf < 50 else
-                             "INSUFFICIENT_CLUSTERS" if ci is None else
-                             "PASS" if ci[0] > 0 else "FAIL")},
-        "k4_latency_p95_ms": p95,
-        "k4_latency_source": lat_kind,
-        "k4_status": "OK" if (p95 is None or p95 < 250) else "BREACH",
+        "k2_ci": {
+            "n_signals": n_conf, "needed": 50, "ci": ci,
+            "status": ("COLLECTING" if n_conf < 50 else
+                       "INSUFFICIENT_CLUSTERS" if ci is None else
+                       "PASS" if ci[0] > 0 else "FAIL"),
+        },
+        "k4_latency": dict(latency_evidence),
     }
-    return {"closed": n, "open": len(open_t), "net": round(net, 2),
-            "net_per_fill": round(net / n, 2) if n else 0, "win_pct": round(wins / n * 100, 1) if n else 0,
-            "fees": round(fees, 2), "ci95": ci, "signals": {s["outcome"]: s["n"] for s in sigs},
-            "leagues": lg, "kill": kill}
+    return {
+        "closed": n,
+        "open": len(open_t),
+        "gross": round(gross, 2),
+        "fees": round(fees, 2),
+        "net": round(net, 2),
+        "net_per_fill": round(net / n, 2) if n else 0,
+        "win_pct": round(wins / n * 100, 1) if n else 0,
+        "ci95": ci,
+        "exit_reasons": exits,
+        "signals": signal_counts,
+        "open_remaining_contracts": round(open_remaining, 2),
+        "open_partial_realized_gross": round(open_realized_gross, 2),
+        "open_accrued_fees": round(open_accrued_fees, 2),
+        "open_partial_realized_net": round(open_realized_gross - open_accrued_fees, 2),
+        "evidence": evidence,
+    }
+
+
+def stats():
+    closed = q("SELECT * FROM trades WHERE status='closed'")
+    open_t = q("SELECT * FROM trades WHERE status='open'")
+    signal_rows = q(
+        """SELECT s.outcome,s.detail,t.strategy AS trade_strategy
+             FROM signals s LEFT JOIN trades t ON t.signal_id=s.id"""
+    )
+    latency_evidence = _latency_evidence()
+    by_strategy = {
+        "gate_a": {"closed": [], "open": [], "signals": []},
+        "price_only_late_score": {"closed": [], "open": [], "signals": []},
+    }
+    for trade in closed:
+        by_strategy[_strategy_key(trade.get("strategy"))]["closed"].append(trade)
+    for trade in open_t:
+        by_strategy[_strategy_key(trade.get("strategy"))]["open"].append(trade)
+    for signal in signal_rows:
+        by_strategy[_signal_strategy(signal)]["signals"].append(signal)
+    sleeves = {
+        strategy: _strategy_summary(
+            rows["closed"], rows["open"], rows["signals"], latency_evidence,
+        )
+        for strategy, rows in by_strategy.items()
+    }
+    combined = _strategy_summary(closed, open_t, signal_rows, latency_evidence)
+    # per-league
+    lg = {}
+    for t in closed:
+        d = lg.setdefault(t["series"], {"n": 0, "net": 0.0, "wins": 0})
+        d["n"] += 1
+        d["net"] += t["net"] or 0
+        d["wins"] += 1 if (t["net"] or 0) > 0 else 0
+    evidence = combined["evidence"]
+    kill = {
+        "k1_fill_integrity": evidence["k1_fill_integrity"],
+        "k2_ci": evidence["k2_ci"],
+        "k4_latency_p95_ms": latency_evidence["p95_ms"],
+        "k4_latency_source": latency_evidence["source"],
+        "k4_status": latency_evidence["status"],
+    }
+    return {
+        **{key: combined[key] for key in (
+            "closed", "open", "gross", "net", "net_per_fill", "win_pct", "fees",
+            "ci95", "signals", "exit_reasons", "open_remaining_contracts",
+            "open_partial_realized_gross", "open_accrued_fees",
+            "open_partial_realized_net",
+        )},
+        "combined": combined,
+        "sleeves": sleeves,
+        "leagues": lg,
+        "kill": kill,
+    }

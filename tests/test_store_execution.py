@@ -1,4 +1,6 @@
 import json
+import os
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -207,6 +209,130 @@ class PaperExecutionStoreTests(unittest.TestCase):
 
         self.assertEqual(gate["k4_latency_source"], "order_arrival")
         self.assertEqual(gate["k4_latency_p95_ms"], 220.0)
+
+    def test_zero_trade_stats_include_both_sleeves_and_reconcile(self):
+        result = store.stats()
+
+        self.assertEqual(result["combined"]["closed"], 0)
+        self.assertEqual(result["combined"]["gross"], 0)
+        self.assertEqual(result["combined"]["net"], 0)
+        self.assertEqual(set(result["sleeves"]), {
+            "gate_a", "price_only_late_score",
+        })
+        self.assertEqual(result["sleeves"]["gate_a"]["open"], 0)
+        self.assertEqual(result["sleeves"]["price_only_late_score"]["signals"], {})
+
+    def test_sleeve_economics_signals_exits_and_partial_state_reconcile(self):
+        gate_signal = store.insert_signal({
+            "ts_ms": 1, "local_ts": 1.0, "market": "G", "event": "EG",
+            "series": "S", "dir": 1, "dl": 1.0, "levels": 5, "size": 100,
+            "ref": 30, "ext": 60, "late": True, "outcome": "filled",
+            "detail": {"strategy": "gate_a"},
+        })
+        price_signal = store.insert_signal({
+            "ts_ms": 2, "local_ts": 2.0, "market": "P", "event": "EP",
+            "series": "S", "dir": 1, "dl": 1.0, "levels": 5, "size": 100,
+            "ref": 30, "ext": 60, "late": True, "outcome": "filled",
+            "detail": {"strategy": "price_only_late_score"},
+        })
+        store.ex(
+            "INSERT INTO signals(event,outcome,detail,mode) VALUES(?,?,?,?)",
+            ("EL", "rejected_cap", "{}", "live"),
+        )
+        store.ex(
+            """INSERT INTO trades(signal_id,event,series,status,gross,fees,net,
+                       exit_reason,strategy,mode,book_at_entry)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (gate_signal, "EG", "S", "closed", 10.0, 1.0, 9.0,
+             "target", None, "live", "{}"),
+        )
+        store.ex(
+            """INSERT INTO trades(signal_id,event,series,status,gross,fees,net,
+                       exit_reason,strategy,mode,book_at_entry)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (price_signal, "EP", "S", "closed", 5.0, 2.0, 3.0,
+             "sleeve_scratch", "price_only_late_score", "live", "{}"),
+        )
+        store.ex(
+            """INSERT INTO trades(event,series,status,size,remaining,realized_gross,
+                       accrued_fees,strategy,mode,book_at_entry)
+                 VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            ("EG2", "S", "open", 5.0, 2.0, 0.5, 0.2, None, "live", "{}"),
+        )
+        store.ex(
+            """INSERT INTO trades(event,series,status,size,remaining,realized_gross,
+                       accrued_fees,strategy,mode,book_at_entry)
+                 VALUES(?,?,?,?,?,?,?,?,?,?)""",
+            ("EP2", "S", "open", 4.0, 1.0, 0.2, 0.1,
+             "price_only_late_score", "live", "{}"),
+        )
+
+        result = store.stats()
+        gate = result["sleeves"]["gate_a"]
+        price = result["sleeves"]["price_only_late_score"]
+        combined = result["combined"]
+
+        self.assertEqual((gate["closed"], gate["open"], gate["net"]), (1, 1, 9.0))
+        self.assertEqual((price["closed"], price["open"], price["net"]), (1, 1, 3.0))
+        for field in ("closed", "open", "gross", "fees", "net",
+                      "open_remaining_contracts", "open_partial_realized_gross",
+                      "open_accrued_fees", "open_partial_realized_net"):
+            self.assertAlmostEqual(combined[field], gate[field] + price[field])
+        self.assertEqual(gate["exit_reasons"], {"target": 1})
+        self.assertEqual(price["exit_reasons"], {"sleeve_scratch": 1})
+        self.assertEqual(gate["signals"], {"filled": 1, "rejected_cap": 1})
+        self.assertEqual(price["signals"], {"filled": 1})
+        self.assertEqual(gate["evidence"]["k2_ci"]["n_signals"], 2)
+        self.assertEqual(price["evidence"]["k2_ci"]["n_signals"], 1)
+        self.assertEqual(result["net"], combined["net"])
+
+
+class OldVolumeMigrationTests(unittest.TestCase):
+    def test_existing_volume_gets_strategy_and_canonical_event_columns(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            db_path = os.path.join(tempdir, "footballbot.db")
+            conn = sqlite3.connect(db_path)
+            conn.executescript("""
+                CREATE TABLE trades(
+                  id INTEGER PRIMARY KEY, signal_id INTEGER, market TEXT,
+                  event TEXT, series TEXT, dir INTEGER, side TEXT,
+                  entry_ts REAL, entry_px REAL, size REAL, cap REAL, notional REAL,
+                  exit_ts REAL, exit_px REAL, exit_reason TEXT, gross REAL, fees REAL,
+                  net REAL, mae REAL, shadow_stop_px REAL, book_at_entry TEXT,
+                  status TEXT DEFAULT 'open');
+                CREATE TABLE goal_latency_observations(
+                  id INTEGER PRIMARY KEY, observed_ts REAL NOT NULL, event TEXT NOT NULL,
+                  milestone_id TEXT NOT NULL, change_kind TEXT NOT NULL, live_type TEXT,
+                  score_before TEXT NOT NULL, score_after TEXT NOT NULL,
+                  previous_poll_ts REAL, poll_started_ts REAL NOT NULL, response_ms REAL NOT NULL,
+                  last_book_change_ts REAL, last_book_lead_ms REAL, last_trade_ts REAL,
+                  last_trade_lead_ms REAL, first_book_after_ts REAL, first_book_after_ms REAL,
+                  first_trade_after_ts REAL, first_trade_after_ms REAL, detail TEXT NOT NULL);
+                CREATE TABLE markets(
+                  ticker TEXT PRIMARY KEY, event TEXT, series TEXT, title TEXT,
+                  close_time TEXT, status TEXT, added_ts REAL);
+            """)
+            conn.close()
+
+            with patch("app.store.config.DATA_DIR", tempdir):
+                store.init()
+                trade_columns = {row["name"] for row in store.q("PRAGMA table_info(trades)")}
+                event_columns = {
+                    row["name"] for row in store.q(
+                        "PRAGMA table_info(goal_latency_observations)"
+                    )
+                }
+                market_columns = {
+                    row["name"] for row in store.q("PRAGMA table_info(markets)")
+                }
+                store._conn.close()
+                store._conn = None
+
+        self.assertIn("strategy", trade_columns)
+        self.assertTrue({
+            "canonical_type", "canonical_side", "normalized_event",
+        }.issubset(event_columns))
+        self.assertTrue({"display_game", "display_leg"}.issubset(market_columns))
 
 
 if __name__ == "__main__":
