@@ -10,6 +10,7 @@ from .books import Book
 from .detector import Detector
 from .goal_latency import GoalLatencyObserver
 from .kalshi import KalshiClient, KalshiWS
+from .late_score_sleeve import PriceOnlyLateScoreSleeve
 from .paper import PaperDesk
 from .recorder import RawRecorder
 
@@ -39,6 +40,7 @@ class Engine:
             self.client._http = _httpx.AsyncClient(base_url=config.KALSHI_REST, timeout=30)
             self.client.n_requests = self.client.n_429 = self.client.n_retries = 0
         self.detector = Detector()
+        self.late_score_sleeve = PriceOnlyLateScoreSleeve()
         self.desk = PaperDesk(self.broadcast, self.on_paper_entry_result)
         self.recorder = RawRecorder(self.on_recorder_error)
         self.books = {}
@@ -101,6 +103,32 @@ class Engine:
             return False
         ct = parse_iso(m["close_time"])
         return ct is not None and (ct - time.time()) <= config.LATE_WINDOW_MIN * 60
+
+    def is_sleeve_window(self, ticker):
+        """Approximate minute 88 from scheduled expiration, without live scores."""
+        if self.mode == "demo":
+            return True
+        m = self.meta.get(ticker)
+        if not m or not m.get("close_time"):
+            return False
+        ct = parse_iso(m["close_time"])
+        if ct is None:
+            return False
+        until_expiry = ct - time.time()
+        return (-config.SLEEVE_AFTER_EXPIRY_MIN * 60.0 <= until_expiry <=
+                config.SLEEVE_START_BEFORE_EXPIRY_MIN * 60.0)
+
+    def _observe_sleeve(self, ticker, observed_ms):
+        if config.PRICE_ONLY_SLEEVE_MODE != "enforce":
+            return
+        m = self.meta.get(ticker)
+        if not m:
+            return
+        event = m["event"]
+        self.late_score_sleeve.observe(
+            event, self.event_markets.get(event, ()), self.meta, self.books, observed_ms,
+            changed_ticker=ticker,
+        )
 
     def price_state(self, ticker):
         if ticker not in self.prices:
@@ -205,6 +233,7 @@ class Engine:
         ps = self.price_state(ticker)
         ps["bid"], ps["ask"] = b.best_yes_bid(), b.best_yes_ask()
         ps["dirty"] = True
+        self._observe_sleeve(ticker, time.time() * 1000.0)
         self.desk.on_book(ticker, b)
 
     # ---------- signal flow ----------
@@ -216,6 +245,7 @@ class Engine:
         ps["dirty"] = True
         self.broadcast({"type": "tape", "ticker": ticker, "px": px, "sz": round(sz, 1),
                         "taker": taker, "ts_ms": ts_ms})
+        self._observe_sleeve(ticker, wall * 1000.0)
         cand = self.detector.on_trade(ticker, ts_ms, px, sz, taker)
         # re-check pending candidates whose siblings include this market
         if self.pending:
@@ -250,7 +280,7 @@ class Engine:
             "dir": cand["dir"], "dl": cand["dl"], "levels": cand["levels"],
             "size": cand["size"], "ref": cand["ref"], "ext": cand["ext"],
             "conf_lag_ms": lag, "late": self.is_late(cand["ticker"]), "outcome": outcome,
-            "detail": {},
+            "detail": cand.get("sleeve") or {},
         })
         if announce:
             self._announce_signal(sid, cand, lag, outcome)
@@ -274,6 +304,28 @@ class Engine:
             self.record_signal(cand, lag, "not_late")
             return
         m = self.meta.get(cand["ticker"], {"event": "?", "series": "?"})
+        if config.PRICE_ONLY_SLEEVE_MODE == "enforce":
+            if not self.is_sleeve_window(cand["ticker"]):
+                cand["sleeve"] = {
+                    "strategy": "price_only_late_score_v1",
+                    "feed_independent": True,
+                    "decision": "outside_minute_88_window",
+                }
+                self.record_signal(cand, lag, "sleeve_outside_window")
+                return
+            event = m.get("event", "?")
+            decision = self.late_score_sleeve.classify(
+                cand,
+                event,
+                self.event_markets.get(event, ()),
+                self.meta,
+                self.books,
+                cand.get("local_ts", time.time()) * 1000.0,
+            )
+            cand["sleeve"] = dict(decision.detail, decision=decision.reason)
+            if not decision.accepted:
+                self.record_signal(cand, lag, f"sleeve_{decision.reason}")
+                return
         if config.PAPER_EXECUTION_V2:
             sid = self.record_signal(cand, lag, "queued")
             self.desk.queue_enter(sid, cand, m)
@@ -283,10 +335,11 @@ class Engine:
         sid = self.record_signal(cand, lag, "executing", announce=False)
         try:
             outcome = self.desk.try_enter(sid, cand, m, book)
-            detail = {}
+            detail = cand.get("sleeve") or {}
         except Exception as exc:
             outcome = "execution_error"
-            detail = {"error": f"{type(exc).__name__}: {exc}"}
+            detail = dict(cand.get("sleeve") or {})
+            detail["error"] = f"{type(exc).__name__}: {exc}"
         store.add_latency("decision_ms", (time.monotonic() - decision_start) * 1000)
         store.update_signal_outcome(sid, outcome, detail)
         self._announce_signal(sid, cand, lag, outcome)
@@ -429,6 +482,7 @@ class Engine:
                 "paper_pending": len(self.desk.pending_entries) + len(self.desk.pending_exits),
                 "demo": self.demo_status, "cred_error": self.cred_error,
                 "foreign_dropped": self.n_foreign,
+                "price_only_sleeve": config.PRICE_ONLY_SLEEVE_MODE,
                 "goal_latency": (self.goal_latency.status() if self.goal_latency else
                                  {"enabled": False}),
                 "feed_lag_p50": round(lat[len(lat) // 2], 1) if lat else None,

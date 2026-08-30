@@ -296,7 +296,7 @@ def record_paper_exit(tid, signal_id, side, ts, reason, fill_levels, progress,
 def load_open_paper_positions():
     """Return durable open-position state for process restart recovery."""
     return q(
-        """SELECT t.*, s.ref, s.ext,
+        """SELECT t.*, s.ref, s.ext, s.detail AS signal_detail,
                   COALESCE((SELECT SUM(f.fee) FROM paper_fills f
                             WHERE f.trade_id=t.id AND f.leg='entry'), 0) AS entry_fees
              FROM trades t LEFT JOIN signals s ON s.id=t.signal_id
