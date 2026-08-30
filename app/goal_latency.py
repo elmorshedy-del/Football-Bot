@@ -10,6 +10,7 @@ import re
 import time
 
 from . import config, store
+from .match_events import normalize_match_event
 
 _SCORE_KEY = re.compile(r"score", re.IGNORECASE)
 
@@ -98,6 +99,7 @@ class GoalLatencyObserver:
         self.last_mapping_attempt = {}
         self.last_error = None
         self.last_poll_wall = None
+        self.last_response_ms = None
         self.polls = 0
         self.scoreless_payloads = 0
         self.goals = 0
@@ -172,6 +174,9 @@ class GoalLatencyObserver:
                 "market_window_before": recent,
             },
         }
+        row["normalized_event"] = normalize_match_event(
+            change_kind, before, after, live_data,
+        )
         row_id = await asyncio.to_thread(store.insert_goal_latency, row)
         self.pending.append({
             "id": row_id,
@@ -183,8 +188,8 @@ class GoalLatencyObserver:
         trade_text = f"{row['last_trade_lead_ms']:.1f}ms" if trade else "none"
         store.log_event(
             "goal_latency",
-            f"{change_kind.upper()} {event} {json.dumps(before, sort_keys=True)} -> "
-            f"{json.dumps(after, sort_keys=True)}; last_book_led={book_text}; "
+            f"{row['normalized_event']['canonical_type']} {event} "
+            f"{row['normalized_event']['human_label']}; last_book_led={book_text}; "
             f"last_trade_led={trade_text}",
         )
 
@@ -208,6 +213,7 @@ class GoalLatencyObserver:
         }
         self.polls += 1
         self.last_poll_wall = received_wall
+        self.last_response_ms = timing["response_ms"]
         for live_data in response.get("live_datas") or []:
             milestone_id = str(live_data.get("milestone_id") or "")
             if milestone_id not in self.events_by_milestone:
@@ -265,5 +271,6 @@ class GoalLatencyObserver:
             "goals": self.goals,
             "corrections": self.corrections,
             "last_poll_ts": self.last_poll_wall,
+            "last_response_ms": self.last_response_ms,
             "last_error": self.last_error,
         }

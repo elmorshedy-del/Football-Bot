@@ -85,7 +85,8 @@ class DemoReplay:
         loop_n = 0
         for tk, (title, _res) in MKTS.items():
             self.e.register_market(tk, EVENT, "KXLALIGAGAME", f"Espanyol vs Real Madrid — {title}",
-                                   None)
+                                   None, leg_title=title,
+                                   game_title="Espanyol vs Real Madrid")
         while True:
             loop_n += 1
             self.e.demo_status = f"loop {loop_n} — Espanyol 1-1 Real Madrid, closing minutes"

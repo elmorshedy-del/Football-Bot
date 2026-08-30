@@ -1,0 +1,116 @@
+import time
+import unittest
+from collections import deque
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+from app.engine import Engine
+
+
+class HealthStatusTests(unittest.TestCase):
+    @staticmethod
+    def engine():
+        engine = Engine.__new__(Engine)
+        engine.feed_lag = deque([10.0, 20.0])
+        engine.recorder = SimpleNamespace(
+            total=20,
+            status=lambda: {"healthy": True, "failures": 0, "last_error": None},
+        )
+        engine.goal_latency = None
+        engine.ws_state = "connected"
+        engine.errors = deque(maxlen=50)
+        engine.started = time.time() - 60
+        engine.mode = "live"
+        engine.meta = {}
+        engine.event_markets = {}
+        engine.n_trades = 0
+        engine.desk = SimpleNamespace(
+            positions={}, pending_entries=[], pending_exits={}, kill=False,
+        )
+        engine.demo_status = ""
+        engine.cred_error = ""
+        engine.n_foreign = 0
+        return engine
+
+    @patch("app.engine.store.database_health",
+           return_value={"healthy": True, "status": "connected"})
+    def test_all_checks_can_report_healthy(self, _database):
+        status = self.engine().status()
+
+        self.assertTrue(status["health"]["ok"])
+        self.assertTrue(all(
+            check["healthy"] for check in status["health"]["checks"].values()
+        ))
+        self.assertEqual(status["health"]["recent_errors"], [])
+
+    @patch("app.engine.store.database_health",
+           return_value={"healthy": False, "status": "error", "error": "disk full"})
+    def test_disconnect_database_and_recent_error_are_visible(self, _database):
+        engine = self.engine()
+        engine.ws_state = "disconnected: ConnectionClosed"
+        engine.errors.append({
+            "ts": time.time(), "component": "paper_exit", "message": "write failed",
+        })
+
+        status = engine.status()
+
+        self.assertFalse(status["health"]["ok"])
+        self.assertFalse(status["health"]["checks"]["websocket"]["healthy"])
+        self.assertFalse(status["health"]["checks"]["database"]["healthy"])
+        self.assertFalse(status["health"]["checks"]["paper_execution"]["healthy"])
+        self.assertFalse(status["health"]["checks"]["recent_backend_faults"]["healthy"])
+        self.assertEqual(status["health"]["recent_errors"][0]["message"], "write failed")
+
+    @patch("app.engine.store.database_health",
+           return_value={"healthy": True, "status": "connected"})
+    def test_recent_non_execution_fault_prevents_false_all_good(self, _database):
+        engine = self.engine()
+        engine.errors.append({
+            "ts": time.time(), "component": "study_export", "message": "disk full",
+        })
+
+        status = engine.status()
+
+        self.assertFalse(status["health"]["ok"])
+        self.assertTrue(status["health"]["checks"]["paper_execution"]["healthy"])
+        self.assertFalse(status["health"]["checks"]["recent_backend_faults"]["healthy"])
+        self.assertEqual(status["health"]["checks"]["recent_backend_faults"]["status"],
+                         "1 recent")
+
+    @patch("app.engine.store.database_health",
+           return_value={"healthy": True, "status": "connected"})
+    def test_stale_mapped_match_feed_is_visible(self, _database):
+        engine = self.engine()
+        engine.goal_latency = SimpleNamespace(status=lambda: {
+            "enabled": True,
+            "poll_ms": 250.0,
+            "mapped_matches": 1,
+            "last_poll_ts": time.time() - 10.0,
+            "last_response_ms": 120.0,
+            "last_error": None,
+        })
+
+        status = engine.status()
+        check = status["health"]["checks"]["match_event_feed"]
+
+        self.assertFalse(status["health"]["ok"])
+        self.assertFalse(check["healthy"])
+        self.assertEqual(check["status"], "stale")
+        self.assertEqual(check["last_response_ms"], 120.0)
+
+    @patch("app.engine.store.log_event")
+    def test_websocket_disconnect_is_recorded_and_broadcast(self, _log):
+        engine = self.engine()
+        engine.q = Mock()
+        engine._last_error_key = None
+        engine._last_error_ts = 0.0
+
+        engine.on_ws_state("disconnected: TimeoutError")
+
+        self.assertEqual(engine.ws_state, "disconnected: TimeoutError")
+        self.assertEqual(engine.errors[-1]["component"], "websocket")
+        engine.q.put_nowait.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()

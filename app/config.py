@@ -50,9 +50,14 @@ STOP_FRAC = _f("STOP_FRAC", 0.35)
 FEE_EXIT_TAKER = _b("FEE_EXIT_TAKER", True)  # charge taker fee on exits (conservative)
 
 # --- Price-only late-score sleeve (paper-only; no score/event feed) ---
-# ``off`` preserves Gate A exactly. ``enforce`` admits only coherent +1/0
-# triplet transitions in the late window and activates dynamic sleeve exits.
-PRICE_ONLY_SLEEVE_MODE = os.environ.get("PRICE_ONLY_SLEEVE_MODE", "off").lower()
+# ``off`` preserves Gate A exactly. ``enforce`` runs only the price-only sleeve.
+# ``parallel`` independently paper-trades both Gate A and the price-only sleeve.
+_price_only_sleeve_mode = os.environ.get("PRICE_ONLY_SLEEVE_MODE", "off").lower()
+PRICE_ONLY_SLEEVE_MODE = (
+    _price_only_sleeve_mode
+    if _price_only_sleeve_mode in {"off", "enforce", "parallel"}
+    else "off"
+)
 SLEEVE_START_BEFORE_EXPIRY_MIN = _f("SLEEVE_START_BEFORE_EXPIRY_MIN", 2.0)
 SLEEVE_AFTER_EXPIRY_MIN = _f("SLEEVE_AFTER_EXPIRY_MIN", 12.0)
 SLEEVE_BASELINE_MS = _f("SLEEVE_BASELINE_MS", 1800.0)
@@ -91,6 +96,7 @@ GOAL_LATENCY_OBSERVER = _b("GOAL_LATENCY_OBSERVER", True)
 GOAL_LATENCY_POLL_MS = _f("GOAL_LATENCY_POLL_MS", 250.0)
 GOAL_LATENCY_LOOKBACK_S = _f("GOAL_LATENCY_LOOKBACK_S", 10.0)
 GOAL_LATENCY_AFTER_S = _f("GOAL_LATENCY_AFTER_S", 2.0)
+EVENT_MATCH_WINDOW_S = _f("EVENT_MATCH_WINDOW_S", 20.0)
 
 # --- Market discovery ---
 DISCOVERY_INTERVAL_S = _i("DISCOVERY_INTERVAL_S", 180)

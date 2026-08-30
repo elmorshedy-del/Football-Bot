@@ -143,6 +143,81 @@ class PaperDeskV2Tests(unittest.TestCase):
         self.assertAlmostEqual(pos.exit_fees, 0.04)
         self.assertEqual(pos.shadow_stop_hit_px, 35.0)
 
+    def test_restart_restores_price_sleeve_identity_and_exit_state(self):
+        desk = PaperDesk(lambda msg: None, realistic=True)
+        desk.restore_open_positions([{
+            "id": 8, "signal_id": 43, "market": "T", "event": "E", "series": "S",
+            "dir": 1, "side": "yes", "entry_px": 45.0, "size": 4.0,
+            "entry_ts": 100.0, "remaining": 1.5, "realized_gross": 0.3,
+            "entry_fees": 0.08, "accrued_fees": 0.12, "exit_qty": 2.5,
+            "exit_vwap_num": 150.0, "mae": 5.0, "shadow_stop_px": 35.0,
+            "ref": 40.0, "ext": 60.0, "strategy": "price_only_late_score",
+            "signal_detail": {"sleeve": {
+                "strategy": "price_only_late_score_v1", "decision": "accepted",
+            }},
+        }])
+
+        pos = desk.positions[8]
+        self.assertEqual(pos.strategy, "price_only_late_score")
+        self.assertEqual(pos.sleeve["decision"], "accepted")
+        self.assertEqual(pos.remaining, 1.5)
+        self.assertAlmostEqual(pos.exit_fees, 0.04)
+
+    @patch("app.paper.store.log_event")
+    @patch("app.paper.store.open_paper_trade", side_effect=[9, 10])
+    def test_parallel_entries_receive_full_independent_depth(self, open_trade, _log):
+        desk = PaperDesk(lambda msg: None, realistic=True)
+        book = live_book(no={55.0: 2.0})
+        base = {"ticker": "T", "dir": 1, "ref": 40.0, "ext": 60.0}
+        gate = dict(base, strategy="gate_a", detail={"strategy": "gate_a"})
+        sleeve = dict(
+            base,
+            strategy="price_only_late_score",
+            sleeve={"strategy": "price_only_late_score_v1", "decision": "accepted"},
+        )
+        meta = {"event": "E", "series": "S"}
+
+        with patch("app.paper.config.PAPER_ENTRY_LATENCY_MS", 0.0), \
+                patch("app.paper.config.NOTIONAL_USD", 0.90), \
+                patch("app.paper.config.PRICE_CAP", 50.0):
+            desk.queue_enter(41, gate, meta, 0.0, 100.0)
+            desk.queue_enter(42, sleeve, meta, 0.0, 100.0)
+            desk.process_pending({"T": book}, now_mono=1.0, now_wall=100.1)
+
+        self.assertEqual(set(desk.positions), {9, 10})
+        self.assertEqual(desk.positions[9].strategy, "gate_a")
+        self.assertEqual(desk.positions[10].strategy, "price_only_late_score")
+        self.assertEqual([call.args[0]["size"] for call in open_trade.call_args_list], [2.0, 2.0])
+        self.assertEqual(book.no_bids, {55.0: 2.0})
+        self.assertEqual(desk.shadows.ensure("T", book).no_bids, {})
+        self.assertEqual(desk.sleeve_shadows.ensure("T", book).no_bids, {})
+
+    @patch("app.paper.store.log_event")
+    @patch("app.paper.store.record_paper_exit")
+    def test_exiting_gate_a_does_not_consume_sleeve_depth(self, _record_exit, _log):
+        desk = PaperDesk(lambda msg: None, realistic=True)
+        gate = Position(
+            7, 41, "T", "E", "S", 1, "yes", 45.0, 2.0, 40.0, 60.0,
+            strategy="gate_a",
+        )
+        sleeve = Position(
+            8, 42, "T", "E", "S", 1, "yes", 45.0, 2.0, 40.0, 60.0,
+            sleeve={"strategy": "price_only_late_score_v1"},
+            strategy="price_only_late_score",
+        )
+        desk.positions = {7: gate, 8: sleeve}
+        book = live_book(yes={60.0: 2.0})
+        desk.apply_book_snapshot("T", book)
+        desk.pending_exits[7] = PendingExit(0.0, 100.0, "flatten", 0.0)
+
+        desk.process_pending({"T": book}, now_mono=1.0, now_wall=100.1)
+
+        self.assertNotIn(7, desk.positions)
+        self.assertIn(8, desk.positions)
+        self.assertEqual(desk.shadows.ensure("T", book).yes_bids, {})
+        self.assertEqual(desk.sleeve_shadows.ensure("T", book).yes_bids, {60.0: 2.0})
+        self.assertEqual(book.yes_bids, {60.0: 2.0})
+
     @patch("app.paper.store.log_event")
     @patch("app.paper.store.open_paper_trade", return_value=9)
     def test_entry_uses_arrival_book_and_real_signal_id(self, open_trade, _log):

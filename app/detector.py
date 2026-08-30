@@ -30,7 +30,6 @@ class MarketState:
         self.trades = deque()          # (ts_ms, px, sz, taker)
         self.big_bursts = deque()      # (ts_ms, signed_dl) recent notable sweeps
         self.last_candidate_ms = -1e18
-        self.last_entry_ms = -1e18     # set by engine on fill (lockout)
 
     def evict(self, now_ms):
         while self.trades and self.trades[0][0] < now_ms - 300_000:
@@ -85,8 +84,6 @@ class Detector:
             return None
         if ts_ms - st.last_candidate_ms < config.EPISODE_COOLDOWN_S * 1000:
             st.last_candidate_ms = ts_ms
-            return None
-        if ts_ms - st.last_entry_ms < config.LOCKOUT_S * 1000:
             return None
         st.last_candidate_ms = ts_ms
         return {"ticker": ticker, "ts_ms": ts_ms, "dir": d, "dl": round(dl, 3),

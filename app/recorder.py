@@ -76,6 +76,32 @@ class RawRecorder:
             "last_write_ts": self.last_write_ts,
         }
 
-    def close(self):
+    def checkpoint(self):
+        """Close the active gzip member so an export can copy a valid segment.
+
+        The next message transparently reopens the hourly file in append mode,
+        producing a standards-compliant concatenated gzip stream.
+        """
         if self._fh:
             self._fh.close()
+        self._fh = None
+        self._hour = None
+        self._n_since_flush = 0
+
+    def checkpoint_for_export(self):
+        """Finalize and rotate the active segment before an export snapshot."""
+        active_hour = self._hour
+        self.checkpoint()
+        if not active_hour:
+            return None
+        active_path = os.path.join(self.dir, f"feed-{active_hour}.jsonl.gz")
+        if not os.path.isfile(active_path):
+            return None
+        finalized_path = os.path.join(
+            self.dir, f"feed-{active_hour}-part-{time.time_ns()}.jsonl.gz",
+        )
+        os.replace(active_path, finalized_path)
+        return finalized_path
+
+    def close(self):
+        self.checkpoint()

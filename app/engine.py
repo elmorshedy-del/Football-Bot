@@ -1,6 +1,7 @@
 """Engine: discovery -> subscriptions -> books/recorder -> detector -> paper desk."""
 import asyncio
 import json
+import re
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -15,6 +16,24 @@ from .paper import PaperDesk
 from .recorder import RawRecorder
 
 
+GATE_A_STRATEGY = "gate_a"
+PRICE_ONLY_STRATEGY = "price_only_late_score"
+
+
+def market_game_title(market):
+    """Derive an additive matchup label from provider text without changing it."""
+    title = (market.get("title") or market.get("subtitle") or "").strip()
+    if " vs " in title.lower():
+        return re.sub(r"\s+Winner\?\s*$", "", title, flags=re.IGNORECASE)
+    rules = market.get("rules_secondary") or market.get("rules_primary") or ""
+    match = re.search(
+        r"(?:refers to|wins) the (.+?\s+vs\s+.+?) professional .*?soccer game",
+        rules,
+        flags=re.IGNORECASE,
+    )
+    return match.group(1).strip() if match else None
+
+
 def parse_iso(s):
     try:
         return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
@@ -25,6 +44,9 @@ def parse_iso(s):
 class Engine:
     def __init__(self, queue):
         self.q = queue
+        self.errors = deque(maxlen=50)
+        self._last_error_key = None
+        self._last_error_ts = 0.0
         self.mode = config.mode()
         self.cred_error = ""
         try:
@@ -41,7 +63,9 @@ class Engine:
             self.client.n_requests = self.client.n_429 = self.client.n_retries = 0
         self.detector = Detector()
         self.late_score_sleeve = PriceOnlyLateScoreSleeve()
-        self.desk = PaperDesk(self.broadcast, self.on_paper_entry_result)
+        self.desk = PaperDesk(
+            self.broadcast, self.on_paper_entry_result, error_result=self._record_error,
+        )
         self.recorder = RawRecorder(self.on_recorder_error)
         self.books = {}
         self.meta = {}                 # ticker -> {event, series, title, close_time}
@@ -50,6 +74,7 @@ class Engine:
         self.watched_events = set()    # current discovery window only
         self.prices = {}               # ticker -> {last,bid,ask,spark:deque,dirty}
         self.pending = []              # candidates awaiting sibling confirmation
+        self.last_entry_ms = {}        # (strategy, ticker) -> exchange signal timestamp
         self.feed_lag = deque(maxlen=600)
         self.market_observations = {}  # event -> recent locally timestamped price changes
         self._last_market_state = {}   # (kind, ticker) -> tuple, suppress unchanged frames
@@ -60,6 +85,8 @@ class Engine:
         self.n_trades = 0
         self.n_foreign = 0
         self.demo_status = ""
+        if self.cred_error:
+            self._record_error("credentials", self.cred_error)
 
     # ---------- plumbing ----------
     def broadcast(self, msg):
@@ -68,23 +95,54 @@ class Engine:
         except asyncio.QueueFull:
             pass
 
+    def _record_error(self, component, error):
+        now = time.time()
+        message = str(error)
+        key = component, message
+        # Repeating network failures are represented without flooding the panel or DB.
+        if key == self._last_error_key and now - self._last_error_ts < 30.0:
+            return
+        self._last_error_key = key
+        self._last_error_ts = now
+        row = {
+            "ts": now,
+            "component": component,
+            "message": message,
+        }
+        self.errors.append(row)
+        try:
+            store.log_event("error", f"{component}: {message}")
+        except Exception:
+            pass
+        self.broadcast({"type": "system_error", "error": row})
+
     def on_recorder_error(self, error):
         text = f"raw recorder unhealthy: {error}"
+        self._record_error("recorder", error)
         try:
             store.log_event("recorder", text)
         except Exception:
             pass
         self.broadcast({"type": "log", "text": text})
 
+    def on_ws_state(self, state):
+        self.ws_state = state
+        if str(state).startswith("disconnected"):
+            self._record_error("websocket", state)
+
     def register_market(self, ticker, event, series, title, close_time,
-                        fee_type="quadratic", fee_multiplier=1.0):
+                        fee_type="quadratic", fee_multiplier=1.0, leg_title=None,
+                        game_title=None):
         self.meta[ticker] = {"event": event, "series": series, "title": title,
                              "close_time": close_time, "fee_type": fee_type,
-                             "fee_multiplier": fee_multiplier}
+                             "fee_multiplier": fee_multiplier,
+                             "leg_title": leg_title, "game_title": game_title}
         self.event_markets.setdefault(event, [])
         if ticker not in self.event_markets[event]:
             self.event_markets[event].append(ticker)
-        store.upsert_market(ticker, event, series, title, close_time, "open")
+        store.upsert_market(
+            ticker, event, series, title, close_time, "open", game_title, leg_title,
+        )
 
     def siblings(self, ticker):
         m = self.meta.get(ticker)
@@ -119,7 +177,7 @@ class Engine:
                 config.SLEEVE_START_BEFORE_EXPIRY_MIN * 60.0)
 
     def _observe_sleeve(self, ticker, observed_ms):
-        if config.PRICE_ONLY_SLEEVE_MODE != "enforce":
+        if config.PRICE_ONLY_SLEEVE_MODE not in {"enforce", "parallel"}:
             return
         m = self.meta.get(ticker)
         if not m:
@@ -280,7 +338,7 @@ class Engine:
             "dir": cand["dir"], "dl": cand["dl"], "levels": cand["levels"],
             "size": cand["size"], "ref": cand["ref"], "ext": cand["ext"],
             "conf_lag_ms": lag, "late": self.is_late(cand["ticker"]), "outcome": outcome,
-            "detail": cand.get("sleeve") or {},
+            "detail": cand.get("detail") or {},
         })
         if announce:
             self._announce_signal(sid, cand, lag, outcome)
@@ -292,71 +350,122 @@ class Engine:
             "id": sid, "market": cand["ticker"], "series": m.get("series", "?"),
             "dir": cand["dir"], "dl": cand["dl"], "levels": cand["levels"],
             "size": cand["size"], "ref": cand["ref"], "ext": cand["ext"],
-            "conf_lag_ms": lag, "outcome": outcome, "ts": time.time()}})
+            "conf_lag_ms": lag, "outcome": outcome, "ts": time.time(),
+            "strategy": cand.get("strategy")}})
         icon = {"filled": "🎯", "rejected_cap": "🧢", "unconfirmed": "👻"}.get(outcome, "•")
         store.log_event("signal", f"{icon} {outcome.upper()} {cand['ticker']} "
                                   f"dl={cand['dl']} lv={cand['levels']} "
                                   f"conf={f'{lag:+.0f}ms' if lag is not None else '—'}")
 
-    def act_on_signal(self, cand, lag):
-        decision_start = time.monotonic()
-        if config.LATE_ONLY and not self.is_late(cand["ticker"]):
-            self.record_signal(cand, lag, "not_late")
-            return
+    @staticmethod
+    def _strategy_candidate(cand, strategy, sleeve=None):
+        tagged = dict(cand)
+        tagged["strategy"] = strategy
+        tagged["detail"] = {"strategy": strategy}
+        if sleeve is not None:
+            tagged["sleeve"] = dict(sleeve)
+            tagged["detail"]["sleeve"] = dict(sleeve)
+        return tagged
+
+    def _is_strategy_locked(self, cand):
+        entries = getattr(self, "last_entry_ms", None)
+        if entries is None:
+            self.last_entry_ms = entries = {}
+        key = (cand.get("strategy") or GATE_A_STRATEGY, cand["ticker"])
+        previous = entries.get(key, -1e18)
+        return cand["ts_ms"] - previous < config.LOCKOUT_S * 1000.0
+
+    def _remember_fill(self, cand):
+        if not hasattr(self, "last_entry_ms"):
+            self.last_entry_ms = {}
+        key = (cand.get("strategy") or GATE_A_STRATEGY, cand["ticker"])
+        self.last_entry_ms[key] = cand["ts_ms"]
+
+    def _execute_strategy_candidate(self, cand, lag, decision_start):
+        if self._is_strategy_locked(cand):
+            self.record_signal(cand, lag, "strategy_lockout")
+            return "strategy_lockout"
         m = self.meta.get(cand["ticker"], {"event": "?", "series": "?"})
-        if config.PRICE_ONLY_SLEEVE_MODE == "enforce":
-            if not self.is_sleeve_window(cand["ticker"]):
-                cand["sleeve"] = {
-                    "strategy": "price_only_late_score_v1",
-                    "feed_independent": True,
-                    "decision": "outside_minute_88_window",
-                }
-                self.record_signal(cand, lag, "sleeve_outside_window")
-                return
-            event = m.get("event", "?")
-            decision = self.late_score_sleeve.classify(
-                cand,
-                event,
-                self.event_markets.get(event, ()),
-                self.meta,
-                self.books,
-                cand.get("local_ts", time.time()) * 1000.0,
-            )
-            cand["sleeve"] = dict(decision.detail, decision=decision.reason)
-            if not decision.accepted:
-                self.record_signal(cand, lag, f"sleeve_{decision.reason}")
-                return
         if config.PAPER_EXECUTION_V2:
             sid = self.record_signal(cand, lag, "queued")
             self.desk.queue_enter(sid, cand, m)
             store.add_latency("decision_ms", (time.monotonic() - decision_start) * 1000)
-            return
+            return "queued"
         book = self.books.get(cand["ticker"])
         sid = self.record_signal(cand, lag, "executing", announce=False)
         try:
             outcome = self.desk.try_enter(sid, cand, m, book)
-            detail = cand.get("sleeve") or {}
+            detail = dict(cand.get("detail") or {})
         except Exception as exc:
             outcome = "execution_error"
-            detail = dict(cand.get("sleeve") or {})
+            detail = dict(cand.get("detail") or {})
             detail["error"] = f"{type(exc).__name__}: {exc}"
         store.add_latency("decision_ms", (time.monotonic() - decision_start) * 1000)
         store.update_signal_outcome(sid, outcome, detail)
         self._announce_signal(sid, cand, lag, outcome)
         if outcome == "filled":
-            self.detector.state(cand["ticker"]).last_entry_ms = cand["ts_ms"]
+            self._remember_fill(cand)
+        return outcome
+
+    def _run_gate_a(self, cand, lag, decision_start):
+        tagged = self._strategy_candidate(cand, GATE_A_STRATEGY)
+        if config.LATE_ONLY and not self.is_late(tagged["ticker"]):
+            self.record_signal(tagged, lag, "not_late")
+            return "not_late"
+        return self._execute_strategy_candidate(tagged, lag, decision_start)
+
+    def _run_price_only(self, cand, lag, decision_start):
+        if not self.is_sleeve_window(cand["ticker"]):
+            sleeve = {
+                "strategy": "price_only_late_score_v1",
+                "feed_independent": True,
+                "decision": "outside_minute_88_window",
+            }
+            tagged = self._strategy_candidate(cand, PRICE_ONLY_STRATEGY, sleeve)
+            self.record_signal(tagged, lag, "sleeve_outside_window")
+            return "sleeve_outside_window"
+        m = self.meta.get(cand["ticker"], {"event": "?", "series": "?"})
+        event = m.get("event", "?")
+        decision = self.late_score_sleeve.classify(
+            cand,
+            event,
+            self.event_markets.get(event, ()),
+            self.meta,
+            self.books,
+            cand.get("local_ts", time.time()) * 1000.0,
+        )
+        sleeve = dict(decision.detail, decision=decision.reason)
+        tagged = self._strategy_candidate(cand, PRICE_ONLY_STRATEGY, sleeve)
+        if not decision.accepted:
+            self.record_signal(tagged, lag, f"sleeve_{decision.reason}")
+            return f"sleeve_{decision.reason}"
+        return self._execute_strategy_candidate(tagged, lag, decision_start)
+
+    def act_on_signal(self, cand, lag):
+        """Dispatch one confirmed episode to independently simulated strategies."""
+        decision_start = time.monotonic()
+        mode = config.PRICE_ONLY_SLEEVE_MODE
+        outcomes = {}
+        if mode in {"off", "parallel"}:
+            outcomes[GATE_A_STRATEGY] = self._run_gate_a(cand, lag, decision_start)
+        if mode in {"enforce", "parallel"}:
+            outcomes[PRICE_ONLY_STRATEGY] = self._run_price_only(
+                cand, lag, decision_start,
+            )
+        return outcomes
 
     def on_paper_entry_result(self, signal_id, cand, outcome, detail):
         """Finalize a queued paper signal after its simulated arrival."""
         if outcome == "filled":
-            self.detector.state(cand["ticker"]).last_entry_ms = cand["ts_ms"]
+            self._remember_fill(cand)
         self.broadcast({
             "type": "signal_update",
             "signal": {"id": signal_id, "outcome": outcome, "detail": detail},
         })
         store.log_event(
             "signal", f"{outcome.upper()} {cand['ticker']} after "
-            f"{detail.get('paper_latency_ms', 0):.1f}ms paper latency",
+            f"{detail.get('paper_latency_ms', 0):.1f}ms paper latency "
+            f"[{cand.get('strategy') or GATE_A_STRATEGY}]",
         )
 
     # ---------- background tasks ----------
@@ -373,7 +482,8 @@ class Engine:
             schedule = fee_type, float(multiplier)
             self.fee_schedules[series] = schedule
             return schedule
-        except (RuntimeError, TypeError, ValueError):
+        except (RuntimeError, TypeError, ValueError) as exc:
+            self._record_error("fee_schedule", exc)
             return None, None
 
     async def discovery_task(self):
@@ -385,7 +495,8 @@ class Engine:
                     try:
                         resp = await self.client.get("/markets", series_ticker=series,
                                                      status="open", limit=1000)
-                    except Exception:
+                    except Exception as exc:
+                        self._record_error(f"discovery:{series}", exc)
                         continue
                     fee_type, fee_multiplier = await self._fee_schedule(series)
                     for mkt in resp.get("markets") or []:
@@ -403,7 +514,10 @@ class Engine:
                             self.register_market(tk, mkt.get("event_ticker", "?"), series,
                                                  mkt.get("title") or mkt.get("subtitle") or tk,
                                                  mkt.get("expected_expiration_time") or mkt.get("close_time"),
-                                                 fee_type, fee_multiplier)
+                                                 fee_type, fee_multiplier,
+                                                 mkt.get("yes_sub_title") or
+                                                 mkt.get("expiration_value"),
+                                                 market_game_title(mkt))
                             want.add(tk)
                 if self.ws:
                     await self.ws.set_markets(want)
@@ -414,6 +528,7 @@ class Engine:
                                 f"discovery: watching {len(want)} markets "
                                 f"({len(set(self.meta[t]['event'] for t in want if t in self.meta))} matches)"})
             except Exception as e:
+                self._record_error("discovery", e)
                 self.broadcast({"type": "log", "text": f"discovery error: {e!r}"})
             await asyncio.sleep(config.DISCOVERY_INTERVAL_S)
 
@@ -430,8 +545,8 @@ class Engine:
                     mkt = r.get("market") or {}
                     if mkt.get("result") in ("yes", "no"):
                         self.desk.settle_market(tk, mkt["result"])
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self._record_error(f"settlement:{tk}", exc)
 
     async def periodic_task(self):
         last_stats = 0.0
@@ -468,23 +583,80 @@ class Engine:
             try:
                 self.desk.process_pending(self.books)
             except Exception as exc:
+                self._record_error("paper_execution", exc)
                 store.log_event("paper", f"execution adapter error: {exc!r}")
                 self.broadcast({"type": "log", "text": f"paper execution error: {exc!r}"})
             await asyncio.sleep(delay)
 
     def status(self):
         lat = sorted(self.feed_lag)
+        recorder = self.recorder.status()
+        goal = (self.goal_latency.status() if self.goal_latency else {"enabled": False})
+        database = store.database_health()
+        ws_healthy = self.ws_state == "demo" or str(self.ws_state).startswith("connected")
+        poll_age = (
+            time.time() - goal["last_poll_ts"]
+            if goal.get("enabled") and goal.get("last_poll_ts") else None
+        )
+        poll_stale = (
+            poll_age is not None and goal.get("mapped_matches", 0) > 0 and
+            poll_age > max(5.0, config.GOAL_LATENCY_POLL_MS / 1000.0 * 10.0)
+        )
+        goal_healthy = (
+            not goal.get("enabled") or
+            (not goal.get("last_error") and not poll_stale)
+        )
+        recent_cutoff = time.time() - 300.0
+        recent_errors = [row for row in self.errors if row["ts"] >= recent_cutoff]
+        execution_errors = [row for row in recent_errors
+                            if row["component"].startswith("paper")]
+        checks = {
+            "websocket": {"healthy": ws_healthy, "status": self.ws_state},
+            "recorder": {"healthy": bool(recorder.get("healthy")),
+                         "status": "recording" if recorder.get("healthy") else "error"},
+            "match_event_feed": {
+                "healthy": goal_healthy,
+                "status": (
+                    "diagnostic_disabled" if not goal.get("enabled") else
+                    "error" if goal.get("last_error") else
+                    "stale" if poll_stale else
+                    "mapping_matches" if not goal.get("mapped_matches") else
+                    "observing"
+                ),
+                "last_poll_ts": goal.get("last_poll_ts"),
+                "last_response_ms": goal.get("last_response_ms"),
+                "target_poll_ms": goal.get("poll_ms"),
+                "mapped_matches": goal.get("mapped_matches", 0),
+                "last_error": goal.get("last_error"),
+            },
+            "paper_execution": {
+                "healthy": not execution_errors,
+                "status": "ready" if not execution_errors else "recent_error",
+                "pending": len(self.desk.pending_entries) + len(self.desk.pending_exits),
+            },
+            "database": database,
+            "credentials": {
+                "healthy": not bool(self.cred_error),
+                "status": "configured" if not self.cred_error else "error",
+            },
+            "recent_backend_faults": {
+                "healthy": not recent_errors,
+                "status": "clear" if not recent_errors else f"{len(recent_errors)} recent",
+            },
+        }
+        system_healthy = all(check["healthy"] for check in checks.values())
         return {"mode": self.mode, "ws": self.ws_state, "uptime_s": int(time.time() - self.started),
                 "markets": len(self.meta), "matches": len(self.event_markets),
                 "trades_seen": self.n_trades, "recorded": self.recorder.total,
-                "recorder": self.recorder.status(),
+                "recorder": recorder,
                 "kill": self.desk.kill, "open_positions": len(self.desk.positions),
                 "paper_pending": len(self.desk.pending_entries) + len(self.desk.pending_exits),
                 "demo": self.demo_status, "cred_error": self.cred_error,
                 "foreign_dropped": self.n_foreign,
                 "price_only_sleeve": config.PRICE_ONLY_SLEEVE_MODE,
-                "goal_latency": (self.goal_latency.status() if self.goal_latency else
-                                 {"enabled": False}),
+                "goal_latency": goal,
+                "health": {"ok": system_healthy, "checks": checks,
+                           "recent_errors": list(reversed(recent_errors[-20:]))},
                 "feed_lag_p50": round(lat[len(lat) // 2], 1) if lat else None,
                 "feed_lag_p95": round(lat[int(0.95 * len(lat))], 1) if len(lat) > 20 else None}
 
@@ -494,7 +666,13 @@ class Engine:
             store.purge_non_live()  # clean demo/legacy rows so live P&L starts fresh
             if config.PAPER_EXECUTION_V2:
                 self.desk.restore_open_positions(store.load_open_paper_positions())
-            self.ws = KalshiWS(self.handle_ws, lambda s: setattr(self, "ws_state", s))
+                for pos in self.desk.positions.values():
+                    self._remember_fill({
+                        "strategy": pos.strategy,
+                        "ticker": pos.market,
+                        "ts_ms": pos.entry_ts * 1000.0,
+                    })
+            self.ws = KalshiWS(self.handle_ws, self.on_ws_state)
             asyncio.create_task(self.ws.run())
             asyncio.create_task(self.discovery_task())
             asyncio.create_task(self.settle_poll_task())

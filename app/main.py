@@ -2,15 +2,17 @@
 import asyncio
 import json
 import os
+import re
 import secrets
-import time
 from contextlib import asynccontextmanager, suppress
 
 from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.background import BackgroundTask
 
-from . import config, store
+from . import config, exporter, store
+from .audit import build_trigger, json_object, match_signal_event, signal_strategy, timing_fields
 from .engine import Engine
 
 _clients = set()
@@ -45,6 +47,95 @@ async def lifespan(_app):
 
 
 app = FastAPI(title="Football-Bot", lifespan=lifespan)
+
+
+def _human_identifier(value):
+    text = re.sub(r"^KX", "", value or "", flags=re.IGNORECASE)
+    text = re.sub(r"GAME", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"[-_]+", " · ", text)
+    text = re.sub(r"\s+", " ", text).strip(" ·")
+    return text.title() or "Unknown match"
+
+
+def _display_names(ticker, fallback_event=None, stored_title=None, stored_leg=None,
+                   stored_game=None):
+    """Presentation-only soccer names; stored identifiers remain untouched."""
+    meta = engine.meta.get(ticker, {}) if engine else {}
+    raw = (meta.get("title") or stored_title or ticker or "").strip()
+    parts = [part.strip(" -") for part in raw.replace("–", "—").split("—") if part.strip(" -")]
+    fallback = fallback_event or meta.get("event") or ticker
+    game_source = meta.get("game_title") or stored_game or (
+        parts[0] if len(parts) > 1 else raw
+    )
+    game_source = re.sub(r"\s+Winner\?\s*$", "", game_source, flags=re.IGNORECASE)
+    game = game_source if game_source and game_source != ticker else _human_identifier(fallback)
+    suffix = (ticker or "").rsplit("-", 1)[-1]
+    provider_leg = (meta.get("leg_title") or stored_leg or "").strip()
+    if suffix.upper() in {"TIE", "DRAW", "X"} or provider_leg.lower() in {"tie", "draw"}:
+        leg = "Draw"
+    elif provider_leg:
+        leg = re.sub(r"\s+wins?\s*$", "", provider_leg, flags=re.IGNORECASE).strip()
+    elif len(parts) > 1:
+        leg = parts[-1]
+    else:
+        title_leg = re.sub(r"\s+wins?\s*$", "", raw, flags=re.IGNORECASE).strip()
+        leg = title_leg if title_leg and title_leg not in {ticker, game} else _human_identifier(suffix)
+    return {"display_game": game, "display_leg": leg,
+            "display_contract": "Draw" if leg == "Draw" else f"{leg} wins"}
+
+
+def _rows_by_signal_id(signal_ids):
+    signal_ids = sorted({int(value) for value in signal_ids if value is not None})
+    if not signal_ids:
+        return {}
+    marks = ",".join("?" for _ in signal_ids)
+    return {row["id"]: row for row in store.q(
+        f"""SELECT s.*,m.title AS market_title,m.display_game AS market_game,
+                   m.display_leg AS market_leg FROM signals s
+              LEFT JOIN markets m ON m.ticker=s.market
+             WHERE s.id IN ({marks})""", signal_ids,
+    )}
+
+
+def _trades_by_signal_id(signal_ids):
+    signal_ids = sorted({int(value) for value in signal_ids if value is not None})
+    if not signal_ids:
+        return {}
+    marks = ",".join("?" for _ in signal_ids)
+    return {row["signal_id"]: row for row in store.q(
+        f"SELECT * FROM trades WHERE signal_id IN ({marks})", signal_ids,
+    )}
+
+
+def _event_observations(signals):
+    timed = [row for row in signals if isinstance(row.get("local_ts"), (int, float))]
+    events = sorted({row.get("event") for row in timed if row.get("event")})
+    if not events:
+        return []
+    marks = ",".join("?" for _ in events)
+    lower = min(row["local_ts"] for row in timed) - config.EVENT_MATCH_WINDOW_S
+    upper = max(row["local_ts"] for row in timed) + config.EVENT_MATCH_WINDOW_S
+    return store.q(
+        f"""SELECT * FROM goal_latency_observations
+              WHERE event IN ({marks}) AND observed_ts BETWEEN ? AND ?
+              ORDER BY observed_ts""",
+        (*events, lower, upper),
+    )
+
+
+def _decorate_signal(row, observations, trade=None):
+    row["detail"] = json_object(row.get("detail"))
+    row["strategy"] = (
+        (trade or {}).get("strategy") or signal_strategy(row)
+    )
+    row["trigger"] = build_trigger(row)
+    row["timing"] = timing_fields(row, trade)
+    row["matched_event"] = match_signal_event(row, observations)
+    row.update(_display_names(
+        row.get("market"), row.get("event"), row.get("market_title"),
+        row.get("market_leg"), row.get("market_game"),
+    ))
+    return row
 
 
 async def _pump():
@@ -90,6 +181,7 @@ async def get_config():
             "paper_execution_v2": config.PAPER_EXECUTION_V2,
             "goal_latency_observer": config.GOAL_LATENCY_OBSERVER,
             "goal_latency_poll_ms": config.GOAL_LATENCY_POLL_MS,
+            "event_match_window_s": config.EVENT_MATCH_WINDOW_S,
             "league_prior": config.LEAGUE_PRIOR}
 
 
@@ -103,22 +195,67 @@ async def matches():
                                 "close_time": m.get("close_time"), "late": False, "legs": {}})
         ps = engine.prices.get(tk, {})
         d["late"] = d["late"] or engine.is_late(tk)
+        display = _display_names(tk, ev)
+        d["title"] = display["display_game"]
         d["legs"][tk] = {"last": ps.get("last"), "bid": ps.get("bid"), "ask": ps.get("ask"),
+                         "display_name": display["display_leg"],
                          "spark": list(ps.get("spark") or [])[-60:]}
     return list(out.values())
 
 
 @app.get("/api/signals")
 async def signals(limit: int = 60):
-    return store.q("SELECT * FROM signals ORDER BY id DESC LIMIT ?", (limit,))
+    limit = max(1, min(limit, 500))
+    rows = store.q(
+        """SELECT s.*,m.title AS market_title,m.display_game AS market_game,
+                  m.display_leg AS market_leg FROM signals s
+             LEFT JOIN markets m ON m.ticker=s.market
+            ORDER BY s.id DESC LIMIT ?""",
+        (limit,),
+    )
+    trades_by_signal = _trades_by_signal_id(row["id"] for row in rows)
+    observations = _event_observations(rows)
+    for row in rows:
+        _decorate_signal(row, observations, trades_by_signal.get(row["id"]))
+    return rows
 
 
 @app.get("/api/trades")
 async def trades(limit: int = 200):
+    limit = max(1, min(limit, 500))
     rows = store.q("SELECT * FROM trades ORDER BY id DESC LIMIT ?", (limit,))
+    opens = [engine.desk.pos_dict(p, p.best_bid) for p in engine.desk.positions.values()]
+    signal_rows = _rows_by_signal_id(
+        [row.get("signal_id") for row in rows] + [row.get("signal_id") for row in opens],
+    )
+    observations = _event_observations(signal_rows.values())
     for r in rows:
         r.pop("book_at_entry", None)
-    opens = [engine.desk.pos_dict(p, p.best_bid) for p in engine.desk.positions.values()]
+        signal = signal_rows.get(r.get("signal_id"))
+        r.update(_display_names(
+            r.get("market"), r.get("event"),
+            (signal or {}).get("market_title"), (signal or {}).get("market_leg"),
+            (signal or {}).get("market_game"),
+        ))
+        if signal:
+            signal["detail"] = json_object(signal.get("detail"))
+            signal["strategy"] = r.get("strategy") or signal_strategy(signal)
+            r["trigger"] = build_trigger(signal)
+            r["timing"] = timing_fields(signal, r)
+            r["matched_event"] = match_signal_event(signal, observations)
+    for row in opens:
+        signal = signal_rows.get(row.get("signal_id"))
+        row.update(_display_names(
+            row.get("market"), row.get("event"),
+            (signal or {}).get("market_title"), (signal or {}).get("market_leg"),
+            (signal or {}).get("market_game"),
+        ))
+        if signal:
+            signal["detail"] = json_object(signal.get("detail"))
+            signal["strategy"] = row.get("strategy") or signal_strategy(signal)
+            row["trigger"] = build_trigger(signal)
+            row["timing"] = timing_fields(signal, row)
+            row["matched_event"] = match_signal_event(signal, observations)
     return {"open": opens, "closed": [r for r in rows if r["status"] == "closed"]}
 
 
@@ -129,11 +266,21 @@ async def stats():
 
 @app.get("/api/equity")
 async def equity():
-    rows = store.q("SELECT exit_ts, net FROM trades WHERE status='closed' ORDER BY exit_ts")
-    cum, out = 0.0, []
+    rows = store.q(
+        """SELECT exit_ts,net,strategy FROM trades
+             WHERE status='closed' ORDER BY exit_ts,id"""
+    )
+    cumulative = {"combined": 0.0, "gate_a": 0.0, "price_only_late_score": 0.0}
+    out = {key: [] for key in cumulative}
     for r in rows:
-        cum += r["net"] or 0
-        out.append([int((r["exit_ts"] or 0) * 1000), round(cum, 2)])
+        strategy = ("price_only_late_score" if r.get("strategy") in {
+            "price_only_late_score", "price_only_late_score_v1",
+        } else "gate_a")
+        ts_ms = int((r["exit_ts"] or 0) * 1000)
+        cumulative[strategy] += r["net"] or 0
+        cumulative["combined"] += r["net"] or 0
+        out[strategy].append([ts_ms, round(cumulative[strategy], 2)])
+        out["combined"].append([ts_ms, round(cumulative["combined"], 2)])
     return out
 
 
@@ -159,17 +306,53 @@ async def goal_latency(limit: int = 100):
         "SELECT * FROM goal_latency_observations ORDER BY id DESC LIMIT ?", (limit,),
     )
     for row in rows:
-        for field in ("score_before", "score_after", "detail"):
+        for field in ("score_before", "score_after", "normalized_event", "detail"):
             try:
                 row[field] = json.loads(row[field])
             except (TypeError, json.JSONDecodeError):
                 pass
+        row.update(_display_names("", row.get("event")))
     return rows
 
 
 @app.get("/api/eventlog")
 async def eventlog(limit: int = 80):
     return store.q("SELECT * FROM eventlog ORDER BY rowid DESC LIMIT ?", (limit,))
+
+
+def _remove_export(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+@app.get("/api/export", dependencies=[Depends(require_admin)])
+async def export_study_data():
+    """Download a consistent paper-study snapshot without exposing credentials."""
+    try:
+        # Finalize the active gzip before selecting immutable raw segments. New
+        # frames open a fresh active file, which belongs to the next export.
+        engine.recorder.checkpoint_for_export()
+        raw_paths = exporter.raw_feed_paths()
+        # This synchronous backup runs before yielding the event loop, so the
+        # database and selected raw files share one explicit capture boundary.
+        snapshot_path = exporter.prepare_database_snapshot()
+        path, _manifest = await asyncio.to_thread(
+            exporter.build_study_bundle, None, engine.mode, raw_paths, snapshot_path,
+        )
+    except Exception as exc:  # noqa: BLE001 - keep collection alive and expose the fault
+        engine._record_error("study_export", exc)
+        raise HTTPException(
+            status_code=500,
+            detail="Study export failed; see System status for the recorded fault.",
+        ) from exc
+    return FileResponse(
+        path,
+        media_type="application/zip",
+        filename=os.path.basename(path),
+        background=BackgroundTask(_remove_export, path),
+    )
 
 
 @app.post("/api/kill", dependencies=[Depends(require_admin)])

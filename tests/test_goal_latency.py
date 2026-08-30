@@ -93,6 +93,7 @@ class ObserverFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(recorded["score_before"]["homeScore"], 0.0)
         self.assertEqual(recorded["score_after"]["homeScore"], 1.0)
         self.assertEqual(observer.goals, 1)
+        self.assertIsNotNone(observer.status()["last_response_ms"])
 
         active.clear()
         await observer._resolve_new_events()
