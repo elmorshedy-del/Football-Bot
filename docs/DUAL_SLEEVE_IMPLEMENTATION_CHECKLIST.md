@@ -91,7 +91,7 @@ Acceptance tests:
 
 Evidence: `docs/DUAL_SLEEVE_CHANGELOG.md` entry `2026-08-30 — Separate sleeve accounting`.
 
-## 6. Frontend makeover — BLOCKED (RENDER CHECK)
+## 6. Frontend makeover — BLOCKED (PUBLIC RENDER CHECK)
 
 Plan:
 
@@ -130,7 +130,7 @@ Acceptance tests:
 
 Evidence: `docs/DUAL_SLEEVE_CHANGELOG.md` entry `2026-08-30 — Downloadable study bundle`.
 
-## 8. Full verification and deployment — IN PROGRESS
+## 8. Full verification and deployment — IN PROGRESS (DEPLOYMENT)
 
 Plan:
 
@@ -144,7 +144,7 @@ Acceptance tests:
 - Railway is healthy and the dashboard reports either `ALL SYSTEMS GOOD` or a specific fault.
 - New signals/events persist through a restart on `/srv/data`.
 
-## 9. Independent final review — PENDING
+## 9. Independent final review — PASSED
 
 Plan:
 
@@ -156,3 +156,5 @@ Acceptance tests:
 
 - `docs/DUAL_SLEEVE_CHANGELOG.md` contains a final audit with evidence and remaining limitations.
 - Pull request stays separately revertible from the original sleeve change.
+
+Evidence: `docs/DUAL_SLEEVE_CHANGELOG.md` entry `2026-08-30 — Independent final code review`.

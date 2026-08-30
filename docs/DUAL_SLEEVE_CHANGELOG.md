@@ -261,3 +261,56 @@ Remaining work:
 
 - Push the isolated branch, open the pull request, wait for GitHub Continuous Integration, perform
   the final diff audit, merge, deploy paper-only, and complete rendered checks on the public URL.
+
+## 2026-08-30 — Independent final code review
+
+Status: `PASSED`
+
+Evidence reviewed:
+
+- Pull request: `#8`, `codex/dual-sleeve-audit-dashboard` into `main`; one commit, 32 files,
+  mergeable without conflicts, no unresolved review threads, and independently revertible from
+  the original price-only sleeve pull request.
+- GitHub Continuous Integration run `33322017843` completed successfully. It executed all 98 tests,
+  compile checks, and the repository's pinned Ruff fatal-error checks on Python 3.12.
+- GitHub tree `2666249838148d64a6f3b44c72773dc88744464b` exactly matched the locally tested
+  commit tree; the connector-created commit changed precisely the 32 reviewed paths.
+
+Final audit conclusions:
+
+- **Entry mathematics:** the sleeve normalizes exactly three positive executable midpoints,
+  requires a timed baseline, fresh legs, bounded spreads, target gain/post-state, sibling outflow,
+  and positive direction. Labels remain inferred states, not observed scores.
+- **Simulation independence:** strategy identity is durable; lockouts key by strategy and market;
+  Gate A and price-only have separate shadow books, positions, exit queues, and P&L allocation;
+  the live order book is never mutated.
+- **Execution realism:** entry/exit latency, latest valid books, IOC depth walking, partial fills,
+  per-level verified taker fees, unsupported-fee rejection, sequence-gap invalidation, settlement,
+  retries, and restart restoration are covered by deterministic tests.
+- **Leakage and safety:** no match-event, score-before/after, or normalized-event reference exists
+  in the sleeve, detector, or paper modules. No real-order/portfolio endpoint exists. Export uses an
+  explicit non-secret allowlist and does not serialize the environment.
+- **Audit semantics:** raw IDs/payloads remain intact; canonical events are versioned; provider
+  receipt uncertainty is explicit; nearest-event joins are same-match/fixed-window and always
+  state `causality=not_established`.
+- **Failure visibility:** stream, recorder, diagnostic feed, paper adapter, database, credentials,
+  dashboard WebSocket, stale polls, recent backend faults, and client API errors all have visible
+  states; a recent recorded backend error prevents a false green banner.
+- **Frontend and export:** additive human labels cover provider title variants; full UTC times and
+  match-feed response latency are visible; phone breakpoints contain no ellipsis; exported tables,
+  database, raw gzip, hashes, and backtest handoff reconcile and parse.
+
+Non-blocking limitations accepted:
+
+- No strategy can be guaranteed profitable or lossless; latency and disappearing liquidity can
+  turn a scratch trigger into a loss.
+- Provider observation time bounds feed receipt, not exact on-field event occurrence.
+- Legacy rows created before additive display metadata may retain a humanized ticker suffix when
+  the provider's historical contract subtitle is unavailable; all new discoveries persist it.
+- External replay/backtesting and any later real execution module are intentionally not part of
+  this pull request.
+
+Remaining operational gate:
+
+- Merge only the green pull request, deploy with both sleeves paper-only and event data diagnostic-
+  only, then complete desktop/public rendered and persistent-volume checks.
