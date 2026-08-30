@@ -316,3 +316,49 @@ Remaining operational gate:
 
 - Merge only the green pull request, deploy with both sleeves paper-only and event data diagnostic-
   only, then complete desktop/public rendered and persistent-volume checks.
+
+## 2026-08-30 — Production deployment and rendered acceptance
+
+Status: `PASSED`
+
+Deployment evidence:
+
+- Pull request `#8` was squash-merged into `main` as commit
+  `633e3d083e29bfc14e1e92ea66c9d3e750d7a01f`; the implementation is revertible as one merge
+  commit and remains separate from the original price-only sleeve change.
+- GitHub Continuous Integration run `33322165031` passed the 98-test suite, compile checks, and
+  pinned Ruff checks for the final pull-request head.
+- Railway production deployment `7ea5361e-24b4-49e8-85df-6b15a55075f2` completed with
+  `SUCCESS`. Only the `football-bot` service was changed. The persistent volume remains mounted
+  at `/srv/data`.
+- Production variables enable `PRICE_ONLY_SLEEVE_MODE=parallel`, `PAPER_EXECUTION_V2=true`, and
+  `GOAL_LATENCY_OBSERVER=true`; both sleeves are paper simulations and the match-event feed remains
+  diagnostic-only. A new admin token protects study exports and is stored only in Railway.
+- Public `/api/status` reported live mode, `health.ok=true`, WebSocket connected, recorder
+  recording, match-event observer observing, paper execution ready, database connected,
+  credentials configured, no recent backend faults, and zero recent errors. The observer reported
+  a 250 ms target poll interval and a 12.1 ms latest response during acceptance.
+- Public `config`, `stats`, `equity`, `signals`, `trades`, and `goal-latency` endpoints returned 200.
+  The export endpoint returned 401 without its admin token, confirming the production boundary.
+- Match-event row `701`, observed on the prior UTC day, remained queryable after the consecutive
+  production deployments. This verifies SQLite study data persisted through restart on the mounted
+  volume; the live raw recorder also continued writing without a recorded failure.
+
+Rendered acceptance:
+
+- The public dashboard rendered at 1363 x 936 with no horizontal page overflow and no application
+  console warning or error. The visible page showed `ALL SYSTEMS GOOD`, both independent sleeve
+  P&L panels, full UTC timestamps, feed response latency, human-readable match and contract names,
+  raw-ID audit details, decision reasons, and the study-download control.
+- The same public deployment rendered inside a 320 px phone viewport. The document measured
+  305 px client width and 305 px scroll width, proving no horizontal overflow; `Sound off`,
+  `Download study data`, and `Kill switch` remained visible and the sleeve panels stacked.
+- Deterministic health tests prove recorder/database/WebSocket faults and recent backend errors
+  make health non-green; frontend contract tests prove fetch, initial-load, scheduled-refresh,
+  export, and WebSocket errors are recorded and displayed instead of swallowed.
+
+Final result:
+
+- All nine checklist sections now pass. Live collection is running for evidence gathering, not
+  evidence of profitability. No return, scratch exit, or loss limit is guaranteed because latency,
+  gaps, fees, and disappearing liquidity remain real execution risks.

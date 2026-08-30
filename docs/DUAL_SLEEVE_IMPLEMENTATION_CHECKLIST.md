@@ -91,7 +91,7 @@ Acceptance tests:
 
 Evidence: `docs/DUAL_SLEEVE_CHANGELOG.md` entry `2026-08-30 — Separate sleeve accounting`.
 
-## 6. Frontend makeover — BLOCKED (PUBLIC RENDER CHECK)
+## 6. Frontend makeover — PASSED
 
 Plan:
 
@@ -109,9 +109,11 @@ Acceptance tests:
 - No raw ticker is the primary label; no unexplained abbreviation or unlabeled chart remains.
 - Simulated disconnect/API error becomes visible in the health panel.
 
-Implementation and static/API validation are complete. The cloud browser blocks local and
-self-contained preview URLs. Desktop/phone and injected-failure rendering will be checked on the
-public deployment in Step 8; this step cannot be marked `PASSED` before that evidence exists.
+Evidence: `docs/DUAL_SLEEVE_CHANGELOG.md` entry `2026-08-30 — Production deployment and
+rendered acceptance`. The public dashboard was rendered at 1363 px desktop width and inside a
+320 px phone viewport. The phone document measured 305 px client width and 305 px scroll width,
+with all three header controls visible. Backend fault injection and client failure visibility are
+covered by the health and frontend contract tests.
 
 ## 7. Downloadable study bundle — PASSED
 
@@ -130,7 +132,7 @@ Acceptance tests:
 
 Evidence: `docs/DUAL_SLEEVE_CHANGELOG.md` entry `2026-08-30 — Downloadable study bundle`.
 
-## 8. Full verification and deployment — IN PROGRESS (DEPLOYMENT)
+## 8. Full verification and deployment — PASSED
 
 Plan:
 
@@ -143,6 +145,9 @@ Acceptance tests:
 - Local tests and GitHub Continuous Integration are green.
 - Railway is healthy and the dashboard reports either `ALL SYSTEMS GOOD` or a specific fault.
 - New signals/events persist through a restart on `/srv/data`.
+
+Evidence: `docs/DUAL_SLEEVE_CHANGELOG.md` entry `2026-08-30 — Production deployment and
+rendered acceptance`.
 
 ## 9. Independent final review — PASSED
 
