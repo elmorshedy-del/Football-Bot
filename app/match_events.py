@@ -4,6 +4,12 @@ Raw provider payloads are always retained.  This module adds a small canonical
 schema for storage, joins and human-readable audit views without using natural
 language interpretation in the trading path.
 """
+import re
+
+
+_CLOCK_RE = re.compile(r"(?P<minute>\d+)(?:\+(?P<stoppage>\d+))?\s*['’]?")
+
+
 def _score_key_matches(key, side):
     lowered = key.lower()
     compact = lowered.replace("_", "").replace(".", "")
@@ -14,11 +20,23 @@ def _score_key_matches(key, side):
 
 
 def _primary_score(signature, side):
-    matches = [(key.count("."), key, value) for key, value in signature.items()
-               if _score_key_matches(key, side)]
+    matches = []
+    priorities = (
+        (f"{side}samegamescore", 0),
+        (f"{side}score", 1),
+        (f"score{side}", 1),
+        (f"{side}aggregatescore", 2),
+    )
+    for key, value in signature.items():
+        compact = key.lower().replace("_", "").replace(".", "")
+        priority = next((rank for suffix, rank in priorities if compact.endswith(suffix)), None)
+        if priority is not None:
+            matches.append((priority, key.count("."), key, value))
+        elif _score_key_matches(key, side):
+            matches.append((3, key.count("."), key, value))
     if not matches:
         return None
-    return float(min(matches)[2])
+    return float(min(matches)[3])
 
 
 def score_pair(signature):
@@ -33,7 +51,8 @@ def _first_field(value, names):
     if isinstance(value, dict):
         for key, child in value.items():
             normalized = str(key).lower().replace("_", "")
-            if normalized in wanted and isinstance(child, (str, int, float)):
+            if normalized in wanted and not isinstance(child, bool) and \
+                    isinstance(child, (str, int, float)):
                 return child
         for child in value.values():
             found = _first_field(child, names)
@@ -51,6 +70,50 @@ def _score_text(pair):
     if pair["home"] is None or pair["away"] is None:
         return None
     return f"{int(pair['home'])}–{int(pair['away'])}"
+
+
+def _clock_parts(value):
+    if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+        return None, None, None
+    matched = _CLOCK_RE.search(str(value))
+    if not matched:
+        return None, None, None
+    minute = int(matched.group("minute"))
+    stoppage = int(matched.group("stoppage")) if matched.group("stoppage") else None
+    rendered = f"{minute}+{stoppage}'" if stoppage is not None else f"{minute}'"
+    return minute, stoppage, rendered
+
+
+def _display_person(value):
+    text = str(value or "").strip()
+    if "," not in text:
+        return text or None
+    family, given = (part.strip() for part in text.split(",", 1))
+    return " ".join(part for part in (given, family) if part) or None
+
+
+def _latest_score_event(details, side):
+    candidates = []
+    sides = (side,) if side in {"home", "away"} else ("home", "away")
+    for event_side in sides:
+        rows = details.get(f"{event_side}_significant_events") or []
+        for index, row in enumerate(rows):
+            if not isinstance(row, dict) or row.get("event_type") != "score_change":
+                continue
+            minute, stoppage, rendered = _clock_parts(row.get("time"))
+            clock_value = (minute or -1) * 1000 + (stoppage or 0)
+            candidates.append((clock_value, index, event_side, row, minute, stoppage, rendered))
+    if not candidates:
+        return None
+    _clock_value, _index, event_side, row, minute, stoppage, rendered = max(candidates)
+    return {
+        "side": event_side,
+        "minute": minute,
+        "stoppage": stoppage,
+        "clock": rendered,
+        "scorer_raw": row.get("player"),
+        "scorer": _display_person(row.get("player")),
+    }
 
 
 def normalize_match_event(change_kind, before, after, live_data=None):
@@ -87,6 +150,19 @@ def normalize_match_event(change_kind, before, after, live_data=None):
     stoppage = _first_field(details, ("stoppage", "stoppage_time", "added_time"))
     period = _first_field(details, ("period", "phase", "half"))
     clock = _first_field(details, ("match_clock", "game_clock", "clock"))
+    score_event = _latest_score_event(details, side)
+    if score_event:
+        minute = score_event["minute"] if minute is None else minute
+        stoppage = score_event["stoppage"] if stoppage is None else stoppage
+        clock = score_event["clock"] if clock is None else clock
+    last_play = details.get("last_play") or {}
+    description = last_play.get("description") if isinstance(last_play, dict) else None
+    penalty = bool(isinstance(description, str) and re.search(
+        r"\bpenalt(?:y|ies)\b|\bfrom the spot\b", description, re.IGNORECASE,
+    ))
+    if change_kind == "goal" and penalty:
+        action = f"{side.title()} penalty scored" if side != "unknown" else "Penalty scored"
+        human_label = f"{action} · {transition}" if transition else action
     return {
         "schema": "football.match_event.v1",
         "canonical_type": canonical_type,
@@ -98,6 +174,10 @@ def normalize_match_event(change_kind, before, after, live_data=None):
         "provider_stoppage": stoppage,
         "provider_period": period,
         "provider_clock": clock,
+        "event_method": "penalty" if penalty else "unspecified",
+        "scorer": (score_event or {}).get("scorer"),
+        "scorer_raw": (score_event or {}).get("scorer_raw"),
+        "provider_description": description,
         "human_label": human_label,
     }
 

@@ -2,20 +2,16 @@
 
 const byId = id => document.getElementById(id);
 const state = {
-  status: null,
-  config: {},
-  stats: {},
-  matches: [],
-  trades: {open: [], closed: []},
-  signals: [],
-  events: [],
-  latency: {},
+  status: null, config: {}, stats: {}, matches: [],
+  trades: {open: [], closed: []}, signals: [], events: [], latency: {},
   equity: {combined: [], gate_a: [], price_only_late_score: []},
-  activity: [],
-  hydrated: false,
+  activity: [], hydrated: false,
 };
+const filters = {query: "", strategy: "all", match: "all", result: "all", association: "all", period: "all"};
+const visibleEquitySeries = new Set(["combined", "gate_a", "price_only_late_score"]);
 const clientErrors = [];
 const activeClientFaults = new Map();
+let leagueSleeve = "combined";
 let socket = null;
 let socketConnected = false;
 let reconnectTimer = null;
@@ -26,123 +22,98 @@ let killEnabled = false;
 let toastTimer = null;
 
 function escapeHtml(value) {
-  return String(value ?? "")
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
+  return String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;").replaceAll('"', "&quot;").replaceAll("'", "&#039;");
 }
-
-function safeJson(value) {
-  return escapeHtml(JSON.stringify(value, null, 2));
-}
-
-function finite(value) {
-  return typeof value === "number" && Number.isFinite(value);
-}
-
+function safeJson(value) { return escapeHtml(JSON.stringify(value, null, 2)); }
+function finite(value) { return typeof value === "number" && Number.isFinite(value); }
 function money(value) {
-  const n = finite(value) ? value : 0;
-  return `${n >= 0 ? "+" : "−"}$${Math.abs(n).toFixed(2)}`;
+  const amount = finite(value) ? value : 0;
+  return `${amount >= 0 ? "+" : "−"}$${Math.abs(amount).toFixed(2)}`;
 }
-
-function cents(value) {
-  return finite(value) ? `${value.toFixed(1)}¢` : "—";
+function cents(value) { return finite(value) ? `${value.toFixed(1)}¢` : "Not supplied"; }
+function integer(value) { return finite(value) ? Math.round(value).toLocaleString() : "Not supplied"; }
+function percent(value) { return finite(value) ? `${value.toFixed(1)}%` : "Not supplied"; }
+function formatBytes(value) {
+  if (!finite(value) || value < 0) return "size unavailable";
+  if (value < 1024) return `${Math.round(value)} B`;
+  const units = ["KB", "MB", "GB", "TB"];
+  let amount = value, unit = -1;
+  do { amount /= 1024; unit += 1; } while (amount >= 1024 && unit < units.length - 1);
+  return `${amount.toFixed(amount >= 10 ? 1 : 2)} ${units[unit]}`;
 }
-
-function integer(value) {
-  return finite(value) ? Math.round(value).toLocaleString() : "—";
+function timestampSeconds(timestamp) {
+  if (!finite(timestamp)) return null;
+  return timestamp > 1e12 ? timestamp / 1000 : timestamp;
 }
-
-function percent(value) {
-  return finite(value) ? `${value.toFixed(1)}%` : "—";
-}
-
 function fullDate(timestamp) {
-  if (!finite(timestamp)) return "Not recorded";
-  const date = new Date(timestamp > 1e12 ? timestamp : timestamp * 1000);
+  const seconds = timestampSeconds(timestamp);
+  if (seconds == null) return "Not supplied by provider";
+  const date = new Date(seconds * 1000);
   if (Number.isNaN(date.getTime())) return "Invalid timestamp";
   return date.toISOString().replace("T", " ").replace("Z", " UTC");
 }
-
+function shortDate(timestamp) {
+  const seconds = timestampSeconds(timestamp);
+  if (seconds == null) return "Unknown time";
+  return new Date(seconds * 1000).toISOString().slice(5, 16).replace("T", " ");
+}
 function duration(seconds) {
-  if (!finite(seconds)) return "—";
+  if (!finite(seconds)) return "Collecting";
   if (seconds < 60) return `${Math.round(seconds)} seconds`;
   if (seconds < 3600) return `${Math.floor(seconds / 60)} minutes`;
-  const hours = Math.floor(seconds / 3600);
-  const minutes = Math.floor((seconds % 3600) / 60);
-  return `${hours}h ${minutes}m`;
+  return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
 }
-
+function relativeMs(milliseconds) {
+  if (!finite(milliseconds)) return "timing unavailable";
+  if (Math.abs(milliseconds) < 1000) return `${Math.abs(milliseconds).toFixed(0)} ms`;
+  if (Math.abs(milliseconds) < 60000) return `${Math.abs(milliseconds / 1000).toFixed(1)} s`;
+  return `${Math.abs(milliseconds / 60000).toFixed(1)} min`;
+}
+function relativeTo(timestamp, origin) {
+  const time = timestampSeconds(timestamp), base = timestampSeconds(origin);
+  if (time == null || base == null) return "relative time unavailable";
+  const delta = (time - base) * 1000;
+  if (Math.abs(delta) < 1) return "at signal receipt";
+  return `${relativeMs(delta)} ${delta >= 0 ? "after" : "before"} signal`;
+}
 function strategyLabel(strategy) {
-  return strategy === "price_only_late_score" ? "Price-only late-score" :
-    strategy === "gate_a" ? "Gate A" : "Detector episode";
+  return strategy === "price_only_late_score" ? "Price-only late-score" : strategy === "gate_a" ? "Gate A" : "Detector episode";
 }
-
-function strategyClass(strategy) {
-  return strategy === "price_only_late_score" ? "price" : "gate";
-}
+function strategyClass(strategy) { return strategy === "price_only_late_score" ? "price" : "gate"; }
+function leagueName(series) { return state.config.league_names?.[series] || series || "Unknown league"; }
 
 const outcomeLabels = {
-  filled: "Paper order filled",
-  queued: "Paper order queued",
-  executing: "Checking executable depth",
-  rejected_cap: "Rejected: executable price exceeded cap",
-  no_book: "Rejected: no valid arrival order book",
-  killed: "Rejected: kill switch active",
-  expired: "Rejected: market expired before arrival",
-  unsupported_fee: "Rejected: fee schedule could not be verified",
-  unconfirmed: "Ignored: no coherent sibling confirmation",
-  not_late: "Ignored: outside Gate A late window",
-  strategy_lockout: "Ignored: this sleeve is in its re-entry lockout",
-  sleeve_outside_window: "Ignored: outside the minute-88 study window",
-  sleeve_no_baseline: "Ignored: no timed triplet baseline",
-  sleeve_stale_baseline: "Ignored: triplet baseline was stale",
-  sleeve_stale_triplet_leg: "Ignored: one match contract was stale",
+  filled: "Paper order filled", queued: "Paper order queued", executing: "Checking executable depth",
+  rejected_cap: "Declined: executable price exceeded cap", no_book: "Declined: no valid arrival order book",
+  killed: "Declined: kill switch active", expired: "Declined: market expired before arrival",
+  unsupported_fee: "Declined: fee schedule could not be verified", unconfirmed: "Ignored: no coherent sibling confirmation",
+  not_late: "Ignored: outside Gate A late window", strategy_lockout: "Ignored: sleeve re-entry lockout",
+  sleeve_outside_window: "Ignored: outside the minute-88 study window", sleeve_no_baseline: "Ignored: no timed triplet baseline",
+  sleeve_stale_baseline: "Ignored: triplet baseline was stale", sleeve_stale_triplet_leg: "Ignored: one match contract was stale",
   sleeve_incoherent_sibling_rise: "Ignored: sibling prices did not reallocate coherently",
   sleeve_insufficient_triplet_shift: "Ignored: normalized probability shift was too small",
   sleeve_weak_post_state: "Ignored: inferred post-event state was too weak",
   sleeve_weak_triplet_coherence: "Ignored: sibling outflow explained too little of the move",
-  sleeve_wide_spread: "Ignored: spread was too wide",
-  sleeve_not_triplet: "Ignored: match did not have exactly three contracts",
+  sleeve_wide_spread: "Ignored: spread was too wide", sleeve_not_triplet: "Ignored: match did not have exactly three contracts",
   sleeve_incomplete_book: "Ignored: a contract order book was incomplete",
   sleeve_ambiguous_draw_leg: "Ignored: draw contract could not be identified",
-  sleeve_not_rising_leg: "Ignored: target contract was not rising",
-  execution_error: "Execution adapter error",
+  sleeve_not_rising_leg: "Ignored: target contract was not rising", execution_error: "Execution adapter error",
 };
-
 const exitLabels = {
-  target: "Profit target reached",
-  timeout: "Gate A time limit",
-  sleeve_timeout: "Price-only time limit",
-  sleeve_profit_lock: "Trailing profit lock",
-  sleeve_scratch: "Fee-aware scratch exit",
-  sleeve_oscillation: "Oscillation exit",
-  sleeve_reversal: "Fast price reversal",
-  stop: "Configured stop",
-  settle: "Market settlement",
-  flatten: "Manual flatten",
-  kill: "Kill switch flatten",
+  target: "Profit target reached", timeout: "Gate A time limit", sleeve_timeout: "Price-only time limit",
+  sleeve_profit_lock: "Trailing profit lock", sleeve_scratch: "Fee-aware scratch exit",
+  sleeve_oscillation: "Oscillation exit", sleeve_reversal: "Fast price reversal", stop: "Configured stop",
+  settle: "Market settlement", flatten: "Manual flatten", kill: "Kill-switch flatten",
 };
-
-const consistencyLabels = {
-  equalizer_consistent: "Consistent with an equalizer",
-  one_goal_lead_consistent: "Consistent with a one-goal lead",
-  correction_or_reversal: "Provider recorded a correction or reversal",
-  state_mismatch: "Nearby event does not match the inferred state",
-  goal_consistent_state_unknown: "Nearby goal; inferred state not confirmable",
-  time_match_only: "Time proximity only",
+const associationLabels = {
+  state_consistent: "State-consistent match event", nearby_goal: "Nearby goal; state not confirmed",
+  nearby_correction: "Nearby score correction", state_mismatch: "Nearby event conflicts with inference",
+  time_only: "Time proximity only", unmatched: "No nearby same-match event",
 };
-
-function humanOutcome(value) {
-  return outcomeLabels[value] || String(value || "Unknown outcome").replaceAll("_", " ");
-}
-
-function humanExit(value) {
-  return exitLabels[value] || String(value || "Unknown exit").replaceAll("_", " ");
-}
-
+function humanOutcome(value) { return outcomeLabels[value] || String(value || "Unknown outcome").replaceAll("_", " "); }
+function humanExit(value) { return exitLabels[value] || String(value || "Unknown exit").replaceAll("_", " "); }
+function humanAssociation(value) { return associationLabels[value] || String(value || "unmatched").replaceAll("_", " "); }
 function humanStatus(value) {
   const text = String(value || "unknown").replaceAll("_", " ");
   return text.charAt(0).toUpperCase() + text.slice(1);
@@ -155,7 +126,6 @@ function showToast(message, error = false) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { toast.className = "toast"; }, 4500);
 }
-
 function recordClientError(component, error) {
   const now = Date.now() / 1000;
   const message = error instanceof Error ? error.message : String(error);
@@ -168,23 +138,15 @@ function recordClientError(component, error) {
   renderHealth();
   showToast(`${component}: ${message}`, true);
 }
-
-function clearClientFault(component) {
-  activeClientFaults.delete(component);
-}
-
+function clearClientFault(component) { activeClientFaults.delete(component); }
 async function apiJson(path) {
   const component = `API ${path.split("?")[0]}`;
   try {
     const response = await fetch(path, {headers: {Accept: "application/json"}});
     if (!response.ok) {
       let detail = `${response.status} ${response.statusText}`;
-      try {
-        const body = await response.json();
-        detail = body.detail || detail;
-      } catch (parseError) {
-        detail += `; response body was not JSON (${parseError.message})`;
-      }
+      try { detail = (await response.json()).detail || detail; }
+      catch (parseError) { detail += `; response body was not JSON (${parseError.message})`; }
       throw new Error(detail);
     }
     const data = await response.json();
@@ -196,91 +158,89 @@ async function apiJson(path) {
   }
 }
 
+function activateTab(name, focus = false) {
+  const safeName = byId(`panel-${name}`) ? name : "overview";
+  document.querySelectorAll("[data-tab]").forEach(button => {
+    const active = button.dataset.tab === safeName;
+    button.classList.toggle("active", active);
+    button.setAttribute("aria-selected", String(active));
+    button.tabIndex = active ? 0 : -1;
+    if (active && focus) button.focus();
+  });
+  document.querySelectorAll(".tab-panel").forEach(panel => { panel.hidden = panel.id !== `panel-${safeName}`; });
+  history.replaceState(null, "", `#${safeName}`);
+  if (safeName === "overview") requestAnimationFrame(renderEquity);
+}
+function initializeTabs() {
+  document.querySelectorAll("[data-tab]").forEach(button => {
+    button.addEventListener("click", () => activateTab(button.dataset.tab));
+    button.addEventListener("keydown", event => {
+      if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      const tabs = [...document.querySelectorAll("[data-tab]")];
+      const current = tabs.indexOf(button);
+      const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 :
+        (current + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+      activateTab(tabs[next].dataset.tab, true);
+      event.preventDefault();
+    });
+  });
+  document.querySelectorAll("[data-tab-target]").forEach(button => button.addEventListener("click", () => activateTab(button.dataset.tabTarget)));
+  activateTab(location.hash.slice(1) || "overview");
+}
+
 function modeTag(status) {
-  const badge = byId("mode-badge");
-  const mode = status?.mode || "starting";
+  const badge = byId("mode-badge"), mode = status?.mode || "starting";
   badge.textContent = mode === "live" ? "Live paper" : mode === "demo" ? "Demo replay" : "Starting";
   badge.className = `status-pill ${mode === "live" ? "live" : mode === "demo" ? "demo" : "neutral"}`;
 }
-
 function healthCheckLabel(key) {
-  return ({
-    websocket: "Market WebSocket",
-    recorder: "Raw recorder",
-    match_event_feed: "Match-event diagnostic",
-    paper_execution: "Paper execution",
-    database: "Database",
-    credentials: "Credentials",
-    recent_backend_faults: "Recent backend faults",
-    dashboard_websocket: "Dashboard live link",
-  })[key] || key.replaceAll("_", " ");
+  return ({websocket: "Market stream", recorder: "Raw recorder", match_event_feed: "Match-event feed",
+    paper_execution: "Paper execution", database: "Database", credentials: "Credentials",
+    recent_backend_faults: "Backend faults", dashboard_websocket: "Dashboard live link"})[key] || key.replaceAll("_", " ");
 }
-
 function renderHealth() {
   const panel = byId("health-panel");
+  if (!panel) return;
   const backend = state.status?.health;
   const checks = {...(backend?.checks || {})};
-  checks.dashboard_websocket = {
-    healthy: socketConnected,
-    status: socketConnected ? "connected" : "disconnected",
-  };
-  const currentFaults = [...activeClientFaults.values()];
-  const checkRows = Object.entries(checks);
-  const ready = state.hydrated && checkRows.length > 1;
-  const allHealthy = ready && checkRows.every(([, check]) => check.healthy) && currentFaults.length === 0;
+  checks.dashboard_websocket = {healthy: socketConnected, status: socketConnected ? "connected" : "disconnected"};
+  const currentFaults = [...activeClientFaults.values()], rows = Object.entries(checks);
+  const ready = state.hydrated && rows.length > 1;
+  const allHealthy = ready && rows.every(([, check]) => check.healthy) && currentFaults.length === 0;
   panel.className = `health-panel ${!ready ? "checking" : allHealthy ? "healthy" : "fault"}`;
-  byId("health-title").textContent = !ready ? "Checking every connection" :
-    allHealthy ? "ALL SYSTEMS GOOD" : "ATTENTION REQUIRED";
+  byId("health-title").textContent = !ready ? "Checking every connection" : allHealthy ? "ALL SYSTEMS GOOD" : "ATTENTION REQUIRED";
   byId("health-indicator").textContent = !ready ? "Checking" : allHealthy ? "Healthy" : "Fault visible";
-  const failed = checkRows.filter(([, check]) => !check.healthy).map(([key]) => healthCheckLabel(key));
-  byId("health-summary").textContent = !ready ? "Waiting for the first complete status response." :
-    allHealthy ? "Market stream, recorder, diagnostic feed, execution, database, and dashboard link report healthy." :
-    `Current issue${failed.length + currentFaults.length === 1 ? "" : "s"}: ${[
-      ...failed, ...currentFaults.map(row => row.component),
-    ].join(", ") || "see recent errors"}.`;
-  byId("health-checks").innerHTML = checkRows.map(([key, check]) => `
-    <div class="health-check ${check.healthy ? "good" : "bad"}">
-      <span>${escapeHtml(healthCheckLabel(key))}</span>
-      <strong>${escapeHtml(humanStatus(check.status))}</strong>
-    </div>`).join("");
-  const backendErrors = backend?.recent_errors || [];
-  const errors = [...currentFaults, ...clientErrors, ...backendErrors]
+  const failed = rows.filter(([, check]) => !check.healthy).map(([key]) => healthCheckLabel(key));
+  byId("health-summary").textContent = !ready ? "Waiting for the first complete status response." : allHealthy ?
+    "Market stream, recorder, diagnostic feed, execution, database, and dashboard link report healthy." :
+    `Current issue${failed.length + currentFaults.length === 1 ? "" : "s"}: ${[...failed, ...currentFaults.map(row => row.component)].join(", ") || "see recent errors"}.`;
+  byId("health-checks").innerHTML = rows.map(([key, check]) => `<div class="health-check ${check.healthy ? "good" : "bad"}"><span>${escapeHtml(healthCheckLabel(key))}</span><strong>${escapeHtml(humanStatus(check.status))}</strong></div>`).join("");
+  const errors = [...currentFaults, ...clientErrors, ...(backend?.recent_errors || [])]
     .sort((a, b) => (b.ts || 0) - (a.ts || 0))
-    .filter((row, index, rows) => index === rows.findIndex(other =>
-      other.component === row.component && other.message === row.message && other.ts === row.ts))
-    .slice(0, 20);
+    .filter((row, index, all) => index === all.findIndex(other => other.component === row.component && other.message === row.message && other.ts === row.ts)).slice(0, 20);
   byId("error-count").textContent = String(errors.length);
-  byId("error-list").innerHTML = errors.length ? errors.map(row => `
-    <div class="error-row"><strong>${escapeHtml(row.component || "system")}</strong> ·
-      ${escapeHtml(fullDate(row.ts))}<br>${escapeHtml(row.message || "Unknown error")}</div>`).join("") :
-    '<div class="empty-state">No errors or disconnects have been reported.</div>';
+  byId("error-list").innerHTML = errors.length ? errors.map(row => `<div class="error-row"><strong>${escapeHtml(row.component || "system")}</strong> · ${escapeHtml(fullDate(row.ts))}<br>${escapeHtml(row.message || "Unknown error")}</div>`).join("") : '<div class="empty-state">No errors or disconnects have been reported.</div>';
   if (errors.length && !allHealthy) byId("error-details").open = true;
+  const global = byId("global-health");
+  global.className = `health-link ${!ready ? "checking" : allHealthy ? "healthy" : "fault"}`;
+  byId("global-health-text").textContent = !ready ? "Checking systems" : allHealthy ? "All systems good" : `${errors.length + failed.length} issue${errors.length + failed.length === 1 ? "" : "s"}`;
 }
-
 function renderRuntime() {
   const status = state.status || {};
   modeTag(status);
   const marketConnected = String(status.ws || "").startsWith("connected") || status.ws === "demo";
-  const eventStatus = status.health?.checks?.match_event_feed?.status ||
-    (status.goal_latency?.enabled ? "observing" : "diagnostic_disabled");
   const eventCheck = status.health?.checks?.match_event_feed || {};
   const values = {
     "runtime-dashboard": [socketConnected ? "Connected" : "Disconnected", socketConnected],
     "runtime-market": [humanStatus(status.ws || "checking"), marketConnected],
-    "runtime-event": [humanStatus(eventStatus), status.health?.checks?.match_event_feed?.healthy !== false],
-    "runtime-event-poll": [fullDate(eventCheck.last_poll_ts), eventCheck.healthy !== false],
-    "runtime-event-response": [finite(eventCheck.last_response_ms) ?
-      `${eventCheck.last_response_ms.toFixed(1)} ms` : "Collecting", eventCheck.healthy !== false],
+    "runtime-event": [humanStatus(eventCheck.status || (status.goal_latency?.enabled ? "observing" : "diagnostic disabled")), eventCheck.healthy !== false],
+    "runtime-event-poll": [finite(eventCheck.last_poll_ts) ? fullDate(eventCheck.last_poll_ts) : "Not supplied by provider", eventCheck.healthy !== false],
+    "runtime-event-response": [finite(eventCheck.last_response_ms) ? `${eventCheck.last_response_ms.toFixed(1)} ms` : "Collecting", eventCheck.healthy !== false],
     "runtime-feed-lag": [finite(status.feed_lag_p50) ? `${status.feed_lag_p50.toFixed(1)} ms` : "Collecting", true],
-    "runtime-matches": [integer(status.matches || 0), true],
-    "runtime-recorded": [integer(status.recorded || 0), status.recorder?.healthy !== false],
+    "runtime-matches": [integer(status.matches || 0), true], "runtime-recorded": [integer(status.recorded || 0), status.recorder?.healthy !== false],
     "runtime-uptime": [duration(status.uptime_s), true],
   };
-  Object.entries(values).forEach(([id, [text, good]]) => {
-    const element = byId(id);
-    element.textContent = text;
-    element.className = good ? "good" : "bad";
-  });
+  Object.entries(values).forEach(([id, [text, good]]) => { byId(id).textContent = text; byId(id).className = good ? "good" : "bad"; });
   killEnabled = Boolean(status.kill);
   byId("kill-button").classList.toggle("active", killEnabled);
   byId("kill-button").textContent = killEnabled ? "Kill switch engaged" : "Kill switch";
@@ -289,462 +249,358 @@ function renderRuntime() {
 function sleeveCard(strategy, summary) {
   const positions = (state.trades.open || []).filter(row => row.strategy === strategy);
   const openMark = positions.reduce((sum, row) => sum + (finite(row.upnl) ? row.upnl : 0), 0);
-  const evidence = summary.evidence || {};
-  const k2 = evidence.k2_ci || {};
-  const status = k2.status || "COLLECTING";
+  const gate = summary.evidence?.k2_ci || {}, status = gate.status || "COLLECTING";
   const description = strategy === "price_only_late_score" ?
-    "Price-only minute-88 inference with reversal, scratch, oscillation, trailing-profit, and timeout exits." :
-    "Original confirmed sweep strategy with its own lockout, shadow depth, positions, and exits.";
-  return `
-    <article class="sleeve-card ${strategyClass(strategy)}">
-      <div class="sleeve-name">
-        <div><h3>${escapeHtml(strategyLabel(strategy))}</h3><p>${escapeHtml(description)}</p></div>
-        <span class="tag ${status === "PASS" ? "good" : status === "FAIL" ? "bad" : "warn"}">${escapeHtml(humanStatus(status))}</span>
-      </div>
-      <div class="net-value ${(summary.net || 0) >= 0 ? "positive" : "negative"}">${money(summary.net || 0)}</div>
-      <div class="secondary-text">Closed realized net after $${Math.abs(summary.fees || 0).toFixed(2)} in fees</div>
-      <div class="metric-grid">
-        <div class="metric-cell"><span class="metric-label">Closed trades</span><strong>${integer(summary.closed || 0)}</strong></div>
-        <div class="metric-cell"><span class="metric-label">Win rate</span><strong>${summary.closed ? percent(summary.win_pct) : "Collecting"}</strong></div>
-        <div class="metric-cell"><span class="metric-label">Net per trade</span><strong>${summary.closed ? money(summary.net_per_fill || 0) : "Collecting"}</strong></div>
-        <div class="metric-cell"><span class="metric-label">Open positions</span><strong>${integer(summary.open || 0)}</strong></div>
-        <div class="metric-cell"><span class="metric-label">Current open mark</span><strong class="${openMark >= 0 ? "positive" : "negative"}">${money(openMark)}</strong></div>
-        <div class="metric-cell"><span class="metric-label">Partial realized net</span><strong>${money(summary.open_partial_realized_net || 0)}</strong></div>
-        <div class="metric-cell"><span class="metric-label">95% interval / trade</span><strong>${summary.ci95 ? `${money(summary.ci95[0])} to ${money(summary.ci95[1])}` : "Collecting"}</strong></div>
-        <div class="metric-cell"><span class="metric-label">Confirmed samples</span><strong>${integer(k2.n_signals || 0)} / ${integer(k2.needed || 50)}</strong></div>
-      </div>
-    </article>`;
+    "Independent price-pattern sleeve. It infers a late score state without consuming the match feed." :
+    "Original confirmed sweep sleeve with independent positions, lockouts, fills, and exits.";
+  return `<article class="sleeve-card ${strategyClass(strategy)}"><div class="sleeve-top"><div><h3>${escapeHtml(strategyLabel(strategy))}</h3><p>${escapeHtml(description)}</p></div><span class="tag ${status === "PASS" ? "good" : status === "FAIL" ? "bad" : "warn"}">${escapeHtml(humanStatus(status))}</span></div><div class="sleeve-net ${(summary.net || 0) >= 0 ? "positive" : "negative"}">${money(summary.net || 0)}</div><p class="muted">Closed realized net after $${Math.abs(summary.fees || 0).toFixed(2)} in recorded fees</p><div class="metric-grid"><div class="metric-cell"><span>Closed trades</span><strong>${integer(summary.closed || 0)}</strong></div><div class="metric-cell"><span>Win rate</span><strong>${summary.closed ? percent(summary.win_pct) : "Collecting"}</strong></div><div class="metric-cell"><span>Net / trade</span><strong>${summary.closed ? money(summary.net_per_fill || 0) : "Collecting"}</strong></div><div class="metric-cell"><span>Open positions</span><strong>${integer(summary.open || 0)}</strong></div><div class="metric-cell"><span>Open mark</span><strong class="${openMark >= 0 ? "positive" : "negative"}">${money(openMark)}</strong></div><div class="metric-cell"><span>Partial realized</span><strong>${money(summary.open_partial_realized_net || 0)}</strong></div><div class="metric-cell"><span>95% interval</span><strong>${summary.ci95 ? `${money(summary.ci95[0])} to ${money(summary.ci95[1])}` : "Collecting"}</strong></div><div class="metric-cell"><span>Study samples</span><strong>${integer(gate.n_signals || 0)} / ${integer(gate.needed || 50)}</strong></div></div></article>`;
 }
-
 function renderSleeves() {
-  const sleeves = state.stats.sleeves || {
-    gate_a: state.stats.combined || state.stats,
-    price_only_late_score: {},
-  };
-  byId("sleeve-cards").innerHTML = ["gate_a", "price_only_late_score"]
-    .map(strategy => sleeveCard(strategy, sleeves[strategy] || {})).join("");
+  const sleeves = state.stats.sleeves || {gate_a: state.stats.combined || state.stats, price_only_late_score: {}};
+  byId("sleeve-cards").innerHTML = ["gate_a", "price_only_late_score"].map(key => sleeveCard(key, sleeves[key] || {})).join("");
   const combined = state.stats.combined || state.stats || {};
-  byId("combined-summary").innerHTML = `<strong class="${(combined.net || 0) >= 0 ? "positive" : "negative"}">${money(combined.net || 0)}</strong>
-    combined closed realized net · ${integer(combined.closed || 0)} closed · ${integer(combined.open || 0)} open ·
-    $${Math.abs(combined.fees || 0).toFixed(2)} fees`;
+  byId("combined-summary").innerHTML = `<strong class="${(combined.net || 0) >= 0 ? "positive" : "negative"}">${money(combined.net || 0)}</strong>combined closed net · ${integer(combined.closed || 0)} trades · ${integer(combined.open || 0)} open`;
+}
+function rawDetails(label, value) { return `<details class="raw-details"><summary>${escapeHtml(label)}</summary><pre>${safeJson(value)}</pre></details>`; }
+function providerClock(normalized) {
+  if (normalized?.provider_clock) return normalized.provider_clock;
+  if (finite(normalized?.provider_minute)) return `${normalized.provider_minute}${finite(normalized.provider_stoppage) ? `+${normalized.provider_stoppage}` : ""}′`;
+  return "Clock not supplied";
 }
 
-function rawDetails(label, value) {
-  return `<details class="raw-details"><summary>${escapeHtml(label)}</summary><pre>${safeJson(value)}</pre></details>`;
+function outcomeGroup(row, isTrade = false) {
+  if (isTrade) return (row.net || 0) >= 0 ? "profitable" : "loss";
+  return ["filled", "queued", "executing"].includes(row.outcome) ? "executed" : "declined";
 }
-
-function renderMatches() {
-  const rows = [...(state.matches || [])].sort((a, b) => Number(b.late) - Number(a.late));
-  byId("match-list").innerHTML = rows.length ? rows.map(match => {
-    const legs = Object.entries(match.legs || {}).sort(([, a], [, b]) =>
-      String(a.display_name).localeCompare(String(b.display_name)));
-    return `<article class="match-card ${match.late ? "late" : ""}">
-      <div class="match-head">
-        <div><h3 class="match-title">${escapeHtml(match.title || "Unnamed match")}</h3>
-          <div class="time-text">Scheduled end: ${escapeHtml(fullDate(Date.parse(match.close_time) / 1000))}</div></div>
-        <span class="tag ${match.late ? "good" : "neutral"}">${match.late ? "Late window" : "Watching"}</span>
-      </div>
-      <div class="contract-list">${legs.map(([ticker, leg]) => `
-        <div class="contract-row">
-          <span class="contract-name">${escapeHtml(leg.display_name || "Unnamed contract")}</span>
-          <span class="price-group"><span>Last <strong>${cents(leg.last)}</strong></span>
-            <span>Bid <strong>${cents(leg.bid)}</strong></span><span>Ask <strong>${cents(leg.ask)}</strong></span></span>
-        </div>`).join("")}</div>
-      ${rawDetails("Raw market identifiers", {event: match.event, series: match.series,
-        contracts: legs.map(([ticker]) => ticker)})}
-    </article>`;
-  }).join("") : '<div class="empty-state">No matches are currently inside the discovery window.</div>';
-}
-
-function renderPositions() {
-  const rows = state.trades.open || [];
-  byId("position-list").innerHTML = rows.length ? rows.map(position => `
-    <article class="position-card ${strategyClass(position.strategy)}">
-      <div class="position-head">
-        <div><h3 class="primary-title">${escapeHtml(position.display_game || "Unnamed match")}</h3>
-          <div class="secondary-text">${escapeHtml(position.display_contract || position.display_leg || "Unnamed contract")} ·
-            ${escapeHtml(strategyLabel(position.strategy))}</div></div>
-        <span class="tag ${position.side === "yes" ? "good" : "warn"}">${position.side === "yes" ? "Bought Yes" : "Bought No"}</span>
-      </div>
-      <div class="time-text">Entered ${escapeHtml(fullDate(position.entry_ts))}</div>
-      <div class="position-values">
-        <div><span class="data-label">Remaining</span><strong>${integer(position.size)} contracts</strong></div>
-        <div><span class="data-label">Entry average</span><strong>${cents(position.entry_px)}</strong></div>
-        <div><span class="data-label">Executable bid</span><strong>${cents(position.bid)}</strong></div>
-        <div><span class="data-label">Open mark</span><strong class="${(position.upnl || 0) >= 0 ? "positive" : "negative"}">${money(position.upnl || 0)}</strong></div>
-      </div>
-      ${rawDetails("Raw position identifiers", {trade_id: position.id, signal_id: position.signal_id,
-        market: position.market, event: position.event, series: position.series})}
-    </article>`).join("") : '<div class="empty-state">No open paper positions. Both strategies remain ready.</div>';
-}
-
-function timingRelation(match) {
-  if (!match || match.match_status !== "nearest_same_match_event") {
-    return `No same-match provider event inside ±${match?.window_s ?? state.config.event_match_window_s ?? 20} seconds`;
+function rowTimestamp(row) { return row.entry_ts || row.local_ts || row.ts || row.observed_ts || 0; }
+function passesFilters(row, isTrade = false) {
+  const searchable = [row.display_game, row.display_contract, row.display_leg, row.market, row.event, row.series, row.outcome, row.exit_reason,
+    row.matched_event?.canonical_event?.human_label, row.matched_event?.canonical_event?.provider_description].join(" ").toLowerCase();
+  if (filters.query && !searchable.includes(filters.query.toLowerCase())) return false;
+  if (filters.strategy !== "all" && row.strategy !== filters.strategy) return false;
+  if (filters.match !== "all" && (row.display_game || row.event) !== filters.match) return false;
+  if (filters.result !== "all" && outcomeGroup(row, isTrade) !== filters.result) return false;
+  const association = row.matched_event?.association || "unmatched";
+  if (filters.association !== "all" && association !== filters.association) return false;
+  if (filters.period !== "all") {
+    const seconds = timestampSeconds(rowTimestamp(row)), cutoff = Date.now() / 1000 - Number(filters.period) * 86400;
+    if (seconds == null || seconds < cutoff) return false;
   }
-  const delta = match.event_minus_signal_ms;
-  if (match.timing_relation === "market_signal_first") return `Market signal arrived ${Math.abs(delta).toFixed(1)} ms before provider observation`;
-  if (match.timing_relation === "match_feed_first") return `Provider observation arrived ${Math.abs(delta).toFixed(1)} ms before market signal`;
-  return "Market signal and provider observation have the same recorded time";
+  return true;
+}
+function filterOptions() {
+  const rows = [...(state.trades.closed || []), ...(state.signals || [])];
+  return [...new Set(rows.map(row => row.display_game || row.event).filter(Boolean))].sort()
+    .map(name => `<option value="${escapeHtml(name)}" ${filters.match === name ? "selected" : ""}>${escapeHtml(name)}</option>`).join("");
+}
+function filterMarkup(scope, visible, total) {
+  return `<label class="filter-field">Search<input type="search" data-filter-field="query" value="${escapeHtml(filters.query)}" placeholder="Team, contract, event"></label><label class="filter-field">Sleeve<select data-filter-field="strategy"><option value="all">Both sleeves</option><option value="gate_a" ${filters.strategy === "gate_a" ? "selected" : ""}>Gate A</option><option value="price_only_late_score" ${filters.strategy === "price_only_late_score" ? "selected" : ""}>Price-only</option></select></label><label class="filter-field">Match<select data-filter-field="match"><option value="all">All matches</option>${filterOptions()}</select></label><label class="filter-field">Result<select data-filter-field="result"><option value="all">All results</option><option value="executed" ${filters.result === "executed" ? "selected" : ""}>Executed signals</option><option value="declined" ${filters.result === "declined" ? "selected" : ""}>Declined signals</option><option value="profitable" ${filters.result === "profitable" ? "selected" : ""}>Profitable trades</option><option value="loss" ${filters.result === "loss" ? "selected" : ""}>Losing trades</option></select></label><label class="filter-field">Event link<select data-filter-field="association"><option value="all">All associations</option>${Object.entries(associationLabels).map(([key, label]) => `<option value="${key}" ${filters.association === key ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}</select></label><label class="filter-field">Period<select data-filter-field="period"><option value="all">All recorded time</option><option value="1" ${filters.period === "1" ? "selected" : ""}>Last 24 hours</option><option value="7" ${filters.period === "7" ? "selected" : ""}>Last 7 days</option><option value="30" ${filters.period === "30" ? "selected" : ""}>Last 30 days</option></select></label><button class="reset-filter" data-reset-filters type="button">Reset</button><div class="filter-count">Showing ${integer(visible)} of ${integer(total)} ${scope}. Filters apply to both audit views.</div>`;
+}
+function bindFilters() {
+  document.querySelectorAll("[data-filter-field]").forEach(control => control.addEventListener(control.type === "search" ? "input" : "change", () => {
+    filters[control.dataset.filterField] = control.value;
+    renderTrades(); renderSignals();
+    if (control.type === "search") {
+      document.querySelectorAll('[data-filter-field="query"]').forEach(other => { if (other !== control) other.value = control.value; });
+      updateFilterCounts();
+    } else {
+      renderFilters();
+    }
+  }));
+  document.querySelectorAll("[data-reset-filters]").forEach(button => button.addEventListener("click", () => {
+    Object.assign(filters, {query: "", strategy: "all", match: "all", result: "all", association: "all", period: "all"});
+    renderFilters(); renderTrades(); renderSignals();
+  }));
+}
+function updateFilterCounts() {
+  const tradeCount = (state.trades.closed || []).filter(row => passesFilters(row, true)).length;
+  const signalCount = (state.signals || []).filter(row => passesFilters(row, false)).length;
+  byId("trade-filters").querySelector(".filter-count").textContent = `Showing ${integer(tradeCount)} of ${integer((state.trades.closed || []).length)} trades. Filters apply to both audit views.`;
+  byId("signal-filters").querySelector(".filter-count").textContent = `Showing ${integer(signalCount)} of ${integer((state.signals || []).length)} signals. Filters apply to both audit views.`;
+}
+function renderFilters() {
+  const trades = (state.trades.closed || []).filter(row => passesFilters(row, true));
+  const signals = (state.signals || []).filter(row => passesFilters(row, false));
+  byId("trade-filters").innerHTML = filterMarkup("trades", trades.length, (state.trades.closed || []).length);
+  byId("signal-filters").innerHTML = filterMarkup("signals", signals.length, (state.signals || []).length);
+  bindFilters();
 }
 
-function inferredStateLabel(value) {
-  if (value === "equal_score_0") return "Equal score inferred from draw-contract reallocation";
-  if (value === "one_goal_lead_+1") return "One-goal lead inferred from team-contract reallocation";
-  return "No score state inferred";
+function triggerSummary(trigger) {
+  const observed = trigger?.observed || {}, threshold = trigger?.thresholds || {}, pieces = [];
+  if (finite(observed.log_odds_displacement)) pieces.push(`log-odds moved ${observed.log_odds_displacement.toFixed(2)} (minimum ${threshold.min_log_odds_displacement})`);
+  if (finite(observed.distinct_price_levels)) pieces.push(`${integer(observed.distinct_price_levels)} distinct price levels`);
+  if (finite(observed.contracts)) pieces.push(`${integer(observed.contracts)} contracts`);
+  return pieces.length ? pieces.join(" · ") : "The provider did not supply the complete trigger measurements.";
+}
+function eventAssociationBlock(matched) {
+  const event = matched?.canonical_event;
+  if (!event) return `<div class="event-association unmatched"><div class="event-summary-line"><h4>No nearby same-match event</h4><span class="tag">Unmatched</span></div><p class="event-caveat">The diagnostic feed did not record a score change inside the fixed ±${integer(matched?.window_s || state.config.event_match_window_s || 20)} second audit window. This does not prove that no football event occurred.</p></div>`;
+  const association = matched.association || "time_only";
+  const occurrence = finite(matched.occurrence_minus_signal_ms) ? `${relativeMs(matched.occurrence_minus_signal_ms)} ${matched.occurrence_minus_signal_ms >= 0 ? "after" : "before"} the signal` : "provider occurrence time unavailable";
+  const received = finite(matched.event_minus_signal_ms) ? `${relativeMs(matched.event_minus_signal_ms)} ${matched.event_minus_signal_ms >= 0 ? "after" : "before"} the signal` : "feed receipt time unavailable";
+  return `<div class="event-association ${association === "state_mismatch" ? "unmatched" : ""}"><div class="event-summary-line"><div><h4>${escapeHtml(event.human_label || "Match event observed")}</h4><p class="event-description">${escapeHtml(event.provider_description || "Provider supplied a score change without a narrative.")}</p></div><span class="tag ${association === "state_consistent" ? "good" : association === "state_mismatch" ? "bad" : "info"}">${escapeHtml(humanAssociation(association))}</span></div><p class="event-caveat">${escapeHtml(providerClock(event))}${event.scorer ? ` · ${escapeHtml(event.scorer)}` : ""}${event.event_method === "penalty" ? " · Penalty" : ""} · provider occurrence ${escapeHtml(occurrence)} · feed observed ${escapeHtml(received)}. Causation is not established.</p></div>`;
+}
+function tradeTimeline(trade) {
+  const timing = trade.timing || {}, matched = trade.matched_event || {}, signalTs = timing.signal_received_ts;
+  const rows = [
+    {ts: signalTs, title: "Market signal received", detail: triggerSummary(trade.trigger)},
+    {ts: timing.paper_order_arrival_ts, title: "Paper order arrived", detail: finite(timing.paper_order_arrival_delay_ms) ? `${timing.paper_order_arrival_delay_ms.toFixed(1)} ms arrival delay` : "Arrival delay not supplied", trade: true},
+    {ts: timing.entry_ts || trade.entry_ts, title: "Paper entry filled", detail: `${cents(trade.entry_px)} · ${integer(trade.size)} contracts`, trade: true},
+    {ts: matched.provider_occurrence_ts, title: "Provider event occurrence", detail: matched.canonical_event?.provider_description || "Provider timestamp only"},
+    {ts: timing.exit_ts || timing.settlement_ts || trade.exit_ts, title: timing.settlement_ts ? "Market settled" : "Paper position exited", detail: `${humanExit(trade.exit_reason)} · ${cents(trade.exit_px)}`, trade: true},
+    {ts: matched.event_observed_ts, title: "Match feed received", detail: `Observation ${matched.observation_id || "not supplied"}`},
+  ].filter(row => timestampSeconds(row.ts) != null).sort((a, b) => timestampSeconds(a.ts) - timestampSeconds(b.ts));
+  return `<div class="timeline">${rows.map(row => `<div class="timeline-step ${row.trade ? "trade-step" : ""}"><i class="timeline-dot"></i><span>${escapeHtml(row.title)}</span><time datetime="${escapeHtml(fullDate(row.ts))}">${escapeHtml(fullDate(row.ts))}<br><small>${escapeHtml(relativeTo(row.ts, signalTs))} · ${escapeHtml(row.detail)}</small></time></div>`).join("")}</div>`;
+}
+function tradeCard(trade) {
+  const matched = trade.matched_event || {};
+  return `<article class="trade-story ${strategyClass(trade.strategy)}"><div class="trade-core"><div class="trade-title-row"><div><h3>${escapeHtml(trade.display_game || "Unnamed match")}</h3><p class="contract-line">${escapeHtml(trade.display_contract || trade.display_leg || "Unnamed contract")} · ${escapeHtml(leagueName(trade.series))}</p></div><span class="tag ${strategyClass(trade.strategy) === "price" ? "info" : "warn"}">${escapeHtml(strategyLabel(trade.strategy))}</span></div><div class="sleeve-net ${(trade.net || 0) >= 0 ? "positive" : "negative"}">${money(trade.net || 0)}</div><p class="muted">Net after ${money(-(trade.fees || 0))} fees</p><div class="trade-economics"><div><span>Entry → exit</span><strong>${cents(trade.entry_px)} → ${cents(trade.exit_px)}</strong></div><div><span>Contracts</span><strong>${integer(trade.size)}</strong></div><div><span>Gross</span><strong>${money(trade.gross || 0)}</strong></div></div><div class="trade-reason"><strong>${escapeHtml(humanExit(trade.exit_reason))}</strong><br>${escapeHtml(triggerSummary(trade.trigger))}</div></div><div class="trade-audit">${eventAssociationBlock(matched)}${tradeTimeline(trade)}<div class="audit-footer">${rawDetails("Raw identifiers and audit record", {trade_id: trade.id, signal_id: trade.signal_id, market: trade.market, event: trade.event, series: trade.series, trigger: trade.trigger, schedule_window: trade.schedule_window, matched_event: matched})}</div></div></article>`;
+}
+function renderTrades() {
+  const rows = (state.trades.closed || []).filter(row => passesFilters(row, true));
+  byId("trade-list").innerHTML = rows.length ? rows.map(tradeCard).join("") : '<div class="empty-state">No closed paper trades match these filters.</div>';
+}
+function renderFeaturedTrades() {
+  const linked = [...(state.trades.closed || [])].sort((a, b) => Number(Boolean(b.matched_event?.canonical_event)) - Number(Boolean(a.matched_event?.canonical_event)) || (b.exit_ts || 0) - (a.exit_ts || 0)).slice(0, 4);
+  byId("featured-trade-list").innerHTML = linked.length ? linked.map(trade => {
+    const event = trade.matched_event?.canonical_event;
+    return `<div class="compact-story"><div><strong>${escapeHtml(trade.display_game || "Unnamed match")} · ${escapeHtml(trade.display_contract || trade.display_leg)}</strong><p>${escapeHtml(strategyLabel(trade.strategy))} · ${escapeHtml(humanExit(trade.exit_reason))}</p><p class="event-note">${escapeHtml(event?.human_label || "No nearby same-match event")}${event?.event_method === "penalty" ? " · Penalty" : ""}</p></div><strong class="${(trade.net || 0) >= 0 ? "positive" : "negative"}">${money(trade.net || 0)}</strong></div>`;
+  }).join("") : '<div class="empty-state">Explained trades appear after a paper position closes.</div>';
 }
 
+function decisionSentence(signal) {
+  const outcome = humanOutcome(signal.outcome), inference = signal.trigger?.price_only_inference || {};
+  if (signal.outcome === "sleeve_outside_window") {
+    const window = signal.schedule_window || {}, seconds = window.seconds_to_expected_expiration;
+    const placement = finite(seconds) ? (seconds >= 0 ? `${duration(seconds)} before expected expiration` : `${duration(Math.abs(seconds))} after expected expiration`) : "an unavailable distance from expected expiration";
+    return `${outcome}. Price-only recorded the market move but declined because the expected-expiration proxy placed it ${placement}; the configured window is ${window.window_start_before_expiration_min ?? state.config.sleeve_start_before_expiry_min ?? 2} minutes before to ${window.window_end_after_expiration_min ?? state.config.sleeve_after_expiry_min ?? 12} minutes after. This schedule proxy is not a verified live match clock.`;
+  }
+  if (signal.strategy === "price_only_late_score" && inference.inferred_state) {
+    return `${outcome}. The independent price sleeve inferred ${inference.inferred_state === "equal_score_0" ? "an equal score" : "a one-goal lead"} from a coherent three-contract probability shift; it did not read the match feed.`;
+  }
+  return `${outcome}. ${triggerSummary(signal.trigger)}`;
+}
+function thresholdItems(signal) {
+  const observed = signal.trigger?.observed || {}, thresholds = signal.trigger?.thresholds || {};
+  const rows = [["Log-odds shift", observed.log_odds_displacement, thresholds.min_log_odds_displacement, "min"], ["Price levels", observed.distinct_price_levels, thresholds.min_distinct_price_levels, "min"], ["Contracts", observed.contracts, thresholds.min_contracts, "min"], ["Sibling lag", observed.sibling_confirmation_lag_ms, thresholds.sibling_confirmation_window_ms, "max"]];
+  const sleeve = signal.trigger?.price_only_inference || {};
+  if (finite(sleeve.target_gain_pp)) rows.push(["Triplet gain", sleeve.target_gain_pp * 100, (sleeve.leg_role === "draw" ? state.config.sleeve_min_draw_gain_pp : state.config.sleeve_min_team_gain_pp) * 100, "min"]);
+  if (finite(sleeve.sibling_explanation)) rows.push(["Sibling outflow (%)", sleeve.sibling_explanation * 100, (state.config.sleeve_min_explained || .85) * 100, "min"]);
+  if (finite(sleeve.target_spread_c)) rows.push(["Target spread", sleeve.target_spread_c, state.config.sleeve_max_spread_c || 6, "max"]);
+  return rows.slice(0, 8).map(([label, actual, required, direction]) => {
+    const supplied = finite(actual) && finite(required), pass = supplied && (direction === "max" ? actual <= required : actual >= required);
+    const ratio = supplied ? (direction === "max" ? required / Math.max(actual, required, .001) : actual / Math.max(required, actual, .001)) : 0;
+    return `<div class="threshold-item"><div class="threshold-head"><span>${escapeHtml(label)}</span><strong>${supplied ? `${Number(actual).toFixed(2)} / ${direction} ${Number(required).toFixed(2)}` : "Not supplied by provider"}</strong></div><div class="threshold-track"><div class="threshold-fill ${pass ? "" : "fail"}" style="width:${Math.max(supplied ? 8 : 0, ratio * 100).toFixed(1)}%"></div></div></div>`;
+  }).join("");
+}
 function signalCard(signal) {
-  const trigger = signal.trigger || {};
-  const observed = trigger.observed || {};
-  const thresholds = trigger.thresholds || {};
-  const inference = trigger.price_only_inference || null;
-  const matched = signal.matched_event || {};
-  const canonical = matched.canonical_event;
-  const consistency = matched.state_consistency;
-  const eventClass = consistency === "correction_or_reversal" ? "correction" :
-    consistency === "state_mismatch" ? "mismatch" : consistency?.includes("consistent") ? "consistent" : "";
-  const outcome = signal.outcome || "unknown";
-  const cardClass = outcome === "filled" ? "filled" : outcome.includes("error") ? "error" :
-    outcome === "queued" || outcome === "executing" ? "collecting" : "rejected";
-  const timing = signal.timing || {};
-  return `<article class="audit-card ${cardClass}">
-    <div class="audit-main">
-      <div class="audit-header">
-        <div><h3 class="primary-title">${escapeHtml(signal.display_game || "Unnamed match")}</h3>
-          <div class="secondary-text">${escapeHtml(signal.display_contract || signal.display_leg || "Unnamed contract")}</div>
-          <div class="time-text">Signal received ${escapeHtml(fullDate(signal.local_ts))}</div></div>
-        <div class="audit-tags"><span class="tag neutral">${escapeHtml(strategyLabel(signal.strategy))}</span>
-          <span class="tag ${outcome === "filled" ? "good" : outcome.includes("error") ? "bad" : "warn"}">${escapeHtml(humanStatus(outcome))}</span></div>
-      </div>
-      <div class="reason-box"><span class="data-label">Decision reason</span>
-        <strong>${escapeHtml(humanOutcome(outcome))}</strong></div>
-      <div class="trigger-box">
-        <span class="data-label">Market trigger · observed versus required</span>
-        <div class="data-grid">
-          <div><span class="data-label">Log-odds move</span><strong>${finite(observed.log_odds_displacement) ? observed.log_odds_displacement.toFixed(3) : "—"} / ≥ ${thresholds.min_log_odds_displacement ?? "—"}</strong></div>
-          <div><span class="data-label">Price levels swept</span><strong>${integer(observed.distinct_price_levels)} / ≥ ${integer(thresholds.min_distinct_price_levels)}</strong></div>
-          <div><span class="data-label">Contracts swept</span><strong>${integer(observed.contracts)} / ≥ ${integer(thresholds.min_contracts)}</strong></div>
-          <div><span class="data-label">Sibling confirmation</span><strong>${finite(observed.sibling_confirmation_lag_ms) ? `${observed.sibling_confirmation_lag_ms >= 0 ? "+" : ""}${observed.sibling_confirmation_lag_ms.toFixed(1)} ms` : "Not confirmed"} / ±${integer(thresholds.sibling_confirmation_window_ms)} ms</strong></div>
-          <div><span class="data-label">Reference price</span><strong>${cents(observed.reference_price_c)}</strong></div>
-          <div><span class="data-label">Sweep extreme</span><strong>${cents(observed.extreme_price_c)}</strong></div>
-          <div><span class="data-label">Entry price cap</span><strong>${cents(thresholds.price_cap_c)}</strong></div>
-          <div><span class="data-label">Price-only inference</span><strong>${escapeHtml(inferredStateLabel(inference?.inferred_state))}</strong></div>
-        </div>
-        ${inference ? `<div class="explain-text">Normalized target gain: ${finite(inference.target_gain_pp) ? `${(inference.target_gain_pp * 100).toFixed(1)} percentage points` : "—"} ·
-          sibling flow explained: ${finite(inference.sibling_explanation) ? percent(inference.sibling_explanation * 100) : "—"} ·
-          target spread: ${cents(inference.target_spread_c)} · baseline age: ${finite(inference.baseline_age_ms) ? `${inference.baseline_age_ms.toFixed(1)} ms` : "—"}</div>` : ""}
-      </div>
-      <div class="event-match-box ${eventClass}">
-        <span class="data-label">Nearest same-match event · diagnostic only</span>
-        <strong>${escapeHtml(canonical?.human_label || "No nearby canonical match event")}</strong>
-        <div class="explain-text">${escapeHtml(timingRelation(matched))}${consistency ? ` · ${escapeHtml(consistencyLabels[consistency] || humanStatus(consistency))}` : ""}.
-          Causation is not established.</div>
-      </div>
-      <div class="timeline-box"><span class="data-label">Recorded timeline</span><div class="timeline-grid">
-        <div><span class="data-label">Exchange trigger</span><strong>${escapeHtml(fullDate(timing.exchange_signal_ts))}</strong></div>
-        <div><span class="data-label">Local signal receipt</span><strong>${escapeHtml(fullDate(timing.signal_received_ts))}</strong></div>
-        <div><span class="data-label">Paper order arrival</span><strong>${escapeHtml(fullDate(timing.paper_order_arrival_ts))}</strong></div>
-        <div><span class="data-label">Provider observation</span><strong>${escapeHtml(fullDate(matched.event_observed_ts))}</strong></div>
-        <div><span class="data-label">Paper entry</span><strong>${escapeHtml(fullDate(timing.entry_ts))}</strong></div>
-        <div><span class="data-label">Paper exit</span><strong>${escapeHtml(fullDate(timing.exit_ts))}</strong></div>
-        <div><span class="data-label">Settlement</span><strong>${escapeHtml(fullDate(timing.settlement_ts))}</strong></div>
-        <div><span class="data-label">Provider poll uncertainty</span><strong>${finite(matched.provider_poll_uncertainty_ms) ? `${matched.provider_poll_uncertainty_ms.toFixed(1)} ms` : "Not recorded"}</strong></div>
-      </div></div>
-    </div>
-    ${rawDetails("Raw identifiers and normalized evidence", {
-      signal_id: signal.id, market: signal.market, event: signal.event, series: signal.series,
-      raw_detail: signal.detail, canonical_match: matched,
-    })}
-  </article>`;
+  const matched = signal.matched_event || {}, group = outcomeGroup(signal), event = matched.canonical_event;
+  return `<article class="decision-card"><div class="story-summary"><div><h3>${escapeHtml(signal.display_game || "Unnamed match")}</h3><p class="contract-line">${escapeHtml(signal.display_contract || signal.display_leg || "Unnamed contract")} · ${escapeHtml(strategyLabel(signal.strategy))}</p></div><span class="tag ${group === "executed" ? "good" : signal.outcome === "execution_error" ? "bad" : "warn"}">${escapeHtml(humanOutcome(signal.outcome))}</span></div><p class="decision-sentence">${escapeHtml(decisionSentence(signal))}</p><div class="decision-meta"><span>${escapeHtml(fullDate(signal.local_ts))}</span><span>·</span><span>${escapeHtml(humanAssociation(matched.association || "unmatched"))}</span>${event ? `<span>·</span><span>${escapeHtml(event.human_label)} at ${escapeHtml(providerClock(event))}</span>` : ""}</div><div class="threshold-grid">${thresholdItems(signal)}</div>${signal.outcome === "sleeve_outside_window" ? `<div class="schedule-warning"><strong>Timing-proxy rejection:</strong> expected market expiration ${escapeHtml(signal.schedule_window?.expected_expiration_time || "not supplied")}; ${escapeHtml(signal.schedule_window?.assumption || "Schedule proxy only; not a verified live match clock.")}</div>` : ""}${rawDetails("Raw identifiers, thresholds, and event audit", {signal_id: signal.id, market: signal.market, event: signal.event, series: signal.series, outcome: signal.outcome, trigger: signal.trigger, schedule_window: signal.schedule_window, matched_event: matched})}</article>`;
 }
-
 function renderSignals() {
-  const rows = state.signals || [];
-  byId("signal-list").innerHTML = rows.length ? rows.slice(0, 60).map(signalCard).join("") :
-    '<div class="empty-state">No detector episodes have been recorded.</div>';
+  const rows = (state.signals || []).filter(row => passesFilters(row, false));
+  byId("signal-list").innerHTML = rows.length ? rows.map(signalCard).join("") : '<div class="empty-state">No detector decisions match these filters.</div>';
 }
-
-function providerClock(event) {
-  const normalized = event.normalized_event || {};
-  if (normalized.provider_clock != null) return String(normalized.provider_clock);
-  if (normalized.provider_minute != null) {
-    const extra = normalized.provider_stoppage != null ? `+${normalized.provider_stoppage}` : "";
-    return `${normalized.provider_minute}${extra} minute`;
+function renderTimingDiagnostics() {
+  const paired = (state.signals || []).filter(signal =>
+    signal.strategy === "price_only_late_score" && signal.matched_event?.canonical_event &&
+    finite(signal.schedule_window?.seconds_to_expected_expiration)
+  ).sort((a, b) => (b.local_ts || 0) - (a.local_ts || 0));
+  if (!paired.length) {
+    byId("timing-diagnostics").innerHTML = '<div class="empty-state">No price-only signal has both a nearby provider event and an auditable expiration proxy yet.</div>';
+    return;
   }
-  return "Not supplied by provider";
+  const grouped = {};
+  paired.forEach(signal => {
+    const group = grouped[signal.series] ||= {values: [], outside: 0};
+    group.values.push(signal.schedule_window.seconds_to_expected_expiration);
+    if (!signal.schedule_window.inside_configured_window) group.outside += 1;
+  });
+  const summaries = Object.entries(grouped).map(([series, group]) => {
+    const values = [...group.values].sort((a, b) => a - b);
+    const median = values[Math.floor(values.length / 2)];
+    return `<div class="timing-summary"><span>${escapeHtml(leagueName(series))}</span><strong>Median ${escapeHtml(duration(Math.abs(median)))} ${median >= 0 ? "before" : "after"} expected expiration</strong><p>${integer(values.length)} paired observation${values.length === 1 ? "" : "s"} · ${integer(group.outside)} outside configured window</p></div>`;
+  }).join("");
+  const cases = paired.slice(0, 12).map(signal => {
+    const event = signal.matched_event.canonical_event;
+    const seconds = signal.schedule_window.seconds_to_expected_expiration;
+    const distance = seconds >= 0 ? `${duration(seconds)} before expected expiration` : `${duration(Math.abs(seconds))} after expected expiration`;
+    const inside = signal.schedule_window.inside_configured_window;
+    return `<div class="timing-row"><div><strong>${escapeHtml(signal.display_game || "Unnamed match")}</strong><p>${escapeHtml(event.human_label)}${event.provider_description ? ` · ${escapeHtml(event.provider_description)}` : ""}</p></div><span>${escapeHtml(providerClock(event))}</span><span>${escapeHtml(distance)}<br><small>Schedule proxy, not live match time</small></span><span class="tag ${inside ? "good" : "warn"}">${inside ? "Inside window" : escapeHtml(humanOutcome(signal.outcome))}</span></div>`;
+  }).join("");
+  byId("timing-diagnostics").innerHTML = `<div class="timing-summary-grid">${summaries}</div><p class="timing-subheading">Recent paired observations</p>${cases}`;
 }
-
-function leadText(value, beforeLabel, none = "Not observed") {
-  return finite(value) ? `${Math.abs(value).toFixed(1)} ms ${beforeLabel}` : none;
-}
-
 function renderEvents() {
   const rows = state.events || [];
   byId("event-list").innerHTML = rows.length ? rows.map(event => {
-    const normalized = event.normalized_event || {};
-    const correction = String(normalized.canonical_type || "").startsWith("score_correction");
-    return `<article class="event-card ${correction ? "correction" : ""}">
-      <div class="event-head"><div><h3 class="primary-title">${escapeHtml(event.display_game || "Unnamed match")}</h3>
-        <div class="secondary-text">${escapeHtml(normalized.human_label || humanStatus(event.change_kind))}</div></div>
-        <span class="tag ${correction ? "warn" : "neutral"}">${escapeHtml(providerClock(event))}</span></div>
-      <div class="time-text">Observed ${escapeHtml(fullDate(event.observed_ts))}</div>
-      <div class="event-metrics">
-        <div><span class="data-label">Provider response</span><strong>${finite(event.response_ms) ? `${event.response_ms.toFixed(1)} ms` : "—"}</strong></div>
-        <div><span class="data-label">Last book change</span><strong>${leadText(event.last_book_lead_ms, "before feed observation")}</strong></div>
-        <div><span class="data-label">Last market trade</span><strong>${leadText(event.last_trade_lead_ms, "before feed observation")}</strong></div>
-        <div><span class="data-label">First book change after</span><strong>${leadText(event.first_book_after_ms, "after feed observation")}</strong></div>
-        <div><span class="data-label">First trade after</span><strong>${leadText(event.first_trade_after_ms, "after feed observation")}</strong></div>
-        <div><span class="data-label">Polling uncertainty</span><strong>${finite(event.detail?.poll_uncertainty_ms) ? `${event.detail.poll_uncertainty_ms.toFixed(1)} ms` : "—"}</strong></div>
-      </div>
-      ${rawDetails("Raw provider observation", {observation_id: event.id, event: event.event,
-        milestone_id: event.milestone_id, normalized_event: normalized,
-        raw_provider_payload: event.detail?.live_data})}
-    </article>`;
-  }).join("") : '<div class="empty-state">No score change has been observed by the diagnostic feed.</div>';
+    const normalized = event.normalized_event || {}, correction = String(normalized.canonical_type || "").startsWith("score_correction");
+    return `<article class="event-row"><time datetime="${escapeHtml(fullDate(event.observed_ts))}">${escapeHtml(fullDate(event.observed_ts))}<br>Feed receipt</time><div><strong>${escapeHtml(event.display_game || "Unnamed match")}</strong><p>${escapeHtml(normalized.human_label || humanStatus(event.change_kind))} · ${escapeHtml(providerClock(normalized))}${normalized.scorer ? ` · ${escapeHtml(normalized.scorer)}` : ""}</p><p>${escapeHtml(normalized.provider_description || "Provider supplied a score change without a narrative.")}</p></div><span class="tag ${correction ? "warn" : normalized.event_method === "penalty" ? "info" : "good"}">${correction ? "Correction" : normalized.event_method === "penalty" ? "Penalty" : "Score event"}</span>${rawDetails("Raw provider observation", {observation_id: event.id, event: event.event, milestone_id: event.milestone_id, normalized_event: normalized, raw_provider_payload: event.detail?.live_data})}</article>`;
+  }).join("") : '<div class="empty-state">No score change has been recorded by the diagnostic feed.</div>';
 }
 
+function showChartTooltip(event, html) {
+  const tooltip = byId("chart-tooltip");
+  tooltip.innerHTML = html;
+  tooltip.hidden = false;
+  tooltip.style.left = `${Math.max(8, Math.min(window.innerWidth - 280, event.clientX + 12))}px`;
+  tooltip.style.top = `${Math.max(8, Math.min(window.innerHeight - 120, event.clientY + 12))}px`;
+}
+function hideChartTooltip() { byId("chart-tooltip").hidden = true; }
 function renderEquity() {
   const holder = byId("equity-chart");
-  const series = [
-    {key: "gate_a", name: "Gate A", color: "#40d98a", values: state.equity.gate_a || []},
-    {key: "price_only_late_score", name: "Price-only", color: "#52c7ea", values: state.equity.price_only_late_score || []},
-    {key: "combined", name: "Combined", color: "#b7c2ca", values: state.equity.combined || [], dash: "6 5"},
-  ];
+  const definitions = [{key: "combined", name: "Combined", color: "#38d996"}, {key: "gate_a", name: "Gate A", color: "#f2bd62"}, {key: "price_only_late_score", name: "Price-only", color: "#56b8ff"}];
+  byId("equity-legend").innerHTML = definitions.map(item => `<button class="legend-button series-${item.key} ${visibleEquitySeries.has(item.key) ? "active" : ""}" data-equity-series="${item.key}" type="button"><i class="legend-swatch"></i>${item.name}</button>`).join("");
+  document.querySelectorAll("[data-equity-series]").forEach(button => button.addEventListener("click", () => {
+    const key = button.dataset.equitySeries;
+    if (visibleEquitySeries.has(key) && visibleEquitySeries.size > 1) visibleEquitySeries.delete(key); else visibleEquitySeries.add(key);
+    renderEquity();
+  }));
+  const series = definitions.map(item => ({...item, values: state.equity[item.key] || []})).filter(item => visibleEquitySeries.has(item.key));
   const points = series.flatMap(item => item.values);
-  if (!points.length) {
-    holder.innerHTML = '<div class="empty-state">The chart begins after the first paper position closes.</div>';
-    return;
-  }
-  const width = 820, height = 280, left = 64, right = 18, top = 35, bottom = 42;
-  let minX = Math.min(...points.map(point => point[0]));
-  let maxX = Math.max(...points.map(point => point[0]));
+  if (!points.length) { holder.innerHTML = '<div class="empty-state">The chart begins after the first paper position closes.</div>'; return; }
+  const width = Math.max(620, holder.clientWidth || 820), height = 400, left = 62, right = 20, top = 20, pnlBottom = 268, ddTop = 300, bottom = 368;
+  let minX = Math.min(...points.map(point => point[0])), maxX = Math.max(...points.map(point => point[0]));
   if (minX === maxX) { minX -= 1000; maxX += 1000; }
-  let minY = Math.min(0, ...points.map(point => point[1]));
-  let maxY = Math.max(0, ...points.map(point => point[1]));
+  let minY = Math.min(0, ...points.map(point => point[1])), maxY = Math.max(0, ...points.map(point => point[1]));
   if (minY === maxY) { minY -= 1; maxY += 1; }
-  const padY = Math.max((maxY - minY) * 0.08, 0.25);
-  minY -= padY; maxY += padY;
+  const yPad = Math.max((maxY - minY) * .08, .5);
+  minY -= yPad; maxY += yPad;
   const x = value => left + (value - minX) / (maxX - minX) * (width - left - right);
-  const y = value => top + (maxY - value) / (maxY - minY) * (height - top - bottom);
-  const ticks = Array.from({length: 5}, (_, index) => minY + (maxY - minY) * index / 4);
-  const paths = series.map(item => {
-    if (!item.values.length) return "";
+  const y = value => top + (maxY - value) / (maxY - minY) * (pnlBottom - top);
+  const combined = state.equity.combined || [];
+  let peak = -Infinity;
+  const drawdown = combined.map(point => { peak = Math.max(peak, point[1]); return [point[0], point[1] - peak]; });
+  const minDrawdown = Math.min(-.01, ...drawdown.map(point => point[1]));
+  const ddy = value => ddTop + (0 - value) / (0 - minDrawdown) * (bottom - ddTop);
+  const yTicks = Array.from({length: 5}, (_, index) => minY + (maxY - minY) * index / 4);
+  const xTicks = Array.from({length: 4}, (_, index) => minX + (maxX - minX) * index / 3);
+  const lines = series.map(item => {
     const d = item.values.map((point, index) => `${index ? "L" : "M"}${x(point[0]).toFixed(1)},${y(point[1]).toFixed(1)}`).join(" ");
-    const last = item.values[item.values.length - 1];
-    return `<path d="${d}" fill="none" stroke="${item.color}" stroke-width="2.5" ${item.dash ? `stroke-dasharray="${item.dash}"` : ""}/>
-      <circle cx="${x(last[0]).toFixed(1)}" cy="${y(last[1]).toFixed(1)}" r="3.5" fill="${item.color}"/>`;
+    return `<path class="chart-line" d="${d}" stroke="${item.color}"/>${item.values.map((point, index) => `<circle class="chart-point" tabindex="0" data-chart-tip="${escapeHtml(`${item.name}<br>${fullDate(point[0])}<br>${money(point[1])} cumulative net`)}" cx="${x(point[0]).toFixed(1)}" cy="${y(point[1]).toFixed(1)}" r="${index === item.values.length - 1 ? 4 : 3}" fill="${item.color}"/>`).join("")}`;
   }).join("");
-  holder.innerHTML = `<svg viewBox="0 0 ${width} ${height}" aria-hidden="true">
-    ${ticks.map(value => `<line x1="${left}" x2="${width - right}" y1="${y(value)}" y2="${y(value)}" stroke="#26343e" stroke-width="1"/>
-      <text x="${left - 9}" y="${y(value) + 4}" fill="#9eabb6" font-size="11" text-anchor="end">${value.toFixed(2)}</text>`).join("")}
-    <line x1="${left}" x2="${width - right}" y1="${y(0)}" y2="${y(0)}" stroke="#66737e" stroke-width="1"/>
-    ${paths}
-    <text x="${left}" y="${height - 13}" fill="#9eabb6" font-size="11">${escapeHtml(fullDate(minX / 1000).slice(0, 19))}</text>
-    <text x="${width - right}" y="${height - 13}" fill="#9eabb6" font-size="11" text-anchor="end">${escapeHtml(fullDate(maxX / 1000).slice(0, 19))}</text>
-    ${series.map((item, index) => `<circle cx="${left + index * 150}" cy="16" r="4" fill="${item.color}"/>
-      <text x="${left + 10 + index * 150}" y="20" fill="#c8d4dc" font-size="11">${item.name}</text>`).join("")}
-    <text x="15" y="${top - 8}" fill="#9eabb6" font-size="10">USD</text>
-  </svg>`;
-}
-
-function renderLatency() {
-  const definitions = [
-    ["order_arrival", "Exchange trigger → paper arrival"],
-    ["paper_entry", "Queued paper order → simulated fill"],
-    ["paper_exit", "Exit decision → simulated fill"],
-    ["feed_lag", "Exchange trade timestamp → service"],
-  ];
-  const rows = definitions.map(([key, label]) => ({key, label, ...(state.latency[key] || {})}))
-    .filter(row => row.n);
-  const maxValue = Math.max(1, ...rows.map(row => row.p95 ?? row.p50 ?? 0));
-  byId("latency-chart").innerHTML = rows.length ? rows.map(row => `
-    <div class="bar-group"><div class="bar-head"><span>${escapeHtml(row.label)}</span>
-      <strong>median ${finite(row.p50) ? row.p50.toFixed(1) : "—"} ms · 95th ${finite(row.p95) ? row.p95.toFixed(1) : "collecting"} ms</strong></div>
-      <div class="bar-track"><i class="${row.key === "feed_lag" ? "warn" : ""}" style="width:${Math.max(1, (row.p95 ?? row.p50 ?? 0) / maxValue * 100).toFixed(1)}%"></i></div>
-      <div class="bar-note">${integer(row.n)} recorded samples${row.key === "feed_lag" ? "; includes clock skew" : ""}</div></div>`).join("") :
-    '<div class="empty-state">Latency samples are still collecting.</div>';
-}
-
-function renderExits() {
-  const sleeves = state.stats.sleeves || {};
-  const rows = ["gate_a", "price_only_late_score"].flatMap(strategy =>
-    Object.entries(sleeves[strategy]?.exit_reasons || {}).map(([reason, count]) => ({strategy, reason, count})));
-  const maxCount = Math.max(1, ...rows.map(row => row.count));
-  byId("exit-chart").innerHTML = rows.length ? rows.sort((a, b) => b.count - a.count).map(row => `
-    <div class="bar-group"><div class="bar-head"><span>${escapeHtml(humanExit(row.reason))}</span>
-      <strong>${escapeHtml(strategyLabel(row.strategy))} · ${integer(row.count)}</strong></div>
-      <div class="bar-track"><i class="${strategyClass(row.strategy)}" style="width:${Math.max(2, row.count / maxCount * 100).toFixed(1)}%"></i></div></div>`).join("") :
-    '<div class="empty-state">Exit reasons appear after positions close.</div>';
-}
-
-function evidenceCard(strategy, key, gate) {
-  const isFill = key === "k1_fill_integrity";
-  const current = isFill ? gate.n_fills || 0 : gate.n_signals || 0;
-  const needed = gate.needed || (isFill ? 25 : 50);
-  const progress = Math.min(100, current / needed * 100);
-  const label = isFill ? "Arrival-book fill integrity" : "Event-clustered confidence interval";
-  const interval = gate.ci ? ` · ${money(gate.ci[0])} to ${money(gate.ci[1])}` : "";
-  return `<div class="evidence-card"><div class="evidence-head"><span>${escapeHtml(strategyLabel(strategy))} · ${label}</span>
-    <strong class="${gate.status === "PASS" ? "positive" : gate.status === "FAIL" ? "negative" : ""}">${escapeHtml(humanStatus(gate.status || "collecting"))}</strong></div>
-    <div class="bar-track"><i class="${gate.status === "FAIL" ? "bad" : gate.status === "PASS" ? strategyClass(strategy) : "warn"}" style="width:${Math.max(1, progress).toFixed(1)}%"></i></div>
-    <div class="bar-note">${integer(current)} of ${integer(needed)} required${escapeHtml(interval)}${gate.failures?.length ? ` · failed trade IDs ${escapeHtml(gate.failures.join(", "))}` : ""}</div></div>`;
-}
-
-function renderEvidence() {
-  const sleeves = state.stats.sleeves || {};
-  const cards = [];
-  ["gate_a", "price_only_late_score"].forEach(strategy => {
-    const evidence = sleeves[strategy]?.evidence || {};
-    if (evidence.k1_fill_integrity) cards.push(evidenceCard(strategy, "k1_fill_integrity", evidence.k1_fill_integrity));
-    if (evidence.k2_ci) cards.push(evidenceCard(strategy, "k2_ci", evidence.k2_ci));
+  const ddPath = drawdown.length ? `${drawdown.map((point, index) => `${index ? "L" : "M"}${x(point[0]).toFixed(1)},${ddy(point[1]).toFixed(1)}`).join(" ")} L${x(drawdown[drawdown.length - 1][0]).toFixed(1)},${ddTop} L${x(drawdown[0][0]).toFixed(1)},${ddTop} Z` : "";
+  holder.innerHTML = `<svg viewBox="0 0 ${width} ${height}" aria-hidden="true">${yTicks.map(value => `<line class="chart-grid" x1="${left}" x2="${width - right}" y1="${y(value)}" y2="${y(value)}"/><text class="chart-axis" x="${left - 9}" y="${y(value) + 4}" text-anchor="end">${money(value)}</text>`).join("")}<line class="chart-zero" x1="${left}" x2="${width - right}" y1="${y(0)}" y2="${y(0)}"/>${lines}<line class="chart-divider" x1="${left}" x2="${width - right}" y1="${ddTop - 14}" y2="${ddTop - 14}"/><text class="chart-axis" x="${left}" y="${ddTop - 18}">Combined drawdown</text>${ddPath ? `<path class="drawdown-area" d="${ddPath}"/>` : ""}<text class="chart-axis" x="${left - 9}" y="${ddTop + 4}" text-anchor="end">$0</text><text class="chart-axis" x="${left - 9}" y="${bottom}" text-anchor="end">${money(minDrawdown)}</text>${xTicks.map((value, index) => `<line class="chart-grid" x1="${x(value)}" x2="${x(value)}" y1="${top}" y2="${bottom}"/><text class="chart-axis" x="${x(value)}" y="${height - 8}" text-anchor="${index === 0 ? "start" : index === 3 ? "end" : "middle"}">${escapeHtml(shortDate(value))}</text>`).join("")}</svg>`;
+  holder.querySelectorAll("[data-chart-tip]").forEach(point => {
+    point.addEventListener("pointerenter", event => showChartTooltip(event, point.dataset.chartTip));
+    point.addEventListener("pointermove", event => showChartTooltip(event, point.dataset.chartTip));
+    point.addEventListener("pointerleave", hideChartTooltip);
+    point.addEventListener("focus", () => showChartTooltip({clientX: window.innerWidth / 2, clientY: 100}, point.dataset.chartTip));
+    point.addEventListener("blur", hideChartTooltip);
   });
-  const latency = state.stats.combined?.evidence?.k4_latency;
-  if (latency) cards.push(`<div class="evidence-card"><div class="evidence-head"><span>Shared execution adapter · arrival latency</span>
-    <strong class="${latency.status === "BREACH" ? "negative" : "positive"}">${escapeHtml(humanStatus(latency.status))}</strong></div>
-    <div class="bar-note">95th percentile ${finite(latency.p95_ms) ? `${latency.p95_ms.toFixed(1)} ms` : "collecting"} · source ${escapeHtml(humanStatus(latency.source))}</div></div>`);
-  byId("evidence-list").innerHTML = cards.length ? cards.join("") :
-    '<div class="empty-state">Evidence gates are still initializing.</div>';
 }
 
-function renderTrades() {
-  const rows = state.trades.closed || [];
-  byId("trade-list").innerHTML = rows.length ? rows.slice(0, 100).map(trade => `
-    <article class="trade-card ${strategyClass(trade.strategy)}">
-      <div class="trade-header"><div><h3 class="primary-title">${escapeHtml(trade.display_game || "Unnamed match")}</h3>
-        <div class="secondary-text">${escapeHtml(trade.display_contract || trade.display_leg || "Unnamed contract")} · ${escapeHtml(strategyLabel(trade.strategy))}</div></div>
-        <strong class="${(trade.net || 0) >= 0 ? "positive" : "negative"}">${money(trade.net || 0)}</strong></div>
-      <div class="time-text">Entered ${escapeHtml(fullDate(trade.entry_ts))}<br>Closed ${escapeHtml(fullDate(trade.exit_ts))}</div>
-      <div class="trade-values">
-        <div><span class="data-label">Position</span><strong>${escapeHtml(trade.side === "yes" ? "Bought Yes" : "Bought No")} · ${integer(trade.size)}</strong></div>
-        <div><span class="data-label">Entry → exit</span><strong>${cents(trade.entry_px)} → ${cents(trade.exit_px)}</strong></div>
-        <div><span class="data-label">Exit reason</span><strong>${escapeHtml(humanExit(trade.exit_reason))}</strong></div>
-        <div><span class="data-label">Gross</span><strong>${money(trade.gross || 0)}</strong></div>
-        <div><span class="data-label">Fees</span><strong>${money(-(trade.fees || 0))}</strong></div>
-        <div><span class="data-label">Net</span><strong class="${(trade.net || 0) >= 0 ? "positive" : "negative"}">${money(trade.net || 0)}</strong></div>
-      </div>
-      ${rawDetails("Raw trade identifiers and matched event", {trade_id: trade.id, signal_id: trade.signal_id,
-        market: trade.market, event: trade.event, series: trade.series, matched_event: trade.matched_event})}
-    </article>`).join("") : '<div class="empty-state">No paper positions have closed yet.</div>';
+function renderAssociationChart() {
+  const groups = {};
+  (state.trades.closed || []).forEach(trade => { const key = trade.matched_event?.association || "unmatched"; const group = groups[key] ||= {count: 0, net: 0}; group.count += 1; group.net += trade.net || 0; });
+  const rows = Object.entries(groups).sort((a, b) => b[1].count - a[1].count), max = Math.max(1, ...rows.map(([, value]) => value.count));
+  byId("association-chart").innerHTML = rows.length ? rows.map(([key, value]) => `<div class="bar-row"><span class="bar-label">${escapeHtml(humanAssociation(key))}</span><div class="bar-track"><div class="bar-fill ${value.net >= 0 ? "positive" : "negative"}" style="width:${Math.max(3, value.count / max * 100).toFixed(1)}%"></div></div><strong class="bar-value ${value.net >= 0 ? "positive" : "negative"}">${integer(value.count)} · ${money(value.net)}</strong></div>`).join("") : '<div class="empty-state">Association coverage appears after trades close.</div>';
+}
+function renderExitChart() {
+  const groups = {};
+  (state.trades.closed || []).forEach(trade => { const group = groups[trade.exit_reason] ||= {count: 0, net: 0}; group.count += 1; group.net += trade.net || 0; });
+  const rows = Object.entries(groups).sort((a, b) => b[1].count - a[1].count), max = Math.max(1, ...rows.map(([, value]) => value.count));
+  byId("exit-chart").innerHTML = rows.length ? rows.map(([reason, value]) => `<div class="bar-row"><span class="bar-label">${escapeHtml(humanExit(reason))}</span><div class="bar-track"><div class="bar-fill ${value.net >= 0 ? "positive" : "negative"}" style="width:${Math.max(3, value.count / max * 100).toFixed(1)}%"></div></div><strong class="bar-value ${value.net >= 0 ? "positive" : "negative"}">${integer(value.count)} · ${money(value.net)}</strong></div>`).join("") : '<div class="empty-state">Exit reasons appear after positions close.</div>';
 }
 
+function leagueRows() {
+  return Object.entries(state.stats.leagues || {}).map(([series, league]) => {
+    const bucket = leagueSleeve === "combined" ? league : league.sleeves?.[leagueSleeve] || {};
+    return {series, name: league.display_name || leagueName(series), n: bucket.n || 0, net: bucket.net || 0, gross: bucket.gross || 0, fees: bucket.fees || 0, win_pct: bucket.win_pct || 0, net_per_trade: bucket.net_per_trade || 0};
+  }).filter(row => row.n > 0);
+}
+function renderLeagues() {
+  const sort = byId("league-sort").value;
+  const rows = leagueRows().sort((a, b) => sort === "name" ? a.name.localeCompare(b.name) : (b[sort] || 0) - (a[sort] || 0));
+  const maxAbs = Math.max(1, ...rows.map(row => Math.abs(row.net)));
+  byId("league-chart").innerHTML = rows.length ? rows.slice(0, 14).map(row => `<div class="league-bar-row"><span class="bar-label"><strong>${escapeHtml(row.name)}</strong><small>${integer(row.n)} trade${row.n === 1 ? "" : "s"}</small></span><div class="signed-track"><div class="signed-fill ${row.net >= 0 ? "positive" : "negative"}" style="width:${Math.max(2, Math.abs(row.net) / maxAbs * 50).toFixed(1)}%"></div></div><strong class="bar-value ${row.net >= 0 ? "positive" : "negative"}">${money(row.net)}</strong></div>`).join("") : '<div class="empty-state">No closed trades for this sleeve.</div>';
+  const totals = rows.reduce((sum, row) => ({n: sum.n + row.n, net: sum.net + row.net, gross: sum.gross + row.gross, fees: sum.fees + row.fees}), {n: 0, net: 0, gross: 0, fees: 0});
+  byId("league-table").innerHTML = rows.length ? `<table><thead><tr><th>League</th><th class="numeric">Trades</th><th class="numeric">Win rate</th><th class="numeric">Gross</th><th class="numeric">Fees</th><th class="numeric">Net</th><th class="numeric">Net / trade</th></tr></thead><tbody>${rows.map(row => `<tr><td data-label="League"><strong>${escapeHtml(row.name)}</strong>${row.n < 10 ? '<br><span class="sample-warning">Small sample</span>' : ""}</td><td data-label="Trades" class="numeric">${integer(row.n)}</td><td data-label="Win rate" class="numeric">${percent(row.win_pct)}</td><td data-label="Gross" class="numeric">${money(row.gross)}</td><td data-label="Fees" class="numeric">${money(-row.fees)}</td><td data-label="Net" class="numeric ${row.net >= 0 ? "positive" : "negative"}">${money(row.net)}</td><td data-label="Net / trade" class="numeric">${money(row.net_per_trade)}</td></tr>`).join("")}<tr><td data-label="League"><strong>Reconciled total</strong></td><td data-label="Trades" class="numeric"><strong>${integer(totals.n)}</strong></td><td data-label="Win rate" class="numeric">—</td><td data-label="Gross" class="numeric">${money(totals.gross)}</td><td data-label="Fees" class="numeric">${money(-totals.fees)}</td><td data-label="Net" class="numeric ${totals.net >= 0 ? "positive" : "negative"}"><strong>${money(totals.net)}</strong></td><td data-label="Net / trade" class="numeric">${totals.n ? money(totals.net / totals.n) : "$0.00"}</td></tr></tbody></table>` : '<div class="empty-state">No closed trades for this sleeve.</div>';
+}
+function renderMatches() {
+  const query = byId("market-search").value.trim().toLowerCase();
+  const rows = [...(state.matches || [])].filter(match => [match.title, match.series, leagueName(match.series)].join(" ").toLowerCase().includes(query)).sort((a, b) => Number(b.late) - Number(a.late));
+  byId("match-list").innerHTML = rows.length ? rows.map(match => {
+    const legs = Object.entries(match.legs || {}).sort(([, a], [, b]) => String(a.display_name).localeCompare(String(b.display_name)));
+    return `<details class="market-row"><summary><div class="market-name"><strong>${escapeHtml(match.title || "Unnamed match")}</strong><span>${escapeHtml(leagueName(match.series))}</span></div><span class="market-time">Scheduled expiration<br>${escapeHtml(match.close_time ? fullDate(Date.parse(match.close_time) / 1000) : "Not supplied")}</span><div class="contract-strip">${legs.map(([, leg]) => `<div class="contract-price"><span>${escapeHtml(leg.display_name || "Contract")}</span><strong>${cents(leg.last)}</strong></div>`).join("")}</div><span class="tag ${match.late ? "warn" : "info"}">${match.late ? "Late proxy" : "Watching"}</span></summary><div class="market-detail">${legs.map(([ticker, leg]) => `<div class="contract-detail"><strong>${escapeHtml(leg.display_name || "Contract")}</strong><div class="price-grid"><div><span>Bid</span><strong>${cents(leg.bid)}</strong></div><div><span>Ask</span><strong>${cents(leg.ask)}</strong></div><div><span>Last</span><strong>${cents(leg.last)}</strong></div></div>${rawDetails("Raw identifiers", {ticker, event: match.event, series: match.series})}</div>`).join("")}</div></details>`;
+  }).join("") : '<div class="empty-state">No watched matches match this search.</div>';
+}
+function renderPositions() {
+  const rows = state.trades.open || [];
+  byId("position-list").innerHTML = rows.length ? rows.map(position => `<div class="position-row"><div class="metric-inline"><strong>${escapeHtml(position.display_game || "Unnamed match")}</strong><span class="tag ${strategyClass(position.strategy) === "price" ? "info" : "warn"}">${escapeHtml(strategyLabel(position.strategy))}</span></div><p>${escapeHtml(position.display_contract || position.display_leg || "Unnamed contract")} · ${integer(position.remaining ?? position.size)} contracts remaining · entry ${cents(position.entry_px)} · best bid ${cents(position.best_bid)}</p><strong class="${(position.upnl || 0) >= 0 ? "positive" : "negative"}">${money(position.upnl || 0)} open mark</strong>${rawDetails("Raw identifiers", {trade_id: position.id, signal_id: position.signal_id, market: position.market, event: position.event, series: position.series})}</div>`).join("") : '<div class="empty-state">No open paper positions.</div>';
+}
+function renderLatency() {
+  const definitions = [["order_arrival", "Trigger → paper arrival"], ["paper_entry", "Queued order → fill"], ["paper_exit", "Exit decision → fill"], ["feed_lag", "Exchange timestamp → service"], ["goal_provider_response", "Match-feed response"]];
+  const rows = definitions.map(([key, label]) => ({key, label, ...(state.latency[key] || {})})).filter(row => row.n);
+  const max = Math.max(1, ...rows.map(row => row.p95 ?? row.p50 ?? 0));
+  byId("latency-chart").innerHTML = rows.length ? rows.map(row => `<div class="bar-row"><span class="bar-label">${escapeHtml(row.label)}<br><small>${integer(row.n)} samples</small></span><div class="bar-track"><div class="bar-fill" style="width:${Math.max(2, (row.p95 ?? row.p50 ?? 0) / max * 100).toFixed(1)}%"></div></div><strong class="bar-value">p50 ${finite(row.p50) ? row.p50.toFixed(1) : "—"} ms<br><small>p95 ${finite(row.p95) ? row.p95.toFixed(1) : "collecting"}</small></strong></div>`).join("") : '<div class="empty-state">Latency samples are still collecting.</div>';
+}
+function renderEvidence() {
+  const cards = [];
+  Object.entries(state.stats.sleeves || {}).forEach(([strategy, summary]) => Object.entries(summary.evidence || {}).forEach(([key, gate]) => {
+    if (!gate || !["k1_fill_integrity", "k2_ci"].includes(key)) return;
+    const current = key === "k1_fill_integrity" ? gate.n_fills || 0 : gate.n_signals || 0, needed = gate.needed || (key === "k1_fill_integrity" ? 25 : 50);
+    cards.push(`<div class="evidence-item"><div><strong>${escapeHtml(strategyLabel(strategy))} · ${key === "k1_fill_integrity" ? "Fill integrity" : "Confidence interval"}</strong><p>${integer(current)} of ${integer(needed)} required${gate.ci ? ` · ${money(gate.ci[0])} to ${money(gate.ci[1])}` : ""}</p></div><span class="tag ${gate.status === "PASS" ? "good" : gate.status === "FAIL" ? "bad" : "warn"}">${escapeHtml(humanStatus(gate.status || "collecting"))}</span></div>`);
+  }));
+  byId("evidence-list").innerHTML = cards.length ? cards.join("") : '<div class="empty-state">Evidence gates are still collecting.</div>';
+}
 function humanizeActivity(text) {
   let result = String(text || "");
-  (state.matches || []).forEach(match => Object.entries(match.legs || {}).forEach(([ticker, leg]) => {
-    result = result.replaceAll(ticker, `${match.title} / ${leg.display_name}`);
-  }));
+  (state.matches || []).forEach(match => Object.entries(match.legs || {}).forEach(([ticker, leg]) => { result = result.replaceAll(ticker, `${match.title} / ${leg.display_name}`); }));
   return result;
 }
-
 function renderActivity() {
   const rows = state.activity || [];
-  byId("activity-list").innerHTML = rows.length ? rows.map(row => `
-    <div class="activity-row"><span>${escapeHtml(fullDate(row.ts))}</span>
-      <span class="tag ${row.kind === "error" ? "bad" : "neutral"}">${escapeHtml(humanStatus(row.kind))}</span>
-      <span class="activity-text">${escapeHtml(humanizeActivity(row.text))}</span></div>`).join("") :
-    '<div class="empty-state">No service activity has been recorded.</div>';
+  byId("activity-list").innerHTML = rows.length ? rows.map(row => `<div class="activity-row"><span>${escapeHtml(fullDate(row.ts))}</span><span class="tag ${row.kind === "error" ? "bad" : "info"}">${escapeHtml(humanStatus(row.kind))}</span><span>${escapeHtml(humanizeActivity(row.text))}</span></div>`).join("") : '<div class="empty-state">No service activity has been recorded.</div>';
 }
-
 function renderAll() {
-  renderHealth();
-  renderRuntime();
-  renderSleeves();
-  renderMatches();
-  renderPositions();
-  renderSignals();
-  renderEvents();
-  renderEquity();
-  renderLatency();
-  renderExits();
-  renderEvidence();
-  renderTrades();
-  renderActivity();
+  renderHealth(); renderRuntime(); renderSleeves(); renderFilters(); renderTrades(); renderSignals(); renderEvents();
+  renderTimingDiagnostics();
+  renderEquity(); renderAssociationChart(); renderExitChart(); renderFeaturedTrades(); renderPositions(); renderLeagues();
+  renderMatches(); renderLatency(); renderEvidence(); renderActivity();
 }
 
 async function refreshAll() {
   if (refreshInFlight) return;
   refreshInFlight = true;
-  const requests = [
-    ["status", "/api/status"],
-    ["config", "/api/config"],
-    ["matches", "/api/matches"],
-    ["trades", "/api/trades?limit=200"],
-    ["signals", "/api/signals?limit=60"],
-    ["stats", "/api/stats"],
-    ["events", "/api/goal-latency?limit=100"],
-    ["latency", "/api/latency"],
-    ["equity", "/api/equity"],
-    ["activity", "/api/eventlog?limit=80"],
-  ];
-  const results = await Promise.allSettled(requests.map(([, path]) => apiJson(path)));
-  results.forEach((result, index) => {
-    if (result.status === "fulfilled") {
-      const key = requests[index][0];
-      state[key] = key === "equity" && Array.isArray(result.value) ?
-        {combined: result.value, gate_a: [], price_only_late_score: []} : result.value;
-    }
-  });
-  state.hydrated = true;
-  refreshInFlight = false;
-  renderAll();
+  const requests = [["status", "/api/status"], ["config", "/api/config"], ["matches", "/api/matches"], ["trades", "/api/trades?limit=500"], ["signals", "/api/signals?limit=500"], ["stats", "/api/stats"], ["events", "/api/goal-latency?limit=200"], ["latency", "/api/latency"], ["equity", "/api/equity"], ["activity", "/api/eventlog?limit=100"]];
+  try {
+    const results = await Promise.allSettled(requests.map(([, path]) => apiJson(path)));
+    results.forEach((result, index) => {
+      if (result.status === "fulfilled") {
+        const key = requests[index][0];
+        state[key] = key === "equity" && Array.isArray(result.value) ? {combined: result.value, gate_a: [], price_only_late_score: []} : result.value;
+      }
+    });
+    state.hydrated = true;
+    renderAll();
+  } finally { refreshInFlight = false; }
 }
-
 function scheduleRefresh(delay = 250) {
   clearTimeout(refreshTimer);
-  refreshTimer = setTimeout(() => {
-    refreshAll().catch(error => recordClientError("dashboard refresh", error));
-  }, delay);
+  refreshTimer = setTimeout(() => refreshAll().catch(error => recordClientError("dashboard refresh", error)), delay);
 }
-
 function connectWebSocket() {
   clearTimeout(reconnectTimer);
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  try {
-    socket = new WebSocket(`${protocol}//${location.host}/ws`);
-  } catch (error) {
-    recordClientError("Dashboard WebSocket", error);
-    reconnectTimer = setTimeout(connectWebSocket, 2500);
-    return;
-  }
-  socket.onopen = () => {
-    socketConnected = true;
-    clearClientFault("Dashboard WebSocket");
-    renderHealth();
-    renderRuntime();
-  };
+  try { socket = new WebSocket(`${protocol}//${location.host}/ws`); }
+  catch (error) { recordClientError("Dashboard WebSocket", error); reconnectTimer = setTimeout(connectWebSocket, 2500); return; }
+  socket.onopen = () => { socketConnected = true; clearClientFault("Dashboard WebSocket"); renderHealth(); renderRuntime(); };
   socket.onmessage = event => {
     try {
       const message = JSON.parse(event.data);
-      if (message.type === "hello" || message.type === "stats") {
-        state.status = message.status || state.status;
-        state.stats = message.stats || state.stats;
-        renderHealth();
-        renderRuntime();
-        renderSleeves();
-        renderEvidence();
-      }
+      if (message.type === "hello" || message.type === "stats") { state.status = message.status || state.status; state.stats = message.stats || state.stats; renderHealth(); renderRuntime(); renderSleeves(); renderEvidence(); }
+      if (message.type === "signal") playSignalTone();
       if (["signal", "signal_update", "trade_open", "trade_partial", "trade_close", "system_error"].includes(message.type)) {
-        if (message.type === "system_error" && message.error) {
-          clientErrors.unshift(message.error);
-          clientErrors.splice(20);
-        }
+        if (message.type === "system_error" && message.error) { clientErrors.unshift(message.error); clientErrors.splice(20); }
         scheduleRefresh();
       }
       if (message.type === "prices") scheduleRefresh(900);
       if (message.type === "log") scheduleRefresh(500);
-    } catch (error) {
-      recordClientError("Dashboard WebSocket message", error);
-    }
+    } catch (error) { recordClientError("Dashboard WebSocket message", error); }
   };
-  socket.onerror = () => {
-    recordClientError("Dashboard WebSocket", new Error("live dashboard connection reported an error"));
-  };
-  socket.onclose = event => {
-    socketConnected = false;
-    recordClientError("Dashboard WebSocket", new Error(`disconnected (code ${event.code || "unknown"})`));
-    renderRuntime();
-    reconnectTimer = setTimeout(connectWebSocket, 2500);
-  };
+  socket.onerror = () => recordClientError("Dashboard WebSocket", new Error("live dashboard connection reported an error"));
+  socket.onclose = event => { socketConnected = false; recordClientError("Dashboard WebSocket", new Error(`disconnected (code ${event.code || "unknown"})`)); renderRuntime(); reconnectTimer = setTimeout(connectWebSocket, 2500); };
 }
 
 async function adminPost(path, body) {
@@ -753,98 +609,72 @@ async function adminPost(path, body) {
   if (!token) return null;
   sessionStorage.setItem("footballbot_admin_token", token);
   try {
-    const response = await fetch(path, {
-      method: "POST",
-      headers: {"Content-Type": "application/json", "X-Admin-Token": token},
-      body: body == null ? null : JSON.stringify(body),
-    });
+    const response = await fetch(path, {method: "POST", headers: {"Content-Type": "application/json", "X-Admin-Token": token}, body: body == null ? null : JSON.stringify(body)});
     if (!response.ok) {
       const payload = await response.json().catch(error => ({detail: `Unable to read error response: ${error.message}`}));
       throw new Error(payload.detail || `${response.status} ${response.statusText}`);
     }
     clearClientFault(`Admin ${path}`);
     return await response.json();
-  } catch (error) {
-    sessionStorage.removeItem("footballbot_admin_token");
-    recordClientError(`Admin ${path}`, error);
-    return null;
-  }
+  } catch (error) { sessionStorage.removeItem("footballbot_admin_token"); recordClientError(`Admin ${path}`, error); return null; }
 }
-
 async function downloadExport() {
   let token = sessionStorage.getItem("footballbot_admin_token");
   if (!token) token = window.prompt("Admin token for protected study download");
   if (!token) return;
   sessionStorage.setItem("footballbot_admin_token", token);
-  const button = byId("export-button");
-  button.disabled = true;
-  button.textContent = "Preparing download…";
+  const buttons = [byId("export-button"), ...document.querySelectorAll("[data-export-trigger]")];
+  buttons.forEach(button => { button.disabled = true; button.textContent = "Preparing data…"; });
   try {
-    const response = await fetch("/api/export", {headers: {"X-Admin-Token": token}});
-    if (!response.ok) {
-      const payload = await response.json().catch(error => ({detail: `Unable to read export error: ${error.message}`}));
-      throw new Error(payload.detail || `${response.status} ${response.statusText}`);
+    const headers = {"X-Admin-Token": token};
+    const started = await fetch("/api/export/prepare", {method: "POST", headers});
+    if (!started.ok) {
+      const payload = await started.json().catch(error => ({detail: `Unable to read export error: ${error.message}`}));
+      throw new Error(payload.detail || `${started.status} ${started.statusText}`);
     }
-    const blob = await response.blob();
-    const disposition = response.headers.get("content-disposition") || "";
-    const matchedName = disposition.match(/filename="?([^";]+)"?/i);
-    const filename = matchedName?.[1] || "football-study-export.zip";
-    const url = URL.createObjectURL(blob);
+    let job = await started.json();
+    const beganAt = Date.now();
+    while (job.status === "preparing") {
+      const elapsed = Math.max(1, Math.round((Date.now() - beganAt) / 1000));
+      buttons.forEach(button => { button.textContent = `Preparing… ${elapsed}s`; });
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      const polled = await fetch(`/api/export/jobs/${encodeURIComponent(job.job_id)}`, {headers});
+      if (!polled.ok) {
+        const payload = await polled.json().catch(error => ({detail: `Unable to read export status: ${error.message}`}));
+        throw new Error(payload.detail || `${polled.status} ${polled.statusText}`);
+      }
+      job = await polled.json();
+    }
+    if (job.status !== "ready") throw new Error(job.error || "Study export preparation failed");
     const anchor = document.createElement("a");
-    anchor.href = url;
-    anchor.download = filename;
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    URL.revokeObjectURL(url);
+    anchor.href = `/api/export/jobs/${encodeURIComponent(job.job_id)}/download`;
+    document.body.appendChild(anchor); anchor.click(); anchor.remove();
     clearClientFault("Study export");
-    showToast("Study data download started.");
-  } catch (error) {
-    sessionStorage.removeItem("footballbot_admin_token");
-    recordClientError("Study export", error);
-  } finally {
-    button.disabled = false;
-    button.textContent = "Download study data";
-  }
+    showToast(`Study data download started (${formatBytes(job.bytes)}).`);
+  } catch (error) { sessionStorage.removeItem("footballbot_admin_token"); recordClientError("Study export", error); }
+  finally { buttons.forEach(button => { button.disabled = false; button.textContent = button.id === "export-button" ? "Download study data" : "Prepare study data"; }); }
 }
-
 function playSignalTone() {
   if (!soundEnabled) return;
   try {
-    const context = new (window.AudioContext || window.webkitAudioContext)();
-    const oscillator = context.createOscillator();
-    const gain = context.createGain();
-    oscillator.connect(gain);
-    gain.connect(context.destination);
-    oscillator.type = "sine";
-    oscillator.frequency.setValueAtTime(330, context.currentTime);
-    oscillator.frequency.exponentialRampToValueAtTime(520, context.currentTime + 0.18);
-    gain.gain.setValueAtTime(0.08, context.currentTime);
-    gain.gain.exponentialRampToValueAtTime(0.001, context.currentTime + 0.35);
-    oscillator.start();
-    oscillator.stop(context.currentTime + 0.35);
-  } catch (error) {
-    recordClientError("Audio notification", error);
-  }
+    const context = new (window.AudioContext || window.webkitAudioContext)(), oscillator = context.createOscillator(), gain = context.createGain();
+    oscillator.connect(gain); gain.connect(context.destination); oscillator.type = "sine";
+    oscillator.frequency.setValueAtTime(330, context.currentTime); oscillator.frequency.exponentialRampToValueAtTime(520, context.currentTime + .18);
+    gain.gain.setValueAtTime(.08, context.currentTime); gain.gain.exponentialRampToValueAtTime(.001, context.currentTime + .35);
+    oscillator.start(); oscillator.stop(context.currentTime + .35);
+  } catch (error) { recordClientError("Audio notification", error); }
 }
 
-byId("kill-button").addEventListener("click", async () => {
-  const result = await adminPost("/api/kill", {on: !killEnabled});
-  if (result) scheduleRefresh(0);
-});
-
-byId("sound-button").addEventListener("click", () => {
-  soundEnabled = !soundEnabled;
-  byId("sound-button").textContent = soundEnabled ? "Sound on" : "Sound off";
-  if (soundEnabled) playSignalTone();
-});
-
-byId("export-button").addEventListener("click", () => {
-  downloadExport().catch(error => recordClientError("Study export", error));
-});
-
+initializeTabs();
+byId("kill-button").addEventListener("click", async () => { const result = await adminPost("/api/kill", {on: !killEnabled}); if (result) scheduleRefresh(0); });
+byId("sound-button").addEventListener("click", () => { soundEnabled = !soundEnabled; byId("sound-button").textContent = soundEnabled ? "Sound on" : "Sound off"; if (soundEnabled) playSignalTone(); });
+byId("export-button").addEventListener("click", () => downloadExport().catch(error => recordClientError("Study export", error)));
+document.querySelectorAll("[data-export-trigger]").forEach(button => button.addEventListener("click", () => downloadExport().catch(error => recordClientError("Study export", error))));
+byId("market-search").addEventListener("input", renderMatches);
+byId("league-sort").addEventListener("change", renderLeagues);
+document.querySelectorAll("[data-league-sleeve]").forEach(button => button.addEventListener("click", () => { leagueSleeve = button.dataset.leagueSleeve; document.querySelectorAll("[data-league-sleeve]").forEach(other => other.classList.toggle("active", other === button)); renderLeagues(); }));
+if (window.ResizeObserver) new ResizeObserver(() => { if (!byId("panel-overview").hidden) renderEquity(); }).observe(byId("equity-chart"));
+window.addEventListener("hashchange", () => activateTab(location.hash.slice(1) || "overview"));
 refreshAll().catch(error => recordClientError("Initial dashboard load", error));
 connectWebSocket();
-setInterval(() => {
-  refreshAll().catch(error => recordClientError("Scheduled dashboard refresh", error));
-}, 15000);
+setInterval(() => refreshAll().catch(error => recordClientError("Scheduled dashboard refresh", error)), 30000);

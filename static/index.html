@@ -4,189 +4,121 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
-  <title>Stoppage Lab · Dual-Sleeve Paper Study</title>
+  <title>Stoppage Lab · Paper Trading Study</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand-block">
-      <div class="brand-mark" aria-hidden="true">SL</div>
-      <div>
-        <h1>Stoppage Lab</h1>
-        <p>Dual-sleeve football market paper study</p>
+  <header class="app-header">
+    <div class="header-main">
+      <div class="brand-block">
+        <div class="brand-mark" aria-hidden="true">SL</div>
+        <div><h1>Stoppage Lab</h1><p>Late football market paper study</p></div>
       </div>
-      <span id="mode-badge" class="status-pill neutral">Starting</span>
+      <div class="header-status">
+        <span id="mode-badge" class="status-pill neutral">Starting</span>
+        <button id="global-health" class="health-link checking" type="button" data-tab-target="system">
+          <span class="health-dot" aria-hidden="true"></span><span id="global-health-text">Checking systems</span>
+        </button>
+      </div>
+      <div class="header-actions">
+        <button id="sound-button" class="button quiet" type="button">Sound off</button>
+        <button id="export-button" class="button secondary" type="button">Download study data</button>
+        <button id="kill-button" class="button danger" type="button">Kill switch</button>
+      </div>
     </div>
-    <div class="header-actions">
-      <button id="sound-button" class="button secondary" type="button">Sound off</button>
-      <button id="export-button" class="button secondary" type="button">Download study data</button>
-      <button id="kill-button" class="button danger" type="button">Kill switch</button>
-    </div>
+    <nav class="primary-tabs" role="tablist" aria-label="Dashboard sections">
+      <button class="tab-button active" id="tab-overview" role="tab" aria-controls="panel-overview" aria-selected="true" data-tab="overview" type="button">Overview</button>
+      <button class="tab-button" id="tab-trades" role="tab" aria-controls="panel-trades" aria-selected="false" data-tab="trades" type="button">Trades &amp; events</button>
+      <button class="tab-button" id="tab-signals" role="tab" aria-controls="panel-signals" aria-selected="false" data-tab="signals" type="button">Signals</button>
+      <button class="tab-button" id="tab-leagues" role="tab" aria-controls="panel-leagues" aria-selected="false" data-tab="leagues" type="button">League performance</button>
+      <button class="tab-button" id="tab-markets" role="tab" aria-controls="panel-markets" aria-selected="false" data-tab="markets" type="button">Live markets</button>
+      <button class="tab-button" id="tab-system" role="tab" aria-controls="panel-system" aria-selected="false" data-tab="system" type="button">System &amp; data</button>
+    </nav>
   </header>
 
-  <div class="study-notice">
-    <strong>Paper study only.</strong> Returns are not guaranteed. The match feed is diagnostic
-    and never participates in entries or exits; event matches show proximity and consistency,
-    not proven causation.
-  </div>
+  <div class="study-notice"><strong>Paper study only.</strong> Returns are not guaranteed. Match events are diagnostic; a nearby event can be a likely explanation without proving causality.</div>
 
   <main class="page-shell">
-    <section id="health-panel" class="health-panel checking" aria-live="polite">
-      <div class="section-heading health-heading">
-        <div>
-          <p class="eyebrow">System status</p>
-          <h2 id="health-title">Checking every connection</h2>
-          <p id="health-summary" class="section-copy">Waiting for the first complete status response.</p>
-        </div>
-        <span id="health-indicator" class="health-indicator">Checking</span>
-      </div>
-      <div id="health-checks" class="health-checks"></div>
-      <details id="error-details" class="error-details">
-        <summary>Recent errors and disconnects <span id="error-count">0</span></summary>
-        <div id="error-list" class="error-list"></div>
-      </details>
-    </section>
-
-    <section class="runtime-strip" aria-label="Live runtime metrics">
-      <div><span>Dashboard link</span><strong id="runtime-dashboard">Connecting</strong></div>
-      <div><span>Market stream</span><strong id="runtime-market">Checking</strong></div>
-      <div><span>Match-event feed</span><strong id="runtime-event">Checking</strong></div>
-      <div><span>Last match-feed poll</span><strong id="runtime-event-poll">Not recorded</strong></div>
-      <div><span>Match-feed response</span><strong id="runtime-event-response">Collecting</strong></div>
-      <div><span>Median market delay</span><strong id="runtime-feed-lag">—</strong></div>
-      <div><span>Watched matches</span><strong id="runtime-matches">0</strong></div>
-      <div><span>Raw messages recorded</span><strong id="runtime-recorded">0</strong></div>
-      <div><span>Service uptime</span><strong id="runtime-uptime">—</strong></div>
-    </section>
-
-    <section>
-      <div class="section-heading">
-        <div>
-          <p class="eyebrow">Independent simulations</p>
-          <h2>Paper profit and loss by sleeve</h2>
-          <p class="section-copy">Headline net is closed, realized P&amp;L after fees. Open marks are shown separately.</p>
-        </div>
-        <div id="combined-summary" class="combined-summary">Combined results are loading.</div>
+    <section id="panel-overview" class="tab-panel" role="tabpanel" aria-labelledby="tab-overview">
+      <div class="page-heading">
+        <div><p class="eyebrow">Study overview</p><h2>What is working, what is not, and why</h2><p>Closed results are after recorded fees. Each sleeve remains an independent paper simulation.</p></div>
+        <div id="combined-summary" class="headline-result">Loading results</div>
       </div>
       <div id="sleeve-cards" class="sleeve-grid"></div>
-    </section>
-
-    <section class="dashboard-grid two-one">
-      <article class="panel span-two">
-        <div class="section-heading compact">
-          <div>
-            <p class="eyebrow">Live market</p>
-            <h2>Matches and contracts</h2>
-          </div>
-          <p class="section-copy">Prices are cents per contract. Raw identifiers remain in each audit detail.</p>
-        </div>
-        <div id="match-list" class="match-grid"><div class="empty-state">Waiting for watched matches.</div></div>
-      </article>
-
-      <article class="panel">
-        <div class="section-heading compact">
-          <div>
-            <p class="eyebrow">Current risk</p>
-            <h2>Open paper positions</h2>
-          </div>
-        </div>
-        <div id="position-list" class="stack-list"><div class="empty-state">No open paper positions.</div></div>
-      </article>
-    </section>
-
-    <section class="panel">
-      <div class="section-heading">
-        <div>
-          <p class="eyebrow">Decision ledger</p>
-          <h2>What triggered, what happened, and what it matched</h2>
-          <p class="section-copy">Every row retains exact timestamps, thresholds, observed values, canonical match event, and raw IDs.</p>
-        </div>
+      <div class="visual-grid overview-visuals">
+        <article class="surface chart-surface wide-card">
+          <div class="surface-heading"><div><p class="eyebrow">Performance path</p><h3>Cumulative net and drawdown</h3></div><div id="equity-legend" class="chart-legend" aria-label="Chart series"></div></div>
+          <div id="equity-chart" class="equity-chart" role="img" aria-label="Cumulative realized paper profit and loss and drawdown by sleeve"></div>
+        </article>
+        <article class="surface chart-surface"><div class="surface-heading"><div><p class="eyebrow">Audit coverage</p><h3>Trades linked to match events</h3></div></div><div id="association-chart" class="bar-chart"></div></article>
+        <article class="surface chart-surface"><div class="surface-heading"><div><p class="eyebrow">Exit behavior</p><h3>Why positions closed</h3></div></div><div id="exit-chart" class="bar-chart"></div></article>
       </div>
-      <div id="signal-list" class="audit-list"><div class="empty-state">No detector episodes recorded yet.</div></div>
+      <div class="content-grid overview-bottom">
+        <article class="surface">
+          <div class="surface-heading"><div><p class="eyebrow">Latest explained trades</p><h3>Trade and event in one view</h3></div><button class="text-button" type="button" data-tab-target="trades">See all trades</button></div>
+          <div id="featured-trade-list" class="compact-story-list"></div>
+        </article>
+        <article class="surface"><div class="surface-heading"><div><p class="eyebrow">Current exposure</p><h3>Open paper positions</h3></div></div><div id="position-list" class="position-list"></div></article>
+      </div>
     </section>
 
-    <section class="dashboard-grid equal">
-      <article class="panel">
-        <div class="section-heading compact">
-          <div>
-            <p class="eyebrow">Diagnostic feed</p>
-            <h2>Canonical match events</h2>
-          </div>
-          <p class="section-copy">Observed locally; provider clock appears only when supplied.</p>
-        </div>
-        <div id="event-list" class="event-list"><div class="empty-state">No score change observed yet.</div></div>
-      </article>
-
-      <article class="panel">
-        <div class="section-heading compact">
-          <div>
-            <p class="eyebrow">Closed realized results</p>
-            <h2>Cumulative P&amp;L after fees</h2>
-          </div>
-          <p class="section-copy">Independent strategy lines; dollars on the vertical axis.</p>
-        </div>
-        <div id="equity-chart" class="chart-frame" role="img" aria-label="Cumulative realized paper profit and loss by sleeve"></div>
-      </article>
+    <section id="panel-trades" class="tab-panel" role="tabpanel" aria-labelledby="tab-trades" hidden>
+      <div class="page-heading"><div><p class="eyebrow">Execution audit</p><h2>Trades &amp; match events</h2><p>One chronological story from price trigger to exit and provider observation.</p></div></div>
+      <div id="trade-filters" class="filter-bar" data-filter-scope="trades"></div>
+      <div id="trade-list" class="trade-story-list"><div class="empty-state">No paper trades recorded.</div></div>
+      <div class="section-divider"></div>
+      <div class="surface-heading events-heading"><div><p class="eyebrow">Diagnostic feed</p><h3>Canonical match events</h3></div><p>Provider receipt time is not the exact on-field occurrence time.</p></div>
+      <div id="event-list" class="event-timeline"><div class="empty-state">No score change observed.</div></div>
     </section>
 
-    <section class="dashboard-grid thirds">
-      <article class="panel">
-        <div class="section-heading compact">
-          <div>
-            <p class="eyebrow">Timing</p>
-            <h2>Recorded latency</h2>
-          </div>
-          <p class="section-copy">Median and 95th percentile in milliseconds; smaller is better.</p>
-        </div>
-        <div id="latency-chart" class="metric-bars"></div>
+    <section id="panel-signals" class="tab-panel" role="tabpanel" aria-labelledby="tab-signals" hidden>
+      <div class="page-heading"><div><p class="eyebrow">Decision audit</p><h2>Why each sleeve acted or declined</h2><p>A recorded decline is still a signal. Read the decision sentence first; expand the mathematics only when needed.</p></div></div>
+      <div id="signal-filters" class="filter-bar" data-filter-scope="signals"></div>
+      <article class="surface timing-audit">
+        <div class="surface-heading"><div><p class="eyebrow">Minute-88 diagnosis</p><h3>Schedule proxy versus provider match clock</h3><p>This view diagnoses timing assumptions after the fact. Match-feed data never enters the price-only trading decision.</p></div></div>
+        <div id="timing-diagnostics" class="timing-diagnostics"></div>
       </article>
-
-      <article class="panel">
-        <div class="section-heading compact">
-          <div>
-            <p class="eyebrow">Outcomes</p>
-            <h2>Why positions closed</h2>
-          </div>
-          <p class="section-copy">Counts are separated by strategy.</p>
-        </div>
-        <div id="exit-chart" class="metric-bars"></div>
-      </article>
-
-      <article class="panel">
-        <div class="section-heading compact">
-          <div>
-            <p class="eyebrow">Promotion discipline</p>
-            <h2>Evidence gates</h2>
-          </div>
-          <p class="section-copy">Collecting is not passing. No live promotion is implied.</p>
-        </div>
-        <div id="evidence-list" class="evidence-list"></div>
-      </article>
+      <div id="signal-list" class="decision-list"><div class="empty-state">No detector episodes recorded.</div></div>
     </section>
 
-    <section class="dashboard-grid equal">
-      <article class="panel">
-        <div class="section-heading compact">
-          <div>
-            <p class="eyebrow">Execution ledger</p>
-            <h2>Closed paper trades</h2>
-          </div>
-        </div>
-        <div id="trade-list" class="trade-list"><div class="empty-state">No closed paper trades.</div></div>
-      </article>
+    <section id="panel-leagues" class="tab-panel" role="tabpanel" aria-labelledby="tab-leagues" hidden>
+      <div class="page-heading">
+        <div><p class="eyebrow">League analysis</p><h2>Where results came from</h2><p>Every league reconciles to the closed-trade ledger; small samples remain visibly small.</p></div>
+        <div class="segmented-control" role="group" aria-label="League sleeve"><button class="segment active" type="button" data-league-sleeve="combined">Combined</button><button class="segment" type="button" data-league-sleeve="gate_a">Gate A</button><button class="segment" type="button" data-league-sleeve="price_only_late_score">Price-only</button></div>
+      </div>
+      <div class="visual-grid league-layout">
+        <article class="surface chart-surface"><div class="surface-heading"><div><p class="eyebrow">Net by league</p><h3>Realized result after fees</h3></div></div><div id="league-chart" class="league-bars"></div></article>
+        <article class="surface table-surface">
+          <div class="surface-heading"><div><p class="eyebrow">Full breakdown</p><h3>League scorecard</h3></div><label class="compact-field">Sort<select id="league-sort"><option value="net">Net result</option><option value="n">Trade count</option><option value="win_pct">Win rate</option><option value="name">League name</option></select></label></div>
+          <div id="league-table" class="table-wrap"></div>
+        </article>
+      </div>
+    </section>
 
-      <article class="panel">
-        <div class="section-heading compact">
-          <div>
-            <p class="eyebrow">Operations</p>
-            <h2>Recent service activity</h2>
-          </div>
-        </div>
-        <div id="activity-list" class="activity-list"><div class="empty-state">No activity recorded.</div></div>
-      </article>
+    <section id="panel-markets" class="tab-panel" role="tabpanel" aria-labelledby="tab-markets" hidden>
+      <div class="page-heading compact-heading"><div><p class="eyebrow">Live context</p><h2>Watched matches</h2><p>Compact by default. Expand one match for contract prices and raw identifiers.</p></div><label class="search-field"><span>Search matches</span><input id="market-search" type="search" placeholder="Team or league"></label></div>
+      <div id="match-list" class="market-table"><div class="empty-state">Waiting for watched matches.</div></div>
+    </section>
+
+    <section id="panel-system" class="tab-panel" role="tabpanel" aria-labelledby="tab-system" hidden>
+      <div class="page-heading"><div><p class="eyebrow">Operations</p><h2>System health &amp; research data</h2><p>Failures and disconnects are explicit. Export preparation runs without pausing collection.</p></div></div>
+      <section id="health-panel" class="health-panel checking" aria-live="polite">
+        <div class="surface-heading"><div><p class="eyebrow">System status</p><h3 id="health-title">Checking every connection</h3><p id="health-summary">Waiting for the first complete response.</p></div><span id="health-indicator" class="status-pill neutral">Checking</span></div>
+        <div id="health-checks" class="health-checks"></div>
+        <details id="error-details" class="error-details"><summary>Errors and disconnects <span id="error-count">0</span></summary><div id="error-list" class="error-list"></div></details>
+      </section>
+      <section class="runtime-strip" aria-label="Live runtime metrics">
+        <div><span>Dashboard link</span><strong id="runtime-dashboard">Connecting</strong></div><div><span>Market stream</span><strong id="runtime-market">Checking</strong></div><div><span>Match-event feed</span><strong id="runtime-event">Checking</strong></div><div><span>Last match-feed poll</span><strong id="runtime-event-poll">Not supplied by provider</strong></div><div><span>Match-feed response</span><strong id="runtime-event-response">Collecting</strong></div><div><span>Median market delay</span><strong id="runtime-feed-lag">Collecting</strong></div><div><span>Watched matches</span><strong id="runtime-matches">0</strong></div><div><span>Raw messages recorded</span><strong id="runtime-recorded">0</strong></div><div><span>Service uptime</span><strong id="runtime-uptime">Collecting</strong></div>
+      </section>
+      <div class="content-grid system-grid">
+        <article class="surface"><div class="surface-heading"><div><p class="eyebrow">Timing</p><h3>Recorded latency</h3></div></div><div id="latency-chart" class="bar-chart"></div></article>
+        <article class="surface"><div class="surface-heading"><div><p class="eyebrow">Promotion discipline</p><h3>Evidence gates</h3></div></div><div id="evidence-list" class="evidence-list"></div></article>
+        <article class="surface data-card"><div><p class="eyebrow">Research handoff</p><h3>Download the complete study bundle</h3><p>Includes the database, canonical events, fills, configuration, hashes, and raw WebSocket recordings.</p></div><button class="button secondary" type="button" data-export-trigger>Prepare study data</button></article>
+        <article class="surface"><div class="surface-heading"><div><p class="eyebrow">Service activity</p><h3>Recent backend events</h3></div></div><div id="activity-list" class="activity-list"></div></article>
+      </div>
     </section>
   </main>
-
+  <div id="chart-tooltip" class="chart-tooltip" role="tooltip" hidden></div>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script src="app.js"></script>
 </body>

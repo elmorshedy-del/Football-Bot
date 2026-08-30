@@ -67,6 +67,52 @@ class MatchEventNormalizationTests(unittest.TestCase):
         self.assertIsNone(normalized["provider_clock"])
         self.assertEqual(normalized["score_transition"], "1–1 → 2–1")
 
+    def test_al_hazm_penalty_equalizer_has_complete_canonical_event(self):
+        before = {
+            "home_same_game_score": 0.0,
+            "away_same_game_score": 1.0,
+            "period_scores.0.home_score": 0.0,
+            "period_scores.0.away_score": 0.0,
+        }
+        after = {
+            "home_same_game_score": 1.0,
+            "away_same_game_score": 1.0,
+            "home_aggregate_score": 1.0,
+            "away_aggregate_score": 1.0,
+            "period_scores.1.home_score": 1.0,
+            "period_scores.1.away_score": 1.0,
+        }
+        live_data = {"details": {
+            "half": "2nd",
+            "home_significant_events": [{
+                "event_type": "score_change",
+                "player": "Pululu, Afimico",
+                "time": "90+5'",
+            }],
+            "away_significant_events": [{
+                "event_type": "score_change",
+                "player": "Martínez, Roger",
+                "time": "48'",
+            }],
+            "last_play": {
+                "description": "Afimico Pululu scores from the spot to level the match at 1 - 1.",
+            },
+        }}
+
+        normalized = normalize_match_event("goal", before, after, live_data)
+
+        self.assertEqual(score_pair(after), {"home": 1.0, "away": 1.0})
+        self.assertEqual(normalized["canonical_type"], "goal_observed.home")
+        self.assertEqual(normalized["score_transition"], "0–1 → 1–1")
+        self.assertEqual(normalized["provider_minute"], 90)
+        self.assertEqual(normalized["provider_stoppage"], 5)
+        self.assertEqual(normalized["provider_clock"], "90+5'")
+        self.assertEqual(normalized["event_method"], "penalty")
+        self.assertEqual(normalized["scorer"], "Afimico Pululu")
+        self.assertEqual(
+            normalized["human_label"], "Home penalty scored · 0–1 → 1–1",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

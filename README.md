@@ -153,9 +153,12 @@ so the holdout remains meaningful.
 
 ### Downloadable research bundle
 
-The dashboard's **Download study data** action calls the admin-protected `/api/export`
-endpoint. It freezes a transactionally consistent SQLite snapshot at the same boundary as
-the selected raw gzip segments and returns:
+The dashboard's **Download study data** action starts an admin-protected background export,
+polls its short status endpoint, and begins a browser-native file download only after the
+archive is ready. This avoids holding an idle HTTP connection or buffering a large archive in
+browser memory. The legacy admin-protected `/api/export` endpoint remains available for API
+clients. Both paths freeze a transactionally consistent SQLite snapshot at the same boundary
+as the selected raw gzip segments and return:
 
 - the database and SQL schema;
 - CSV and JSONL versions of markets, signals, trades, fills, latency, canonical match-event

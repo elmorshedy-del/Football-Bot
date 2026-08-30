@@ -362,3 +362,79 @@ Final result:
 - All nine checklist sections now pass. Live collection is running for evidence gathering, not
   evidence of profitability. No return, scratch exit, or loss limit is guaranteed because latency,
   gaps, fees, and disappearing liquidity remain real execution risks.
+
+## 2026-08-30 — Large-volume export hardening
+
+Status: `PASSED` locally; production acceptance pending.
+
+Finding:
+
+- An authenticated production stress check kept collection healthy but received no response bytes
+  before a 90-second client timeout while the full historical archive was being prepared. The
+  synchronous compatibility endpoint did not lose data, but its idle request made the dashboard
+  download unsuitable for a growing persistent volume.
+
+Correction:
+
+- Added a protected prepare/status/download job flow. The dashboard now receives a job identifier
+  immediately, shows elapsed preparation time, polls a short authenticated status endpoint, and
+  starts a native browser download only when the file is ready.
+- The native download uses an HttpOnly, Secure, SameSite-strict, path-scoped, job-specific cookie;
+  neither the admin token nor job download token is placed in a URL or returned in JSON.
+- Removed browser `Blob` buffering so large archives stream through the browser's download path.
+- Stored already-gzipped raw feed members without redundant ZIP deflation and computed each raw
+  SHA-256 once instead of reading every segment twice.
+- Preserved `/api/export` as an authenticated compatibility endpoint and retained explicit failure
+  recording without interrupting market collection.
+
+Validation performed:
+
+- Unit coverage proves prepare, polling, ready size, cookie-authorized download, missing-auth
+  rejection, missing-token fail-closed behavior, and non-fatal preparation failure.
+- Archive coverage proves raw gzip members use `ZIP_STORED` while all existing parsing, table-count,
+  hash, SQLite, raw-gzip, and secret-exclusion assertions still pass.
+- Frontend contract coverage proves the prepare/poll route is used and whole-archive Blob buffering
+  is absent.
+
+## 2026-08-30 — Operator dashboard and Al-Shabab event trace
+
+Status: `PASSED` locally; pull-request and production acceptance pending.
+
+Production finding reproduced from the preserved study ledger:
+
+- The Al-Hazm vs Al-Shabab equalizer was not missing. Gate A signal `1169` opened trade `51` on
+  Draw at 50c and exited at the 90c target for $80.00 gross, $4.80 fees, and +$75.20 net.
+- The market signal reached the service at `2026-08-30 18:01:19.811772 UTC`, paper entry filled at
+  `18:01:20.022890 UTC`, and the target exit filled at `18:01:32.569554 UTC`.
+- Provider observation `746` was received 18.635 seconds after the signal. Its preserved last-play
+  timestamp was 13.188 seconds after the signal and its description says Afimico Pululu scored
+  from the spot to level the match 1-1 at 90+5.
+- The independent price-only sleeve recorded the same market episode but declined it as
+  `sleeve_outside_window`. The market's expected-expiration value was about 64 minutes after the
+  90+5 event, proving that the global schedule proxy is not a reliable live minute-88 clock for
+  this series. The trading logic was not changed without backtest evidence.
+
+Changes made:
+
+- Replaced the long dashboard with Overview, Trades & Events, Signals, League Performance, Live
+  Markets, and System & Data tabs. Full health stays visible in the header and live markets are
+  compact until expanded.
+- Added synchronized trade/signal filters and sentence-first decisions. A trade now presents its
+  trigger, entry, exit, economics, nearest canonical event, provider occurrence, provider receipt,
+  and full UTC timeline together, while explicitly stating that causation is not established.
+- Extended deterministic normalization for same-game score fields, stoppage clocks, scorer names,
+  and explicit penalty language. Historical rows gain the improved display by re-reading their
+  preserved raw payload; storage names and payloads remain unchanged.
+- Restored sortable per-league results with combined/Gate A/price-only splits, small-sample
+  warnings, and reconciled totals. Added cumulative net, drawdown, exact chart points, event-link
+  outcomes, exit distributions, and a league-level timing-proxy diagnostic.
+- Preserved independent sleeves and added a regression guard proving score/event-feed fields are
+  absent from the price-only classifier, detector, and paper-execution modules.
+
+Validation performed:
+
+- `107` unit, migration, parser, execution, export, health, and frontend-contract tests pass.
+- `node --check static/app.js`, `git diff --check`, demo startup, `/api/status`, `/api/config`,
+  `/api/stats`, and all six rendered route markers pass locally.
+- Local `/api/config` exposes the 20-second event-match audit window, 8c maximum sleeve spread,
+  and 46 human-readable league names. Demo stats expose independent Gate A and price-only buckets.

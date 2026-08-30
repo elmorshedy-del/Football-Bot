@@ -1,6 +1,6 @@
 import unittest
 
-from app.audit import build_trigger, match_signal_event, timing_fields
+from app.audit import build_trigger, match_signal_event, schedule_window, timing_fields
 from app.match_events import normalize_match_event
 
 
@@ -55,6 +55,7 @@ class TriggerEventAuditTests(unittest.TestCase):
 
         self.assertEqual(matched["timing_relation"], "market_signal_first")
         self.assertEqual(matched["event_minus_signal_ms"], 2000.0)
+        self.assertEqual(matched["association"], "state_consistent")
         self.assertEqual(matched["causality"], "not_established")
         self.assertEqual(matched["match_status"], "nearest_same_match_event")
 
@@ -81,6 +82,7 @@ class TriggerEventAuditTests(unittest.TestCase):
 
         self.assertEqual(matched["observation_id"], 2)
         self.assertEqual(matched["state_consistency"], "equalizer_consistent")
+        self.assertEqual(matched["association"], "state_consistent")
         self.assertEqual(matched["canonical_event"]["human_label"],
                          "Away goal observed · 1–0 → 1–1")
         self.assertEqual(matched["raw_provider_payload"]["milestone_id"], "M1")
@@ -135,6 +137,16 @@ class TriggerEventAuditTests(unittest.TestCase):
         self.assertEqual(timing["entry_ts"], 100.15)
         self.assertEqual(timing["exit_ts"], 130.0)
         self.assertIsNone(timing["settlement_ts"])
+
+    def test_expiration_proxy_is_explicit_and_auditable(self):
+        row = signal(local_ts=100.0)
+        row["expected_expiration_time"] = "1970-01-01T00:02:30Z"
+
+        window = schedule_window(row)
+
+        self.assertEqual(window["seconds_to_expected_expiration"], 50.0)
+        self.assertTrue(window["inside_configured_window"])
+        self.assertIn("not a verified live match clock", window["assumption"])
 
     def test_settlement_time_is_not_mislabeled_as_an_active_exit(self):
         timing = timing_fields(signal(), {
