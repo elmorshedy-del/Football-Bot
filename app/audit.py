@@ -5,6 +5,7 @@ the same stored event identifier inside a fixed window.  It never feeds the
 strategy and never upgrades temporal proximity into a causal claim.
 """
 import json
+from datetime import datetime, timezone
 
 from . import config
 from .match_events import event_consistency, normalize_match_event
@@ -24,15 +25,21 @@ def json_object(value):
 
 def normalized_event(row):
     stored = json_object(row.get("normalized_event"))
-    if stored:
-        return stored
     detail = json_object(row.get("detail"))
-    return normalize_match_event(
+    derived = normalize_match_event(
         row.get("change_kind"),
         json_object(row.get("score_before")),
         json_object(row.get("score_after")),
         detail.get("live_data") or {},
     )
+    if not stored:
+        return derived
+    # Re-derive additive presentation fields from the preserved raw payload so
+    # historical observations benefit from deterministic parser improvements.
+    return {**stored, **{
+        key: value for key, value in derived.items()
+        if value is not None or stored.get(key) is None
+    }}
 
 
 def signal_inferred_state(signal):
@@ -77,12 +84,60 @@ def build_trigger(signal):
     }
 
 
+def schedule_window(signal):
+    """Expose the frozen expiration-time proxy used by the price-only sleeve."""
+    raw = signal.get("expected_expiration_time") or signal.get("close_time")
+    signal_ts = signal.get("local_ts")
+    expiration_ts = None
+    if isinstance(raw, str) and raw:
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            expiration_ts = parsed.timestamp()
+        except ValueError:
+            pass
+    seconds_to_expiration = (
+        expiration_ts - signal_ts
+        if expiration_ts is not None and isinstance(signal_ts, (int, float)) else None
+    )
+    inside = (
+        -config.SLEEVE_AFTER_EXPIRY_MIN * 60.0 <= seconds_to_expiration <=
+        config.SLEEVE_START_BEFORE_EXPIRY_MIN * 60.0
+        if seconds_to_expiration is not None else None
+    )
+    return {
+        "source": "market_expected_expiration",
+        "assumption": "Schedule proxy only; not a verified live match clock.",
+        "expected_expiration_time": raw,
+        "expected_expiration_ts": expiration_ts,
+        "signal_ts": signal_ts,
+        "seconds_to_expected_expiration": (
+            round(seconds_to_expiration, 3) if seconds_to_expiration is not None else None
+        ),
+        "window_start_before_expiration_min": config.SLEEVE_START_BEFORE_EXPIRY_MIN,
+        "window_end_after_expiration_min": config.SLEEVE_AFTER_EXPIRY_MIN,
+        "inside_configured_window": inside,
+    }
+
+
 def _timing_relation(delta_ms):
     if delta_ms > 0:
         return "market_signal_first"
     if delta_ms < 0:
         return "match_feed_first"
     return "same_recorded_time"
+
+
+def _association_label(consistency):
+    return {
+        "equalizer_consistent": "state_consistent",
+        "one_goal_lead_consistent": "state_consistent",
+        "goal_consistent_state_unknown": "nearby_goal",
+        "correction_or_reversal": "nearby_correction",
+        "state_mismatch": "state_mismatch",
+        "time_match_only": "time_only",
+    }.get(consistency, "unmatched")
 
 
 def match_signal_event(signal, observations, window_s=None):
@@ -103,6 +158,9 @@ def match_signal_event(signal, observations, window_s=None):
         "canonical_event": None,
         "provider_poll_uncertainty_ms": None,
         "provider_response_ms": None,
+        "provider_occurrence_ts": None,
+        "occurrence_minus_signal_ms": None,
+        "association": "unmatched",
         "raw_provider_payload": None,
     }
     if not isinstance(signal_ts, (int, float)):
@@ -124,18 +182,30 @@ def match_signal_event(signal, observations, window_s=None):
     )
     normalized = normalized_event(row)
     detail = json_object(row.get("detail"))
+    raw_provider = detail.get("live_data") or {}
+    provider_details = raw_provider.get("details") or {}
+    last_play = provider_details.get("last_play") or {}
+    occurrence_ts = last_play.get("occurence_ts") if isinstance(last_play, dict) else None
+    occurrence_delta_ms = (
+        round((occurrence_ts - signal_ts) * 1000.0, 3)
+        if isinstance(occurrence_ts, (int, float)) else None
+    )
     delta_ms = round(delta * 1000.0, 3)
+    consistency = event_consistency(signal_inferred_state(signal), normalized)
     base.update({
         "match_status": "nearest_same_match_event",
         "event_observed_ts": observed_ts,
         "event_minus_signal_ms": delta_ms,
         "timing_relation": _timing_relation(delta_ms),
-        "state_consistency": event_consistency(signal_inferred_state(signal), normalized),
+        "state_consistency": consistency,
+        "association": _association_label(consistency),
         "observation_id": row.get("id"),
         "canonical_event": normalized,
         "provider_poll_uncertainty_ms": detail.get("poll_uncertainty_ms"),
         "provider_response_ms": row.get("response_ms"),
-        "raw_provider_payload": detail.get("live_data"),
+        "provider_occurrence_ts": occurrence_ts,
+        "occurrence_minus_signal_ms": occurrence_delta_ms,
+        "raw_provider_payload": raw_provider,
     })
     return base
 

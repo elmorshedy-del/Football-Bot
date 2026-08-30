@@ -285,6 +285,11 @@ class PaperExecutionStoreTests(unittest.TestCase):
         self.assertEqual(gate["evidence"]["k2_ci"]["n_signals"], 2)
         self.assertEqual(price["evidence"]["k2_ci"]["n_signals"], 1)
         self.assertEqual(result["net"], combined["net"])
+        league = result["leagues"]["S"]
+        self.assertEqual((league["n"], league["net"], league["win_pct"]),
+                         (2, 12.0, 100.0))
+        self.assertEqual(league["sleeves"]["gate_a"]["net"], 9.0)
+        self.assertEqual(league["sleeves"]["price_only_late_score"]["net"], 3.0)
 
 
 class OldVolumeMigrationTests(unittest.TestCase):

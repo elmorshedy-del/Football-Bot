@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from app.books import Book
@@ -100,6 +101,19 @@ class PriceOnlyClassifierTests(unittest.TestCase):
 
         self.assertFalse(decision.accepted)
         self.assertEqual(decision.reason, "no_baseline")
+
+    def test_price_only_path_does_not_import_match_feed_fields(self):
+        root = Path(__file__).resolve().parents[1]
+        source = "\n".join(
+            (root / "app" / filename).read_text()
+            for filename in ("late_score_sleeve.py", "detector.py", "paper.py")
+        )
+
+        for forbidden in (
+            "goal_latency", "normalize_match_event", "score_before",
+            "score_after", "normalized_event",
+        ):
+            self.assertNotIn(forbidden, source)
 
 
 class PriceOnlyExitTests(unittest.TestCase):

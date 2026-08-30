@@ -4,20 +4,31 @@ import json
 import os
 import re
 import secrets
+import time
 from contextlib import asynccontextmanager, suppress
 
-from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse
+from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
 from . import config, exporter, store
-from .audit import build_trigger, json_object, match_signal_event, signal_strategy, timing_fields
+from .audit import (
+    build_trigger,
+    json_object,
+    match_signal_event,
+    normalized_event as current_normalized_event,
+    schedule_window,
+    signal_strategy,
+    timing_fields,
+)
 from .engine import Engine
 
 _clients = set()
 _queue = asyncio.Queue(maxsize=2000)
 engine = None
+_export_job = None
+_export_tasks = set()
 
 
 def require_admin(x_admin_token: str | None = Header(default=None)):
@@ -91,7 +102,8 @@ def _rows_by_signal_id(signal_ids):
     marks = ",".join("?" for _ in signal_ids)
     return {row["id"]: row for row in store.q(
         f"""SELECT s.*,m.title AS market_title,m.display_game AS market_game,
-                   m.display_leg AS market_leg FROM signals s
+                   m.display_leg AS market_leg,m.close_time AS expected_expiration_time
+              FROM signals s
               LEFT JOIN markets m ON m.ticker=s.market
              WHERE s.id IN ({marks})""", signal_ids,
     )}
@@ -130,6 +142,7 @@ def _decorate_signal(row, observations, trade=None):
     )
     row["trigger"] = build_trigger(row)
     row["timing"] = timing_fields(row, trade)
+    row["schedule_window"] = schedule_window(row)
     row["matched_event"] = match_signal_event(row, observations)
     row.update(_display_names(
         row.get("market"), row.get("event"), row.get("market_title"),
@@ -175,6 +188,8 @@ async def get_config():
             "sleeve_after_expiry_min": config.SLEEVE_AFTER_EXPIRY_MIN,
             "sleeve_min_team_gain_pp": config.SLEEVE_MIN_TEAM_GAIN_PP,
             "sleeve_min_draw_gain_pp": config.SLEEVE_MIN_DRAW_GAIN_PP,
+            "sleeve_min_explained": config.SLEEVE_MIN_EXPLAINED,
+            "sleeve_max_spread_c": config.SLEEVE_MAX_SPREAD_C,
             "sleeve_scratch_arm_c": config.SLEEVE_SCRATCH_ARM_C,
             "sleeve_trail_arm_c": config.SLEEVE_TRAIL_ARM_C,
             "sleeve_timeout_s": config.SLEEVE_TIMEOUT_S,
@@ -182,7 +197,8 @@ async def get_config():
             "goal_latency_observer": config.GOAL_LATENCY_OBSERVER,
             "goal_latency_poll_ms": config.GOAL_LATENCY_POLL_MS,
             "event_match_window_s": config.EVENT_MATCH_WINDOW_S,
-            "league_prior": config.LEAGUE_PRIOR}
+            "league_prior": config.LEAGUE_PRIOR,
+            "league_names": config.LEAGUE_NAMES}
 
 
 @app.get("/api/matches")
@@ -208,7 +224,8 @@ async def signals(limit: int = 60):
     limit = max(1, min(limit, 500))
     rows = store.q(
         """SELECT s.*,m.title AS market_title,m.display_game AS market_game,
-                  m.display_leg AS market_leg FROM signals s
+                  m.display_leg AS market_leg,m.close_time AS expected_expiration_time
+             FROM signals s
              LEFT JOIN markets m ON m.ticker=s.market
             ORDER BY s.id DESC LIMIT ?""",
         (limit,),
@@ -242,6 +259,7 @@ async def trades(limit: int = 200):
             signal["strategy"] = r.get("strategy") or signal_strategy(signal)
             r["trigger"] = build_trigger(signal)
             r["timing"] = timing_fields(signal, r)
+            r["schedule_window"] = schedule_window(signal)
             r["matched_event"] = match_signal_event(signal, observations)
     for row in opens:
         signal = signal_rows.get(row.get("signal_id"))
@@ -255,6 +273,7 @@ async def trades(limit: int = 200):
             signal["strategy"] = row.get("strategy") or signal_strategy(signal)
             row["trigger"] = build_trigger(signal)
             row["timing"] = timing_fields(signal, row)
+            row["schedule_window"] = schedule_window(signal)
             row["matched_event"] = match_signal_event(signal, observations)
     return {"open": opens, "closed": [r for r in rows if r["status"] == "closed"]}
 
@@ -311,6 +330,7 @@ async def goal_latency(limit: int = 100):
                 row[field] = json.loads(row[field])
             except (TypeError, json.JSONDecodeError):
                 pass
+        row["normalized_event"] = current_normalized_event(row)
         row.update(_display_names("", row.get("event")))
     return rows
 
@@ -325,6 +345,115 @@ def _remove_export(path):
         os.unlink(path)
     except OSError:
         pass
+
+
+def _public_export_job(job):
+    return {
+        "job_id": job["job_id"],
+        "status": job["status"],
+        "created_at": job["created_at"],
+        "bytes": job.get("bytes"),
+        "error": job.get("error"),
+    }
+
+
+async def _build_export_job(job_id, mode, raw_paths, snapshot_path):
+    global _export_job
+    try:
+        path, _manifest = await asyncio.to_thread(
+            exporter.build_study_bundle, None, mode, raw_paths, snapshot_path,
+        )
+    except Exception as exc:  # noqa: BLE001 - surface failure without stopping collection
+        if _export_job and _export_job.get("job_id") == job_id:
+            _export_job.update(status="error", error="Study export preparation failed.")
+        engine._record_error("study_export", exc)
+        return
+    if not _export_job or _export_job.get("job_id") != job_id:
+        _remove_export(path)
+        return
+    _export_job.update(status="ready", path=path, bytes=os.path.getsize(path), error=None)
+
+
+@app.post("/api/export/prepare", dependencies=[Depends(require_admin)], status_code=202)
+async def prepare_study_export():
+    """Start one non-blocking export job and return a pollable identifier."""
+    global _export_job
+    if _export_job and _export_job.get("status") == "preparing":
+        job = _export_job
+    else:
+        if _export_job and _export_job.get("path"):
+            _remove_export(_export_job["path"])
+        try:
+            engine.recorder.checkpoint_for_export()
+            raw_paths = exporter.raw_feed_paths()
+            snapshot_path = exporter.prepare_database_snapshot()
+        except Exception as exc:  # noqa: BLE001 - keep collection alive and expose the fault
+            engine._record_error("study_export", exc)
+            raise HTTPException(
+                status_code=500,
+                detail="Study export failed; see System status for the recorded fault.",
+            ) from exc
+        job = {
+            "job_id": secrets.token_urlsafe(18),
+            "download_token": secrets.token_urlsafe(32),
+            "status": "preparing",
+            "created_at": time.time(),
+            "path": None,
+            "bytes": None,
+            "error": None,
+        }
+        _export_job = job
+        task = asyncio.create_task(_build_export_job(
+            job["job_id"], engine.mode, raw_paths, snapshot_path,
+        ))
+        _export_tasks.add(task)
+        task.add_done_callback(_export_tasks.discard)
+    response = JSONResponse(_public_export_job(job), status_code=202)
+    response.set_cookie(
+        "footballbot_export_job", job["download_token"], max_age=3600,
+        httponly=True, secure=True, samesite="strict", path="/api/export/jobs",
+    )
+    return response
+
+
+@app.get("/api/export/jobs/{job_id}", dependencies=[Depends(require_admin)])
+async def study_export_status(job_id: str):
+    if not _export_job or not secrets.compare_digest(job_id, _export_job["job_id"]):
+        raise HTTPException(status_code=404, detail="Study export job not found")
+    if _export_job["status"] == "ready" and not os.path.isfile(_export_job["path"]):
+        _export_job.update(status="error", error="Prepared export is no longer available.")
+    return _public_export_job(_export_job)
+
+
+@app.get("/api/export/jobs/{job_id}/download")
+async def download_study_export(
+    job_id: str,
+    x_admin_token: str | None = Header(default=None),
+    footballbot_export_job: str | None = Cookie(default=None),
+):
+    if not _export_job or not secrets.compare_digest(job_id, _export_job["job_id"]):
+        raise HTTPException(status_code=404, detail="Study export job not found")
+    header_ok = bool(config.ADMIN_TOKEN) and secrets.compare_digest(
+        x_admin_token or "", config.ADMIN_TOKEN,
+    )
+    cookie_ok = secrets.compare_digest(
+        footballbot_export_job or "", _export_job["download_token"],
+    )
+    if not header_ok and not cookie_ok:
+        raise HTTPException(status_code=401, detail="invalid export authorization")
+    if _export_job["status"] == "preparing":
+        raise HTTPException(status_code=425, detail="Study export is still preparing")
+    if _export_job["status"] != "ready" or not os.path.isfile(_export_job.get("path") or ""):
+        raise HTTPException(status_code=410, detail=_export_job.get("error") or
+                            "Study export is unavailable")
+    path = _export_job["path"]
+    response = FileResponse(
+        path,
+        media_type="application/zip",
+        filename=os.path.basename(path),
+    )
+    response.delete_cookie("footballbot_export_job", path="/api/export/jobs")
+    return response
 
 
 @app.get("/api/export", dependencies=[Depends(require_admin)])

@@ -195,14 +195,18 @@ def build_study_bundle(output_path=None, mode=None, raw_paths=None, snapshot_pat
                     if not path.is_file() or path.is_symlink():
                         continue
                     archived = f"raw/{path.name}"
-                    archive.write(path, archived)
+                    # Recorder segments are already gzip-compressed. Re-deflating
+                    # them is expensive on long-running volumes and provides no
+                    # meaningful size reduction.
+                    archive.write(path, archived, compress_type=zipfile.ZIP_STORED)
+                    raw_sha256 = _sha256(path)
                     manifest["raw_feed"].append({
                         "file": archived,
                         "bytes": path.stat().st_size,
-                        "sha256": _sha256(path),
+                        "sha256": raw_sha256,
                     })
                     manifest["artifacts"][archived] = {
-                        "sha256": _sha256(path),
+                        "sha256": raw_sha256,
                         "bytes": path.stat().st_size,
                     }
                 handoff = Path(__file__).resolve().parents[1] / "docs" / \

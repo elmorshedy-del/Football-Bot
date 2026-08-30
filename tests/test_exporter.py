@@ -129,6 +129,10 @@ class StudyExportTests(unittest.TestCase):
                         self.assertEqual(hashlib.sha256(content).hexdigest(), metadata["sha256"])
 
                     raw_content = archive.read(manifest["raw_feed"][0]["file"])
+                    self.assertEqual(
+                        archive.getinfo(manifest["raw_feed"][0]["file"]).compress_type,
+                        zipfile.ZIP_STORED,
+                    )
                     with gzip.GzipFile(fileobj=io.BytesIO(raw_content)) as source:
                         raw_rows = [json.loads(line) for line in source.read().decode().splitlines()]
                     self.assertEqual(raw_rows[0]["m"]["seq"], 1)

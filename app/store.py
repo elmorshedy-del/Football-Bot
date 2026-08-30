@@ -549,13 +549,42 @@ def stats():
         for strategy, rows in by_strategy.items()
     }
     combined = _strategy_summary(closed, open_t, signal_rows, latency_evidence)
-    # per-league
+    # Per-league results retain the legacy combined fields while adding
+    # strategy-separated economics for the operator dashboard.
     lg = {}
     for t in closed:
-        d = lg.setdefault(t["series"], {"n": 0, "net": 0.0, "wins": 0})
-        d["n"] += 1
-        d["net"] += t["net"] or 0
-        d["wins"] += 1 if (t["net"] or 0) > 0 else 0
+        series = t["series"]
+        d = lg.setdefault(series, {
+            "series": series,
+            "display_name": config.LEAGUE_NAMES.get(series, series),
+            "n": 0, "net": 0.0, "gross": 0.0, "fees": 0.0, "wins": 0,
+            "sleeves": {
+                "gate_a": {"n": 0, "net": 0.0, "gross": 0.0, "fees": 0.0, "wins": 0},
+                "price_only_late_score": {
+                    "n": 0, "net": 0.0, "gross": 0.0, "fees": 0.0, "wins": 0,
+                },
+            },
+        })
+        strategy = _strategy_key(t.get("strategy"))
+        net_value, gross_value, fee_value = (
+            t.get("net") or 0.0, t.get("gross") or 0.0, t.get("fees") or 0.0,
+        )
+        won = 1 if net_value > 0 else 0
+        for bucket in (d, d["sleeves"][strategy]):
+            bucket["n"] += 1
+            bucket["net"] += net_value
+            bucket["gross"] += gross_value
+            bucket["fees"] += fee_value
+            bucket["wins"] += won
+    for d in lg.values():
+        for bucket in (d, *d["sleeves"].values()):
+            bucket["net"] = round(bucket["net"], 2)
+            bucket["gross"] = round(bucket["gross"], 2)
+            bucket["fees"] = round(bucket["fees"], 2)
+            bucket["win_pct"] = round(bucket["wins"] / bucket["n"] * 100, 1) \
+                if bucket["n"] else 0.0
+            bucket["net_per_trade"] = round(bucket["net"] / bucket["n"], 2) \
+                if bucket["n"] else 0.0
     evidence = combined["evidence"]
     kill = {
         "k1_fill_integrity": evidence["k1_fill_integrity"],
