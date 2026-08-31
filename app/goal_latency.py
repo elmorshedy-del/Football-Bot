@@ -10,6 +10,12 @@ import re
 import time
 
 from . import config, store
+
+# Events a later correction may point back at.
+_SUBSTANTIVE_FOR_REVISION = {
+    "goal.observed", "penalty.scored", "score.correction",
+    "goal.disallowed", "var.overturned",
+}
 from .match_clock import MatchClockTracker, parse_current_clock
 from .match_events import (
     iter_provider_event_rows,
@@ -114,6 +120,9 @@ class GoalLatencyObserver:
         self.provider_events_recorded = 0
         self.seen_fingerprints = {}     # event -> set of fingerprints
         self.lifecycle_state = {}       # event -> {period, status}
+        # event -> fingerprint of the last substantive event, so a correction
+        # arriving on a later poll still links to what it revises.
+        self.last_substantive_fingerprint = {}
 
     async def _resolve_new_events(self):
         now = time.time()
@@ -234,7 +243,10 @@ class GoalLatencyObserver:
         if lifecycle is not None:
             candidates.append(lifecycle)
         self.lifecycle_state[event] = current_lifecycle
-        previous_fingerprint = None
+        # A correction usually arrives on a LATER poll than the goal it
+        # corrects.  Resetting this per poll meant every such correction was
+        # stored with previous_fingerprint=null and the revision chain broke.
+        previous_fingerprint = self.last_substantive_fingerprint.get(event)
         for item in candidates:
             fingerprint = item["fingerprint"]
             if fingerprint in seen:
@@ -281,6 +293,9 @@ class GoalLatencyObserver:
                 "raw_payload": item.get("raw") or live_data,
             }
             inserted, is_new = await asyncio.to_thread(store.upsert_provider_event, row)
+            if item["canonical_type"] in _SUBSTANTIVE_FOR_REVISION:
+                previous_fingerprint = fingerprint
+                self.last_substantive_fingerprint[event] = fingerprint
             if is_new:
                 self.provider_events_recorded += 1
                 previous_fingerprint = fingerprint

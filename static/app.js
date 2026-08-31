@@ -5,7 +5,7 @@ const state = {
   status: null, config: {}, stats: {}, matches: [],
   trades: {open: [], closed: []}, signals: [], events: [], latency: {},
   equity: {combined: [], gate_a: [], price_only_late_score: []},
-  activity: [], clocks: {coverage: {}, observations: []}, hydrated: false,
+  activity: [], clocks: {coverage: {}, observations: []}, providerEvents: [], hydrated: false,
 };
 const filters = {query: "", strategy: "all", match: "all", result: "all", association: "all", gate: "all", period: "all"};
 const visibleEquitySeries = new Set(["combined", "gate_a", "price_only_late_score"]);
@@ -613,6 +613,25 @@ function renderTimingDiagnostics() {
   }).join("");
   byId("timing-diagnostics").innerHTML = `<div class="timing-summary-grid">${summaries}</div><p class="timing-subheading">Recent paired observations</p>${cases}`;
 }
+function providerEventRow(row) {
+  const normalized = row.normalized_event || {};
+  const kind = String(row.canonical_type || normalized.canonical_type || "provider.unknown");
+  const tone = kind.startsWith("goal.disallowed") || kind.startsWith("var.") ? "warn"
+    : kind.startsWith("score.correction") ? "warn"
+    : kind.startsWith("goal.") || kind.startsWith("penalty.scored") ? "good" : "info";
+  const revises = row.previous_fingerprint
+    ? `<p class="event-note">Revises earlier observation ${escapeHtml(String(row.previous_fingerprint).slice(0, 12))}…</p>` : "";
+  const uncertainty = finite(row.previous_poll_ts) && finite(row.first_observed_ts)
+    ? `poll uncertainty ${relativeMs((row.first_observed_ts - row.previous_poll_ts) * 1000)}` : "poll uncertainty unavailable";
+  return `<article class="event-row"><time datetime="${escapeHtml(fullDate(row.first_observed_ts))}">${escapeHtml(fullDate(row.first_observed_ts))}<br>First observed</time><div><strong>${escapeHtml(row.display_game || row.event || "Unnamed match")}</strong><p>${escapeHtml(kind.replaceAll(".", " "))} · ${escapeHtml(providerClock(row))}${normalized.scorer ? ` · ${escapeHtml(normalized.scorer)}` : ""}</p><p>${escapeHtml(normalized.provider_description || normalized.human_label || "Provider supplied no narrative.")}</p><p class="event-note">${escapeHtml(uncertainty)}. Provider receipt is not the on-field occurrence time.</p>${revises}</div><span class="tag ${tone}">${escapeHtml(kind.split(".")[0])}</span>${rawDetails("Raw provider payload", {id: row.id, fingerprint: row.fingerprint, previous_fingerprint: row.previous_fingerprint, canonical_type: kind, normalized_event: normalized, raw_payload: row.raw_payload})}</article>`;
+}
+function renderProviderEvents() {
+  const holder = byId("provider-event-list");
+  if (!holder) return;
+  const rows = state.providerEvents || [];
+  holder.innerHTML = rows.length ? rows.map(providerEventRow).join("")
+    : '<div class="empty-state">No canonical provider events recorded. Goals, cards, VAR and corrections appear here once the feed reports them.</div>';
+}
 function renderEvents() {
   const rows = state.events || [];
   byId("event-list").innerHTML = rows.length ? rows.map(event => {
@@ -784,7 +803,7 @@ function renderActivity() {
 }
 function renderAll() {
   renderHealth(); renderRuntime(); renderSleeves(); renderFilters(); renderTrades(); renderSignals(); renderEvents();
-  renderTimingDiagnostics();
+  renderTimingDiagnostics(); renderProviderEvents();
   renderEquity(); renderAssociationChart(); renderExitChart(); renderFeaturedTrades(); renderPositions(); renderLeagues();
   renderMatches(); renderLatency(); renderClockCoverage(); renderClockObservations(); renderEvidence(); renderActivity();
 }
@@ -792,7 +811,7 @@ function renderAll() {
 async function refreshAll() {
   if (refreshInFlight) return;
   refreshInFlight = true;
-  const requests = [["status", "/api/status"], ["config", "/api/config"], ["matches", "/api/matches"], ["trades", "/api/trades?limit=500"], ["signals", "/api/signals?limit=500"], ["stats", "/api/stats"], ["events", "/api/goal-latency?limit=200"], ["latency", "/api/latency"], ["equity", "/api/equity"], ["activity", "/api/eventlog?limit=100"], ["clocks", "/api/match-clocks?limit=60"]];
+  const requests = [["status", "/api/status"], ["config", "/api/config"], ["matches", "/api/matches"], ["trades", "/api/trades?limit=500"], ["signals", "/api/signals?limit=500"], ["stats", "/api/stats"], ["events", "/api/goal-latency?limit=200"], ["latency", "/api/latency"], ["equity", "/api/equity"], ["activity", "/api/eventlog?limit=100"], ["clocks", "/api/match-clocks?limit=60"], ["providerEvents", "/api/provider-events?limit=120"]];
   try {
     const results = await Promise.allSettled(requests.map(([, path]) => apiJson(path)));
     results.forEach((result, index) => {

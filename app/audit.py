@@ -199,8 +199,12 @@ def match_signal_event(signal, observations, window_s=None):
         eligible, key=lambda item: (item[0], item[1], item[2], item[3]),
     )
     normalized = normalized_event(row)
+    # goal_latency_observations carry `detail`; provider_match_events carry
+    # `raw_payload`.  Reading only `detail` left every canonical provider
+    # association with an empty payload, no occurrence time, and no poll
+    # uncertainty.
     detail = json_object(row.get("detail"))
-    raw_provider = detail.get("live_data") or {}
+    raw_provider = detail.get("live_data") or json_object(row.get("raw_payload")) or {}
     provider_details = raw_provider.get("details") or {}
     last_play = provider_details.get("last_play") or {}
     occurrence_ts = last_play.get("occurence_ts") if isinstance(last_play, dict) else None
@@ -220,7 +224,18 @@ def match_signal_event(signal, observations, window_s=None):
         "event_association": association_class(consistency, True),
         "observation_id": row.get("id"),
         "canonical_event": normalized,
-        "provider_poll_uncertainty_ms": detail.get("poll_uncertainty_ms"),
+        # goal_latency rows carry a precomputed value in `detail`; provider rows
+        # carry the raw previous_poll_ts, so derive it rather than reporting
+        # empty polling uncertainty for every canonical provider association.
+        "provider_poll_uncertainty_ms": (
+            detail.get("poll_uncertainty_ms")
+            if detail.get("poll_uncertainty_ms") is not None
+            else (
+                round((observed_ts - row["previous_poll_ts"]) * 1000.0, 3)
+                if isinstance(row.get("previous_poll_ts"), (int, float))
+                and isinstance(observed_ts, (int, float)) else None
+            )
+        ),
         "provider_response_ms": row.get("response_ms"),
         "provider_occurrence_ts": occurrence_ts,
         "occurrence_minus_signal_ms": occurrence_delta_ms,

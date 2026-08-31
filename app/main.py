@@ -146,7 +146,8 @@ def _event_observations(signals):
         f"""SELECT id, event, first_observed_ts AS observed_ts, first_observed_ts,
                     last_observed_ts, canonical_type, canonical_side, fingerprint,
                     provider_clock, provider_minute, provider_stoppage,
-                    normalized_event, raw_payload, response_ms
+                    normalized_event, raw_payload, response_ms,
+                    previous_poll_ts, previous_fingerprint
                FROM provider_match_events
               WHERE event IN ({marks}) AND first_observed_ts BETWEEN ? AND ?
               ORDER BY first_observed_ts""",
