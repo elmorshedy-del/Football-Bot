@@ -611,3 +611,103 @@ markers); and the gate's terminal-status-before-missing-minute ordering.
 
 Suite after this commit: 155 tests pass (was 146). `compileall`, `ruff` with
 `E9,F63,F7,F82`, `node --check static/app.js`, and `git diff --check` are clean.
+
+## 2026-08-31 — Persist the execution path, not just its peak
+
+Status: collection only. No change to Gate A or price-only detection, sizing,
+entry, exit, fees, lockout, or settlement. Nothing in the trading path reads the
+new data.
+
+### Why a scalar high was not enough
+
+`max_executable_bid` answers an audit question — *what was the highest bid, and
+when* — and § 3.4 of the specification is written entirely in that register. The
+question the study actually needs to answer is a research question: *what should
+the exit rule be*. Those need different data.
+
+Two positions with an identical `max_executable_bid` of 90c:
+
+- 90c resting for ~200 ms in size 1: the position could never have filled there,
+  and the recorded MFE is fiction.
+- 90c resting for 12 s in size 500: the money was genuinely left on the table.
+
+The scalar cannot separate them, and the discriminator — time at price and depth
+at price — is gone the moment the quote moves.
+
+The sharper finding: **the sleeve already computed the path and discarded it.**
+`Position.bid_path` (a `deque(maxlen=240)`) is appended on every quote inside
+`sleeve_exit_reason` and is the basis for four exit decisions —
+`sleeve_reversal`, `sleeve_scratch`, `sleeve_profit_lock`, and
+`sleeve_oscillation`, the last computing crossings, path length, displacement,
+and efficiency. None of it was persisted. Every one of those exits was therefore
+unfalsifiable: the card showed the label, never the evidence that produced it.
+It was also populated for price-only positions only, so Gate A had no path at
+all, and it carried no size, so it could not answer the depth question either.
+
+### What is collected now
+
+New append-only `bid_path_samples` table, one row per *change* in the held-side
+quote:
+
+| Column | Meaning |
+|---|---|
+| `kind` | `position` (entry to final exit) or `decline` (forward window after a signal) |
+| `trade_id` / `signal_id` | anchor |
+| `anchor_ts`, `dt_ms` | entry fill or signal receipt, and offset from it |
+| `bid` | best held-side executable bid |
+| `bid_size` | size resting at that bid |
+| `exec_px` | size-weighted price to sell the held quantity through the ladder |
+| `qty` | the quantity `exec_px` was computed for |
+
+`exec_px` is populated only when the ladder can fill the whole held size; a
+partial walk would overstate what the position could have realized, so it stays
+null rather than being approximated.
+
+`store.bid_path_summary()` derives `peak_bid`, `ms_at_peak`, `peak_exec_px`,
+`trough_bid`, `path_travelled_c`, `displacement_c`, and `path_efficiency`.
+`max_executable_bid`, `max_executable_bid_ts`, and `mfe_c` are unchanged and
+remain on `trades`; they are now a view over the path rather than the only
+record of it.
+
+`Position.bid_path` is deliberately untouched. It is load-bearing for exit logic
+at its current shape and length; the persisted buffer is a separate
+`Position.exec_path`.
+
+### Declines are now labelled observations
+
+Every signal starts a forward watch for `SIGNAL_PATH_WINDOW_S` (default 300 s),
+accepted or declined, bounded by `SIGNAL_PATH_MAX_TRACKED` (default 400) with
+flush-on-eviction. Previously a decline was a dead record: the ledger showed
+that the sleeve said no and nothing about whether saying no was right. The 86
+`sleeve_outside_window` rows in production carry no outcome and cannot be given
+one retroactively except by replaying raw tape. From here, every decline is a
+labelled observation and the selection bias is gone.
+
+### Cost to the hot path: none
+
+`store.ex()` commits per statement on the asyncio event loop, so a naive
+per-quote write would have added an fsync to every book update and made the K4
+order-arrival breach worse. Samples buffer in memory and flush in batches:
+incrementally every `BID_PATH_FLUSH_EVERY` (250) samples, which bounds what a
+crash can lose, and once more at close. `dt_ms` is relative to the restored
+`entry_ts`, so partial flushes reassemble in `dt_ms` order after a restart.
+Paths are capped at `BID_PATH_MAX_SAMPLES` (4000) with a logged overflow count
+rather than silent truncation.
+
+Two tests pin this: recording `BID_PATH_FLUSH_EVERY - 1` quotes performs no
+database write at all, and recording three flush windows produces a handful of
+batched writes rather than one per quote.
+
+### Surfaced
+
+`/api/trades` returns `bid_path` and `bid_path_summary`; `/api/signals` returns
+`forward_path` and `forward_path_summary`. `bid_path_samples` is in the audit
+bundle. The trade card renders the path as a sparkline with the entry line, the
+peak marker, time held at peak, the fillable price at peak for the actual held
+size, and round-trip distance with path efficiency.
+
+Suite: 167 tests pass (was 155). `compileall`, `ruff E9,F63,F7,F82`,
+`node --check static/app.js`, and `git diff --check` are clean.
+
+Rollback: additive. Revert the commit; `bid_path_samples` can stay. Set
+`SIGNAL_PATH_WINDOW_S=0` to stop decline-path collection without a deploy.

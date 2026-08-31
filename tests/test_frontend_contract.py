@@ -123,6 +123,16 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("state.clocks?.observations", self.js)
         self.assertIn("renderClockObservations", self.js)
 
+    def test_trade_card_renders_the_execution_path_not_just_the_peak(self):
+        """A scalar peak cannot show whether it was a spike or a plateau."""
+        for token in (
+            "pathSparkline", "trade.bid_path_summary", "bid-path-svg",
+            "summary.ms_at_peak", "summary.peak_exec_px", "summary.path_efficiency",
+        ):
+            self.assertIn(token, self.js)
+        self.assertIn(".bid-path-line", self.css)
+        self.assertIn(".bid-path-peak", self.css)
+
     def test_trade_and_signal_surface_persisted_clock_and_high(self):
         # Persisted clock stamps and executable-bid highs must render without
         # opening raw JSON — trade card and signal card both show them.

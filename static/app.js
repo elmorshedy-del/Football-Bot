@@ -372,6 +372,30 @@ function tradeHighBlock(trade) {
   const mfeNet = finite(mfe) ? mfe : (finite(high) && finite(trade.entry_px) ? Math.max(0, high - trade.entry_px) : null);
   return `<div class="trade-high"><div><span>Max executable bid</span><strong>${cents(high)}</strong></div><div><span>MFE from entry</span><strong>${finite(mfeNet) ? cents(mfeNet) : "Not observed"}</strong></div><div><span>UTC time of high</span><strong>${escapeHtml(fullDate(highTs))}</strong></div><div><span>After entry</span><strong>${finite(secondsAfter) ? duration(secondsAfter) : "not derived"}</strong></div></div>`;
 }
+function pathSparkline(trade) {
+  // The path is what a scalar high cannot show: whether the peak was a spike
+  // or a plateau, and whether it was reachable in the held size.
+  const summary = trade.bid_path_summary;
+  const samples = trade.bid_path || [];
+  if (!summary || samples.length < 2) return "";
+  const width = 320, height = 64, pad = 4;
+  const xs = samples.map(row => row.dt_ms), ys = samples.map(row => row.bid);
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = Math.min(...ys, trade.entry_px), maxY = Math.max(...ys, trade.entry_px);
+  const spanX = maxX - minX || 1, spanY = maxY - minY || 1;
+  const px = value => pad + (value - minX) / spanX * (width - pad * 2);
+  const py = value => pad + (maxY - value) / spanY * (height - pad * 2);
+  const d = samples.map((row, index) => `${index ? "L" : "M"}${px(row.dt_ms).toFixed(1)},${py(row.bid).toFixed(1)}`).join(" ");
+  const entryY = py(trade.entry_px).toFixed(1);
+  const peakX = px(summary.peak_dt_ms).toFixed(1), peakY = py(summary.peak_bid).toFixed(1);
+  const reachable = finite(summary.peak_exec_px) && finite(summary.peak_bid)
+    ? `${cents(summary.peak_exec_px)} for ${integer(trade.size)}`
+    : "size not fillable at peak";
+  const efficiency = finite(summary.path_efficiency)
+    ? `${(summary.path_efficiency * 100).toFixed(0)}% direct`
+    : "path efficiency unavailable";
+  return `<div class="bid-path"><div class="bid-path-head"><span>Executable bid path</span><strong>${integer(summary.samples)} quotes over ${escapeHtml(duration((summary.span_ms || 0) / 1000))}</strong></div><svg class="bid-path-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="Held-side executable bid from entry to exit"><line class="bid-path-entry" x1="${pad}" x2="${width - pad}" y1="${entryY}" y2="${entryY}"/><path class="bid-path-line" d="${d}"/><circle class="bid-path-peak" cx="${peakX}" cy="${peakY}" r="3.5"/></svg><div class="bid-path-facts"><div><span>Peak held</span><strong>${escapeHtml(relativeMs(summary.ms_at_peak))}</strong></div><div><span>Fillable at peak</span><strong>${escapeHtml(reachable)}</strong></div><div><span>Round trip</span><strong>${cents(summary.path_travelled_c)} · ${escapeHtml(efficiency)}</strong></div></div></div>`;
+}
 function lossPath(trade) {
   // Losing trades expose entry → high → exit so the missed profit is legible.
   if ((trade.net || 0) >= 0) return "";
@@ -494,7 +518,8 @@ function tradeCard(trade) {
   const clock = clockStampBlock(trade.match_clock);
   const highBlock = tradeHighBlock(trade);
   const loss = lossPath(trade);
-  return `<article class="trade-story ${strategyClass(trade.strategy)}"><div class="trade-core"><div class="trade-title-row"><div><h3>${escapeHtml(trade.display_game || "Unnamed match")}</h3><p class="contract-line">${escapeHtml(trade.display_contract || trade.display_leg || "Unnamed contract")} · ${escapeHtml(leagueName(trade.series))} · ${escapeHtml(matchTime)}</p></div><span class="tag ${strategyClass(trade.strategy) === "price" ? "info" : "warn"}">${escapeHtml(strategyLabel(trade.strategy))}</span></div><div class="sleeve-net ${(trade.net || 0) >= 0 ? "positive" : "negative"}">${money(trade.net || 0)}</div><p class="muted">Net after ${money(-(trade.fees || 0))} fees</p><div class="trade-economics"><div><span>Entry → exit</span><strong>${cents(trade.entry_px)} → ${cents(trade.exit_px)}</strong></div><div><span>Contracts</span><strong>${integer(trade.size)}</strong></div><div><span>Gross</span><strong>${money(trade.gross || 0)}</strong></div></div>${loss}${clock}${highBlock}<div class="trade-reason"><strong>${escapeHtml(humanExit(trade.exit_reason))}</strong><br>${escapeHtml(triggerSummary(trade.trigger))}</div></div><div class="trade-audit">${eventAssociationBlock(matched)}${tradeTimeline(trade)}<div class="audit-footer">${rawDetails("Raw identifiers and audit record", {trade_id: trade.id, signal_id: trade.signal_id, market: trade.market, event: trade.event, series: trade.series, trigger: trade.trigger, schedule_window: trade.schedule_window, matched_event: matched, match_clock: trade.match_clock, max_executable_bid: trade.max_executable_bid, max_executable_bid_ts: trade.max_executable_bid_ts, mfe_c: trade.mfe_c, high_after_entry_s: trade.high_after_entry_s})}</div></div></article>`;
+  const spark = pathSparkline(trade);
+  return `<article class="trade-story ${strategyClass(trade.strategy)}"><div class="trade-core"><div class="trade-title-row"><div><h3>${escapeHtml(trade.display_game || "Unnamed match")}</h3><p class="contract-line">${escapeHtml(trade.display_contract || trade.display_leg || "Unnamed contract")} · ${escapeHtml(leagueName(trade.series))} · ${escapeHtml(matchTime)}</p></div><span class="tag ${strategyClass(trade.strategy) === "price" ? "info" : "warn"}">${escapeHtml(strategyLabel(trade.strategy))}</span></div><div class="sleeve-net ${(trade.net || 0) >= 0 ? "positive" : "negative"}">${money(trade.net || 0)}</div><p class="muted">Net after ${money(-(trade.fees || 0))} fees</p><div class="trade-economics"><div><span>Entry → exit</span><strong>${cents(trade.entry_px)} → ${cents(trade.exit_px)}</strong></div><div><span>Contracts</span><strong>${integer(trade.size)}</strong></div><div><span>Gross</span><strong>${money(trade.gross || 0)}</strong></div></div>${loss}${spark}${clock}${highBlock}<div class="trade-reason"><strong>${escapeHtml(humanExit(trade.exit_reason))}</strong><br>${escapeHtml(triggerSummary(trade.trigger))}</div></div><div class="trade-audit">${eventAssociationBlock(matched)}${tradeTimeline(trade)}<div class="audit-footer">${rawDetails("Raw identifiers and audit record", {trade_id: trade.id, signal_id: trade.signal_id, market: trade.market, event: trade.event, series: trade.series, trigger: trade.trigger, schedule_window: trade.schedule_window, matched_event: matched, match_clock: trade.match_clock, max_executable_bid: trade.max_executable_bid, max_executable_bid_ts: trade.max_executable_bid_ts, mfe_c: trade.mfe_c, high_after_entry_s: trade.high_after_entry_s})}</div></div></article>`;
 }
 function renderTrades() {
   const rows = (state.trades.closed || []).filter(row => passesFilters(row, true));

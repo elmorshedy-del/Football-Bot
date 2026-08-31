@@ -256,6 +256,9 @@ async def signals(limit: int = 60):
     observations = _event_observations(rows)
     for row in rows:
         _decorate_signal(row, observations, trades_by_signal.get(row["id"]))
+        samples = store.bid_path_for_signal(row["id"])
+        row["forward_path"] = samples
+        row["forward_path_summary"] = store.bid_path_summary(samples)
     return rows
 
 
@@ -292,6 +295,9 @@ async def trades(limit: int = 200):
         if r.get("mfe_c") is None and r.get("max_executable_bid") is not None \
                 and r.get("entry_px") is not None:
             r["mfe_c"] = max(0.0, r["max_executable_bid"] - r["entry_px"])
+        samples = store.bid_path_for_trade(r["id"])
+        r["bid_path"] = samples
+        r["bid_path_summary"] = store.bid_path_summary(samples)
     for row in opens:
         signal = signal_rows.get(row.get("signal_id"))
         row.update(_display_names(

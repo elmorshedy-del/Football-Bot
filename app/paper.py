@@ -10,6 +10,9 @@ from collections import deque
 from dataclasses import dataclass
 
 from . import config, store
+
+# Samples buffered before an incremental write; bounds crash loss.
+BID_PATH_FLUSH_EVERY = 250
 from .execution import ShadowBooks
 from .late_score_sleeve import sleeve_exit_reason
 
@@ -77,6 +80,11 @@ class Position:
         self.sleeve_anchor_bid = None
         self.peak_bid = entry_px
         self.bid_path = deque(maxlen=240)
+        # Persisted execution path, separate from `bid_path` above, which the
+        # sleeve exit logic owns and must keep at its current shape/length.
+        self.exec_path = []
+        self.exec_path_last = None
+        self.exec_path_dropped = 0
         self.max_executable_bid = None
         self.max_executable_bid_ts = None
         self.mfe_c = None
@@ -422,6 +430,74 @@ class PaperDesk:
                     if pos.max_executable_bid_ts is not None else None
                 )}
 
+    def _record_exec_path(self, pos, book, bid, now):
+        """Buffer one held-side quote when it changes.  Memory only.
+
+        A scalar high cannot say whether that high was reachable: 90c resting
+        for 200ms in size 1 and 90c resting for 12s in size 500 produce an
+        identical max_executable_bid.  Storing the change-log keeps time-at-price
+        and depth, so exit rules can be re-tuned without re-collecting.
+        """
+        try:
+            ladder = book.bid_ladder(pos.side)
+        except Exception:
+            ladder = []
+        bid_size = ladder[0][1] if ladder else None
+        qty = pos.remaining
+        exec_px = None
+        if ladder and qty and qty > 0:
+            taken, weighted = 0.0, 0.0
+            for price, size in ladder:
+                take = min(size, qty - taken)
+                if take <= 0:
+                    break
+                weighted += take * price
+                taken += take
+                if taken >= qty:
+                    break
+            # Only a fully fillable size gets a VWAP; a partial walk would
+            # overstate what the position could actually have realized.
+            if taken >= qty and taken > 0:
+                exec_px = weighted / taken
+        signature = (bid, bid_size, exec_px, qty)
+        if signature == pos.exec_path_last:
+            return
+        pos.exec_path_last = signature
+        if len(pos.exec_path) >= store.BID_PATH_MAX_SAMPLES:
+            pos.exec_path_dropped += 1
+            return
+        pos.exec_path.append({
+            "kind": "position", "trade_id": pos.tid, "signal_id": pos.signal_id,
+            "event": pos.event, "market": pos.market, "side": pos.side,
+            "strategy": pos.strategy, "anchor_ts": pos.entry_ts,
+            "dt_ms": round((now - pos.entry_ts) * 1000.0, 1),
+            "bid": bid, "bid_size": bid_size, "exec_px": exec_px, "qty": qty,
+        })
+        # Bound how much a crash can lose without paying a commit per quote.
+        if len(pos.exec_path) >= BID_PATH_FLUSH_EVERY:
+            self._flush_exec_path(pos)
+
+    def _flush_exec_path(self, pos, final=False):
+        """Write the buffered path in one transaction.
+
+        Called incrementally so a restart loses at most BID_PATH_FLUSH_EVERY
+        samples, and once more at close.  dt_ms is relative to the restored
+        entry_ts, so partial flushes reassemble in dt_ms order.
+        """
+        if pos.exec_path:
+            rows, pos.exec_path = pos.exec_path, []
+            try:
+                store.insert_bid_path(rows)
+            except Exception as exc:
+                self._report_error("bid_path", exc)
+        if final and pos.exec_path_dropped:
+            self._safe_log(
+                "paper",
+                f"bid path for trade {pos.tid} truncated at "
+                f"{store.BID_PATH_MAX_SAMPLES} samples "
+                f"({pos.exec_path_dropped} dropped)",
+            )
+
     def _observe_executable_high(self, pos, bid, now=None):
         """Record the highest executable held-side bid after entry fill."""
         if bid is None:
@@ -444,6 +520,7 @@ class PaperDesk:
             if bid is None:
                 continue
             self._observe_executable_high(pos, bid)
+            self._record_exec_path(pos, book, bid, time.time())
             pos.best_bid = bid
             adverse = pos.entry_px - bid
             if adverse > pos.mae:
@@ -648,6 +725,7 @@ class PaperDesk:
         }
 
     def _complete_realistic(self, pos, reason, final):
+        self._flush_exec_path(pos, final=True)
         self.positions.pop(pos.tid, None)
         self.pending_exits.pop(pos.tid, None)
         self._safe_broadcast({"type": "trade_close", "trade": {
@@ -668,6 +746,7 @@ class PaperDesk:
         store.close_trade(pos.tid, round(exit_px, 2), reason, round(gross, 2),
                           round(fees, 2), round(net, 2), round(pos.mae, 2),
                           pos.shadow_stop_hit_px)
+        self._flush_exec_path(pos, final=True)
         self.positions.pop(pos.tid, None)
         self.broadcast({"type": "trade_close", "trade": {
             "id": pos.tid, "market": pos.market, "series": pos.series, "side": pos.side,

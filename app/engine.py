@@ -45,6 +45,7 @@ def parse_iso(s):
 class Engine:
     def __init__(self, queue):
         self.q = queue
+        self._signal_paths = deque()
         self.errors = deque(maxlen=50)
         self._last_error_key = None
         self._last_error_ts = 0.0
@@ -286,6 +287,67 @@ class Engine:
             if res in ("yes", "no"):
                 self.desk.settle_market(ticker, res)
 
+    def _watch_signal_forward(self, sid, cand, outcome):
+        """Track the held-side price for a bounded window after any signal.
+
+        Without this a declined signal is a dead record: the study can see that
+        the sleeve said no, but never whether saying no was right.  Every
+        signal, accepted or declined, becomes a labelled observation.
+        """
+        if not config.SIGNAL_PATH_WINDOW_S or sid is None:
+            return
+        ticker = cand.get("ticker")
+        meta = self.meta.get(ticker, {})
+        now = cand.get("local_ts") or time.time()
+        side = "yes" if cand.get("dir", 1) >= 0 else "no"
+        self._signal_paths.append({
+            "signal_id": sid, "market": ticker, "event": meta.get("event", "?"),
+            "side": side, "strategy": cand.get("strategy") or "detector",
+            "anchor_ts": now, "expires_at": now + config.SIGNAL_PATH_WINDOW_S,
+            "outcome": outcome, "last": None, "rows": [], "dropped": 0,
+        })
+        if len(self._signal_paths) > config.SIGNAL_PATH_MAX_TRACKED:
+            self._flush_signal_path(self._signal_paths.popleft())
+
+    def _record_signal_paths(self, ticker, book, now):
+        for watch in self._signal_paths:
+            if watch["market"] != ticker:
+                continue
+            try:
+                ladder = book.bid_ladder(watch["side"])
+            except Exception:
+                ladder = []
+            if not ladder:
+                continue
+            bid, bid_size = ladder[0]
+            signature = (bid, bid_size)
+            if signature == watch["last"]:
+                continue
+            watch["last"] = signature
+            if len(watch["rows"]) >= store.BID_PATH_MAX_SAMPLES:
+                watch["dropped"] += 1
+                continue
+            watch["rows"].append({
+                "kind": "decline", "trade_id": None, "signal_id": watch["signal_id"],
+                "event": watch["event"], "market": ticker, "side": watch["side"],
+                "strategy": watch["strategy"], "anchor_ts": watch["anchor_ts"],
+                "dt_ms": round((now - watch["anchor_ts"]) * 1000.0, 1),
+                "bid": bid, "bid_size": bid_size, "exec_px": None, "qty": None,
+            })
+
+    def _flush_signal_path(self, watch):
+        if not watch["rows"]:
+            return
+        rows, watch["rows"] = watch["rows"], []
+        try:
+            store.insert_bid_path(rows)
+        except Exception as exc:
+            self._record_error("signal_path", exc)
+
+    def _expire_signal_paths(self, now):
+        while self._signal_paths and self._signal_paths[0]["expires_at"] <= now:
+            self._flush_signal_path(self._signal_paths.popleft())
+
     def on_book(self, ticker, synthetic=False):
         b = self.books.get(ticker)
         if not b:
@@ -293,7 +355,10 @@ class Engine:
         ps = self.price_state(ticker)
         ps["bid"], ps["ask"] = b.best_yes_bid(), b.best_yes_ask()
         ps["dirty"] = True
-        self._observe_sleeve(ticker, time.time() * 1000.0)
+        now = time.time()
+        self._observe_sleeve(ticker, now * 1000.0)
+        self._record_signal_paths(ticker, b, now)
+        self._expire_signal_paths(now)
         self.desk.on_book(ticker, b)
 
     # ---------- signal flow ----------
@@ -364,6 +429,7 @@ class Engine:
         age = stamp.get("age_ms")
         if isinstance(age, (int, float)):
             store.add_latency("match_clock_age_ms", age)
+        self._watch_signal_forward(sid, cand, outcome)
         if announce:
             self._announce_signal(sid, cand, lag, outcome)
         return sid

@@ -23,6 +23,7 @@ TABLES = (
     "goal_latency_observations",
     "match_clock_observations",
     "provider_match_events",
+    "bid_path_samples",
     "eventlog",
 )
 _RAW_NAME = re.compile(r"^feed-\d{8}-\d{2}(?:-part-\d+)?\.jsonl\.gz$")

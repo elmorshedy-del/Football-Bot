@@ -162,6 +162,30 @@ def init():
     except sqlite3.OperationalError:
         pass
     _conn.executescript(
+        """CREATE TABLE IF NOT EXISTS bid_path_samples(
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             kind TEXT NOT NULL,
+             trade_id INTEGER,
+             signal_id INTEGER,
+             event TEXT,
+             market TEXT,
+             side TEXT,
+             strategy TEXT,
+             anchor_ts REAL NOT NULL,
+             dt_ms REAL NOT NULL,
+             bid REAL,
+             bid_size REAL,
+             exec_px REAL,
+             qty REAL,
+             mode TEXT);
+           CREATE INDEX IF NOT EXISTS idx_bid_path_trade
+             ON bid_path_samples(trade_id, dt_ms);
+           CREATE INDEX IF NOT EXISTS idx_bid_path_signal
+             ON bid_path_samples(signal_id, dt_ms);
+           CREATE INDEX IF NOT EXISTS idx_bid_path_kind
+             ON bid_path_samples(kind, anchor_ts);"""
+    )
+    _conn.executescript(
         """CREATE TABLE IF NOT EXISTS match_clock_observations(
              id INTEGER PRIMARY KEY AUTOINCREMENT,
              observed_ts REAL NOT NULL,
@@ -356,6 +380,99 @@ def latency_kind_summary(kind, limit=500, now=None, threshold_ms=None):
 
 def latency_readiness(limit=500, now=None):
     return {kind: latency_kind_summary(kind, limit=limit, now=now) for kind in LATENCY_KINDS}
+
+
+BID_PATH_MAX_SAMPLES = 4000
+
+
+def insert_bid_path(rows):
+    """Persist one buffered path in a single transaction.
+
+    The caller accumulates samples in memory for the life of a position or a
+    decline window and flushes once.  Committing per sample would add a
+    synchronous fsync to the asyncio hot path for every book update.
+    """
+    if not rows:
+        return 0
+    payload = [
+        (
+            row.get("kind"), row.get("trade_id"), row.get("signal_id"),
+            row.get("event"), row.get("market"), row.get("side"),
+            row.get("strategy"), row.get("anchor_ts"), row.get("dt_ms"),
+            row.get("bid"), row.get("bid_size"), row.get("exec_px"),
+            row.get("qty"), _mode,
+        )
+        for row in rows
+    ]
+    with _lock:
+        _conn.executemany(
+            """INSERT INTO bid_path_samples(
+                   kind,trade_id,signal_id,event,market,side,strategy,
+                   anchor_ts,dt_ms,bid,bid_size,exec_px,qty,mode)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            payload,
+        )
+        _conn.commit()
+    return len(payload)
+
+
+def bid_path_for_trade(trade_id, limit=BID_PATH_MAX_SAMPLES):
+    return q(
+        """SELECT dt_ms,bid,bid_size,exec_px,qty FROM bid_path_samples
+             WHERE trade_id=? ORDER BY dt_ms LIMIT ?""",
+        (trade_id, limit),
+    )
+
+
+def bid_path_for_signal(signal_id, limit=BID_PATH_MAX_SAMPLES):
+    return q(
+        """SELECT dt_ms,bid,bid_size,exec_px,qty FROM bid_path_samples
+             WHERE signal_id=? AND kind='decline' ORDER BY dt_ms LIMIT ?""",
+        (signal_id, limit),
+    )
+
+
+def bid_path_summary(samples):
+    """Derive the scalars the UI and study need from a stored path."""
+    points = [
+        row for row in (samples or [])
+        if isinstance(row.get("bid"), (int, float))
+    ]
+    if not points:
+        return None
+    bids = [row["bid"] for row in points]
+    peak = max(bids)
+    trough = min(bids)
+    peak_row = next(row for row in points if row["bid"] == peak)
+    trough_row = next(row for row in points if row["bid"] == trough)
+    # Time the held side spent at or above its own peak is the answer to
+    # "could that high actually have been filled".
+    at_peak_ms = sum(
+        (right["dt_ms"] - left["dt_ms"])
+        for left, right in zip(points, points[1:])
+        if left["bid"] >= peak
+    )
+    travelled = sum(
+        abs(right["bid"] - left["bid"]) for left, right in zip(points, points[1:])
+    )
+    displacement = abs(points[-1]["bid"] - points[0]["bid"])
+    return {
+        "samples": len(points),
+        "first_bid": points[0]["bid"],
+        "last_bid": points[-1]["bid"],
+        "peak_bid": peak,
+        "peak_dt_ms": peak_row["dt_ms"],
+        "peak_bid_size": peak_row.get("bid_size"),
+        "peak_exec_px": peak_row.get("exec_px"),
+        "ms_at_peak": round(at_peak_ms, 1),
+        "trough_bid": trough,
+        "trough_dt_ms": trough_row["dt_ms"],
+        "path_travelled_c": round(travelled, 2),
+        "displacement_c": round(displacement, 2),
+        # 1.0 = straight line, near 0 = chopped back and forth for nothing.
+        "path_efficiency": round(displacement / travelled, 4) if travelled > 0 else None,
+        "span_ms": round(points[-1]["dt_ms"] - points[0]["dt_ms"], 1),
+    }
 
 
 def update_trade_high(tid, bid, ts):

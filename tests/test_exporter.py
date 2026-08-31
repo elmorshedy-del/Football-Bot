@@ -61,6 +61,13 @@ class StudyExportTests(unittest.TestCase):
              1.0, 0.55, 0.01, "entry", "live"),
         )
         store.add_latency("order_arrival", 150.0)
+        store.insert_bid_path([{
+            "kind": "position", "trade_id": trade_id, "signal_id": signal_id,
+            "event": "KXTESTGAME", "market": "KXTESTGAME-YES", "side": "yes",
+            "strategy": "price_only_late_score", "anchor_ts": 1_777_777_777.25,
+            "dt_ms": 250.0, "bid": 62.0, "bid_size": 40.0, "exec_px": 61.5,
+            "qty": 1.0,
+        }])
         store.insert_goal_latency({
             "observed_ts": 1_777_777_778.0,
             "event": "KXTESTGAME",
