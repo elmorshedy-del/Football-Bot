@@ -142,6 +142,19 @@ strong, .tabular { font-variant-numeric: tabular-nums; }
 .raw-segment-row span, .raw-segment-row a { overflow-wrap: anywhere; }
 .raw-segment-row a { color: var(--blue); font-weight: 700; }
 .clock-faults { margin-top: 10px; display: grid; gap: 6px; }
+.clock-fault-row {
+  display: grid; grid-template-columns: minmax(120px, 1fr) 2fr; gap: 8px;
+  padding: 6px 10px; border-radius: 6px; background: rgba(255, 255, 255, .04);
+  font-size: .8rem; overflow-wrap: anywhere;
+}
+.clock-fault-row.warn { border-left: 3px solid var(--yellow); }
+.clock-fault-row.bad { border-left: 3px solid var(--red); }
+.clock-fault-row strong { color: var(--text); }
+.clock-fault-row span { color: var(--subtle); }
+.clock-stamp.good { border-left: 3px solid var(--green); }
+.clock-stamp.warn { border-left: 3px solid var(--yellow); }
+.clock-legacy, .clock-reason { grid-column: 1 / -1; color: var(--subtle); font-size: .75rem; }
+.raw-details summary { cursor: pointer; }
 .clock-fault { padding: 8px 10px; border-radius: 8px; background: var(--red-soft); overflow-wrap: anywhere; }
 .loss-path {
   display: grid;
