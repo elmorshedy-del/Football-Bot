@@ -82,6 +82,38 @@ class StudyExportTests(unittest.TestCase):
                     "response_ms": 100.0,
                     "detail": {"live_data": {"period": "second_half", "minute": 89}},
                 })
+                store.insert_match_clock({
+                    "observed_ts": 1_777_777_778.0,
+                    "poll_started_ts": 1_777_777_777.9,
+                    "previous_poll_ts": 1_777_777_777.5,
+                    "response_ms": 100.0,
+                    "event": "KXTESTGAME",
+                    "milestone_id": "milestone-1",
+                    "provider_period": "2nd",
+                    "provider_minute": 90,
+                    "provider_stoppage": 5,
+                    "provider_clock": "90+5′",
+                    "provider_status": "live",
+                    "precision": "provider_minute_polled",
+                    "raw_context": {"time": "90+5'"},
+                })
+                store.upsert_provider_event({
+                    "observed_ts": 1_777_777_778.0,
+                    "poll_started_ts": 1_777_777_777.9,
+                    "previous_poll_ts": 1_777_777_777.5,
+                    "response_ms": 100.0,
+                    "event": "KXTESTGAME",
+                    "milestone_id": "milestone-1",
+                    "fingerprint": "abc123",
+                    "canonical_type": "penalty.scored",
+                    "canonical_side": "home",
+                    "provider_period": "2nd",
+                    "provider_minute": 90,
+                    "provider_stoppage": 5,
+                    "provider_clock": "90+5′",
+                    "normalized_event": {"canonical_type": "penalty.scored"},
+                    "raw_payload": {"event_type": "score_change"},
+                })
                 store.log_event("test", "export fixture")
 
                 raw_dir = Path(directory) / "raw"

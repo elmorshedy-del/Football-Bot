@@ -63,6 +63,47 @@ CREATE TABLE IF NOT EXISTS goal_latency_observations(
   canonical_side TEXT,
   normalized_event TEXT,
   detail TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS match_clock_observations(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  observed_ts REAL NOT NULL,
+  poll_started_ts REAL NOT NULL,
+  previous_poll_ts REAL,
+  response_ms REAL NOT NULL,
+  event TEXT NOT NULL,
+  milestone_id TEXT NOT NULL,
+  provider_period TEXT,
+  provider_minute INTEGER,
+  provider_stoppage INTEGER,
+  provider_clock TEXT,
+  provider_status TEXT,
+  precision TEXT NOT NULL,
+  raw_context TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_match_clock_event_ts
+  ON match_clock_observations(event, observed_ts);
+CREATE TABLE IF NOT EXISTS provider_match_events(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  observed_ts REAL NOT NULL,
+  first_observed_ts REAL NOT NULL,
+  last_observed_ts REAL NOT NULL,
+  poll_started_ts REAL NOT NULL,
+  previous_poll_ts REAL,
+  response_ms REAL NOT NULL,
+  event TEXT NOT NULL,
+  milestone_id TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  previous_fingerprint TEXT,
+  canonical_type TEXT NOT NULL,
+  canonical_side TEXT,
+  provider_period TEXT,
+  provider_minute INTEGER,
+  provider_stoppage INTEGER,
+  provider_clock TEXT,
+  normalized_event TEXT NOT NULL,
+  raw_payload TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_provider_events_event_ts
+  ON provider_match_events(event, observed_ts);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_events_fingerprint
+  ON provider_match_events(event, fingerprint);
 """
 
 
@@ -112,6 +153,53 @@ def init():
             )
         except sqlite3.OperationalError:
             pass
+    try:
+        _conn.execute("ALTER TABLE signals ADD COLUMN match_clock_snapshot TEXT")
+    except sqlite3.OperationalError:
+        pass
+    _conn.executescript(
+        """CREATE TABLE IF NOT EXISTS match_clock_observations(
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             observed_ts REAL NOT NULL,
+             poll_started_ts REAL NOT NULL,
+             previous_poll_ts REAL,
+             response_ms REAL NOT NULL,
+             event TEXT NOT NULL,
+             milestone_id TEXT NOT NULL,
+             provider_period TEXT,
+             provider_minute INTEGER,
+             provider_stoppage INTEGER,
+             provider_clock TEXT,
+             provider_status TEXT,
+             precision TEXT NOT NULL,
+             raw_context TEXT NOT NULL);
+           CREATE INDEX IF NOT EXISTS idx_match_clock_event_ts
+             ON match_clock_observations(event, observed_ts);
+           CREATE TABLE IF NOT EXISTS provider_match_events(
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             observed_ts REAL NOT NULL,
+             first_observed_ts REAL NOT NULL,
+             last_observed_ts REAL NOT NULL,
+             poll_started_ts REAL NOT NULL,
+             previous_poll_ts REAL,
+             response_ms REAL NOT NULL,
+             event TEXT NOT NULL,
+             milestone_id TEXT NOT NULL,
+             fingerprint TEXT NOT NULL,
+             previous_fingerprint TEXT,
+             canonical_type TEXT NOT NULL,
+             canonical_side TEXT,
+             provider_period TEXT,
+             provider_minute INTEGER,
+             provider_stoppage INTEGER,
+             provider_clock TEXT,
+             normalized_event TEXT NOT NULL,
+             raw_payload TEXT NOT NULL);
+           CREATE INDEX IF NOT EXISTS idx_provider_events_event_ts
+             ON provider_match_events(event, observed_ts);
+           CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_events_fingerprint
+             ON provider_match_events(event, fingerprint);"""
+    )
     _conn.commit()
 
 
@@ -211,6 +299,74 @@ def insert_goal_latency(row):
     return cur.lastrowid
 
 
+def insert_match_clock(row):
+    cur = ex(
+        """INSERT INTO match_clock_observations(
+               observed_ts,poll_started_ts,previous_poll_ts,response_ms,event,milestone_id,
+               provider_period,provider_minute,provider_stoppage,provider_clock,
+               provider_status,precision,raw_context)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            row["observed_ts"], row["poll_started_ts"], row.get("previous_poll_ts"),
+            row["response_ms"], row["event"], row["milestone_id"],
+            row.get("provider_period"), row.get("provider_minute"),
+            row.get("provider_stoppage"), row.get("provider_clock"),
+            row.get("provider_status"), row.get("precision") or "provider_minute_polled",
+            json.dumps(row.get("raw_context") or {}, separators=(",", ":")),
+        ),
+    )
+    return cur.lastrowid
+
+
+def latest_match_clock(event):
+    rows = q(
+        """SELECT * FROM match_clock_observations WHERE event=?
+            ORDER BY id DESC LIMIT 1""",
+        (event,),
+    )
+    return rows[0] if rows else None
+
+
+def upsert_provider_event(row):
+    """Insert a new fingerprint or refresh last_observed_ts. History stays append-only."""
+    existing = q(
+        """SELECT id, first_observed_ts, canonical_type FROM provider_match_events
+            WHERE event=? AND fingerprint=?""",
+        (row["event"], row["fingerprint"]),
+    )
+    if existing:
+        ex(
+            """UPDATE provider_match_events
+                  SET last_observed_ts=?, poll_started_ts=?, previous_poll_ts=?, response_ms=?
+                WHERE id=?""",
+            (
+                row["observed_ts"], row["poll_started_ts"], row.get("previous_poll_ts"),
+                row["response_ms"], existing[0]["id"],
+            ),
+        )
+        return existing[0]["id"], False
+    cur = ex(
+        """INSERT INTO provider_match_events(
+               observed_ts,first_observed_ts,last_observed_ts,poll_started_ts,previous_poll_ts,
+               response_ms,event,milestone_id,fingerprint,previous_fingerprint,canonical_type,
+               canonical_side,provider_period,provider_minute,provider_stoppage,provider_clock,
+               normalized_event,raw_payload)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            row["observed_ts"], row["observed_ts"], row["observed_ts"],
+            row["poll_started_ts"], row.get("previous_poll_ts"), row["response_ms"],
+            row["event"], row["milestone_id"], row["fingerprint"],
+            row.get("previous_fingerprint"), row["canonical_type"],
+            row.get("canonical_side"), row.get("provider_period"),
+            row.get("provider_minute"), row.get("provider_stoppage"),
+            row.get("provider_clock"),
+            json.dumps(row.get("normalized_event") or {}, separators=(",", ":")),
+            json.dumps(row.get("raw_payload") or {}, separators=(",", ":")),
+        ),
+    )
+    return cur.lastrowid, True
+
+
 def finish_goal_latency(row_id, first_book=None, first_trade=None):
     ex(
         """UPDATE goal_latency_observations
@@ -239,13 +395,22 @@ def upsert_market(ticker, event, series, title, close_time, status,
         display_game, display_leg))
 
 
+def _stamp_text(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, separators=(",", ":"))
+
+
 def insert_signal(s):
     cur = ex("""INSERT INTO signals(ts_ms,local_ts,market,event,series,dir,dl,levels,size,
-                ref,ext,conf_lag_ms,late,outcome,detail,mode)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ref,ext,conf_lag_ms,late,outcome,detail,mode,match_clock_snapshot)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
              (s["ts_ms"], s["local_ts"], s["market"], s["event"], s["series"], s["dir"],
               s["dl"], s["levels"], s["size"], s["ref"], s["ext"], s.get("conf_lag_ms"),
-              1 if s.get("late") else 0, s["outcome"], json.dumps(s.get("detail") or {}), _mode))
+              1 if s.get("late") else 0, s["outcome"], json.dumps(s.get("detail") or {}), _mode,
+              _stamp_text(s.get("match_clock_snapshot"))))
     return cur.lastrowid
 
 

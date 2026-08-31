@@ -20,6 +20,8 @@ TABLES = (
     "paper_fills",
     "latency",
     "goal_latency_observations",
+    "match_clock_observations",
+    "provider_match_events",
     "eventlog",
 )
 
@@ -30,6 +32,8 @@ def non_secret_config():
         "DL_MIN", "LEVELS_MIN", "SIZE_MIN", "CONF_MS", "CONF_SIGN",
         "PRICE_CAP", "NOTIONAL_USD", "TARGET", "TIMEOUT_S", "LOCKOUT_S",
         "EPISODE_COOLDOWN_S", "LATE_ONLY", "LATE_WINDOW_MIN", "USE_STOP",
+        "STOP_FRAC", "FEE_EXIT_TAKER", "PRICE_ONLY_SLEEVE_MODE",
+        "SLEEVE_START_BEFORE_EXPIRY_MIN", "SLEEVE_AFTER_EXPIRY_MIN",
         "STOP_FRAC", "FEE_EXIT_TAKER", "PRICE_ONLY_SLEEVE_MODE",
         "SLEEVE_START_BEFORE_EXPIRY_MIN", "SLEEVE_AFTER_EXPIRY_MIN",
         "SLEEVE_BASELINE_MS", "SLEEVE_MAX_BASELINE_AGE_MS",
@@ -46,7 +50,7 @@ def non_secret_config():
         "PAPER_EXIT_LATENCY_MS", "PAPER_EXECUTION_POLL_MS",
         "GOAL_LATENCY_OBSERVER", "GOAL_LATENCY_POLL_MS",
         "GOAL_LATENCY_LOOKBACK_S", "GOAL_LATENCY_AFTER_S",
-        "EVENT_MATCH_WINDOW_S", "SOCCER_SERIES",
+        "EVENT_MATCH_WINDOW_S", "MATCH_CLOCK_MAX_AGE_MS", "SOCCER_SERIES",
     )
     return {name.lower(): getattr(config, name) for name in names}
 

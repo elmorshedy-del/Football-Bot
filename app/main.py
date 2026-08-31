@@ -23,6 +23,7 @@ from .audit import (
     timing_fields,
 )
 from .engine import Engine
+from .match_clock import parse_stored_stamp
 
 _clients = set()
 _queue = asyncio.Queue(maxsize=2000)
@@ -127,12 +128,23 @@ def _event_observations(signals):
     marks = ",".join("?" for _ in events)
     lower = min(row["local_ts"] for row in timed) - config.EVENT_MATCH_WINDOW_S
     upper = max(row["local_ts"] for row in timed) + config.EVENT_MATCH_WINDOW_S
-    return store.q(
+    score_rows = store.q(
         f"""SELECT * FROM goal_latency_observations
               WHERE event IN ({marks}) AND observed_ts BETWEEN ? AND ?
               ORDER BY observed_ts""",
         (*events, lower, upper),
     )
+    provider_rows = store.q(
+        f"""SELECT id, event, first_observed_ts AS observed_ts, first_observed_ts,
+                    last_observed_ts, canonical_type, canonical_side, fingerprint,
+                    provider_clock, provider_minute, provider_stoppage,
+                    normalized_event, raw_payload, response_ms
+               FROM provider_match_events
+              WHERE event IN ({marks}) AND first_observed_ts BETWEEN ? AND ?
+              ORDER BY first_observed_ts""",
+        (*events, lower, upper),
+    )
+    return list(score_rows) + list(provider_rows)
 
 
 def _decorate_signal(row, observations, trade=None):
@@ -144,6 +156,7 @@ def _decorate_signal(row, observations, trade=None):
     row["timing"] = timing_fields(row, trade)
     row["schedule_window"] = schedule_window(row)
     row["matched_event"] = match_signal_event(row, observations)
+    row["match_clock"] = parse_stored_stamp(row.get("match_clock_snapshot"))
     row.update(_display_names(
         row.get("market"), row.get("event"), row.get("market_title"),
         row.get("market_leg"), row.get("market_game"),
@@ -197,6 +210,7 @@ async def get_config():
             "goal_latency_observer": config.GOAL_LATENCY_OBSERVER,
             "goal_latency_poll_ms": config.GOAL_LATENCY_POLL_MS,
             "event_match_window_s": config.EVENT_MATCH_WINDOW_S,
+            "match_clock_max_age_ms": config.MATCH_CLOCK_MAX_AGE_MS,
             "league_prior": config.LEAGUE_PRIOR,
             "league_names": config.LEAGUE_NAMES}
 
@@ -261,6 +275,7 @@ async def trades(limit: int = 200):
             r["timing"] = timing_fields(signal, r)
             r["schedule_window"] = schedule_window(signal)
             r["matched_event"] = match_signal_event(signal, observations)
+            r["match_clock"] = parse_stored_stamp(signal.get("match_clock_snapshot"))
     for row in opens:
         signal = signal_rows.get(row.get("signal_id"))
         row.update(_display_names(
@@ -275,6 +290,7 @@ async def trades(limit: int = 200):
             row["timing"] = timing_fields(signal, row)
             row["schedule_window"] = schedule_window(signal)
             row["matched_event"] = match_signal_event(signal, observations)
+            row["match_clock"] = parse_stored_stamp(signal.get("match_clock_snapshot"))
     return {"open": opens, "closed": [r for r in rows if r["status"] == "closed"]}
 
 
@@ -338,6 +354,40 @@ async def goal_latency(limit: int = 100):
 @app.get("/api/eventlog")
 async def eventlog(limit: int = 80):
     return store.q("SELECT * FROM eventlog ORDER BY rowid DESC LIMIT ?", (limit,))
+
+
+@app.get("/api/match-clocks")
+async def match_clocks(limit: int = 100):
+    limit = max(1, min(limit, 500))
+    rows = store.q(
+        "SELECT * FROM match_clock_observations ORDER BY id DESC LIMIT ?", (limit,),
+    )
+    for row in rows:
+        try:
+            row["raw_context"] = json.loads(row["raw_context"])
+        except (TypeError, json.JSONDecodeError):
+            pass
+    coverage = (
+        engine.clock_tracker.coverage(engine.watched_events)
+        if engine and getattr(engine, "clock_tracker", None) else {}
+    )
+    return {"coverage": coverage, "observations": rows}
+
+
+@app.get("/api/provider-events")
+async def provider_events(limit: int = 100):
+    limit = max(1, min(limit, 500))
+    rows = store.q(
+        "SELECT * FROM provider_match_events ORDER BY id DESC LIMIT ?", (limit,),
+    )
+    for row in rows:
+        for field in ("normalized_event", "raw_payload"):
+            try:
+                row[field] = json.loads(row[field])
+            except (TypeError, json.JSONDecodeError):
+                pass
+        row.update(_display_names("", row.get("event")))
+    return rows
 
 
 def _remove_export(path):

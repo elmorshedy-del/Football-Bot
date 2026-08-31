@@ -12,6 +12,7 @@ from .detector import Detector
 from .goal_latency import GoalLatencyObserver
 from .kalshi import KalshiClient, KalshiWS
 from .late_score_sleeve import PriceOnlyLateScoreSleeve
+from .match_clock import MatchClockTracker, unusable_stamp
 from .paper import PaperDesk
 from .recorder import RawRecorder
 
@@ -79,6 +80,7 @@ class Engine:
         self.market_observations = {}  # event -> recent locally timestamped price changes
         self._last_market_state = {}   # (kind, ticker) -> tuple, suppress unchanged frames
         self.goal_latency = None
+        self.clock_tracker = MatchClockTracker()
         self.ws = None
         self.ws_state = "init"
         self.started = time.time()
@@ -332,13 +334,30 @@ class Engine:
 
     def record_signal(self, cand, lag, outcome, announce=True):
         m = self.meta.get(cand["ticker"], {})
+        event = m.get("event", "?")
+        signal_ts = cand.get("local_ts")
+        if self.mode == "demo" and event not in self.clock_tracker.latest:
+            stamp = unusable_stamp(
+                event, signal_ts, "demo_mode_no_match_clock",
+                gate_outcome="clock_demo", source="demo_replay",
+            )
+        else:
+            stamp = self.clock_tracker.stamp(event, signal_ts)
+            if not stamp.get("usable_for_88_gate"):
+                reason = stamp.get("unusable_reason")
+                if reason in {"unmapped", "stale", "malformed", "missing_clock"}:
+                    self._record_error(
+                        "match_clock",
+                        f"{event}: clock stamp unusable ({reason})",
+                    )
         sid = store.insert_signal({
             "ts_ms": cand["ts_ms"], "local_ts": cand["local_ts"], "market": cand["ticker"],
-            "event": m.get("event", "?"), "series": m.get("series", "?"),
+            "event": event, "series": m.get("series", "?"),
             "dir": cand["dir"], "dl": cand["dl"], "levels": cand["levels"],
             "size": cand["size"], "ref": cand["ref"], "ext": cand["ext"],
             "conf_lag_ms": lag, "late": self.is_late(cand["ticker"]), "outcome": outcome,
             "detail": cand.get("detail") or {},
+            "match_clock_snapshot": stamp,
         })
         if announce:
             self._announce_signal(sid, cand, lag, outcome)
@@ -592,6 +611,12 @@ class Engine:
         lat = sorted(self.feed_lag)
         recorder = self.recorder.status()
         goal = (self.goal_latency.status() if self.goal_latency else {"enabled": False})
+        tracker = getattr(self, "clock_tracker", None)
+        watched = getattr(self, "watched_events", set())
+        clock_coverage = tracker.coverage(watched) if tracker else {
+            "watched": 0, "mapped": 0, "clock_present": 0, "clock_fresh": 0,
+            "clock_gate_candidate_misses": 0, "faults": [], "mapping_errors": [],
+        }
         database = store.database_health()
         ws_healthy = self.ws_state == "demo" or str(self.ws_state).startswith("connected")
         poll_age = (
@@ -655,6 +680,7 @@ class Engine:
                 "foreign_dropped": self.n_foreign,
                 "price_only_sleeve": config.PRICE_ONLY_SLEEVE_MODE,
                 "goal_latency": goal,
+                "clock_coverage": clock_coverage,
                 "health": {"ok": system_healthy, "checks": checks,
                            "recent_errors": list(reversed(recent_errors[-20:]))},
                 "feed_lag_p50": round(lat[len(lat) // 2], 1) if lat else None,
@@ -681,6 +707,7 @@ class Engine:
                     self.client,
                     lambda: self.watched_events,
                     self.market_window,
+                    clock_tracker=self.clock_tracker,
                 )
                 asyncio.create_task(self.goal_latency.run())
             store.log_event("sys", "engine started in LIVE mode")

@@ -1,6 +1,12 @@
 import unittest
 
-from app.match_events import event_consistency, normalize_match_event, score_pair
+from app.match_events import (
+    canonical_provider_type,
+    event_consistency,
+    iter_provider_event_rows,
+    normalize_match_event,
+    score_pair,
+)
 
 
 class MatchEventNormalizationTests(unittest.TestCase):
@@ -112,6 +118,37 @@ class MatchEventNormalizationTests(unittest.TestCase):
         self.assertEqual(
             normalized["human_label"], "Home penalty scored · 0–1 → 1–1",
         )
+
+    def test_provider_event_ledger_covers_penalty_var_card_and_unknown(self):
+        live_data = {"details": {
+            "home_significant_events": [
+                {"event_type": "penalty", "player": "A", "time": "88'",
+                 "description": "penalty awarded"},
+                {"event_type": "score_change", "player": "A", "time": "90+5'",
+                 "description": "Afimico Pululu scores from the spot"},
+                {"event_type": "yellow_card", "player": "B", "time": "70'"},
+                {"event_type": "substitution", "player": "C", "time": "62'"},
+            ],
+            "away_significant_events": [
+                {"event_type": "var_review", "time": "89'"},
+                {"event_type": "goal_disallowed", "time": "89'",
+                 "description": "goal disallowed after VAR"},
+            ],
+            "last_play": {"description": "Unknown gesture", "type": "other"},
+        }}
+        rows = {item["canonical_type"]: item for item in iter_provider_event_rows(live_data)}
+        self.assertEqual(rows["penalty.awarded"]["provider_minute"], 88)
+        self.assertEqual(rows["penalty.scored"]["provider_clock"], "90+5'")
+        self.assertEqual(rows["card.yellow"]["canonical_type"], "card.yellow")
+        self.assertEqual(rows["substitution"]["canonical_type"], "substitution")
+        self.assertEqual(rows["var.review"]["canonical_type"], "var.review")
+        self.assertEqual(rows["goal.disallowed"]["canonical_type"], "goal.disallowed")
+        self.assertEqual(rows["provider.unknown"]["canonical_type"], "provider.unknown")
+
+    def test_ordinary_goal_and_correction_types(self):
+        self.assertEqual(canonical_provider_type("score_change"), "goal.observed")
+        self.assertEqual(canonical_provider_type("score_correction"), "score.correction")
+        self.assertEqual(canonical_provider_type("penalty_missed"), "penalty.missed")
 
 
 if __name__ == "__main__":
