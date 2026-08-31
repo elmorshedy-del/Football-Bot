@@ -557,3 +557,57 @@ Known limitations recorded before final review:
 - Frontend uses the browser's `sessionStorage` for the admin token; the rewrite now leaves the
   token in place on transient 5xx and network errors, but the token is still cleared on 401 or
   when a user cancels then re-prompts.
+
+## 2026-08-31 — Audit of the production-integrity stack
+
+Status: seven defects found by review of commits 1-5 and fixed in `4c9701b`. All
+carry regression tests that fail against the previous behavior. Paper-only; no
+change to Gate A, sizing, entry, exit, fees, lockout, or settlement.
+
+| # | Severity | Defect | Fix |
+|---|---|---|---|
+| 1 | High | Clock parser read the first integer anywhere in the string, so `"2nd Half 90+5'"` parsed as minute 2 and `"1-0 90+5'"` as minute 1 | Require an explicit minute mark or stoppage; accept a bare integer only as the whole value |
+| 2 | Medium | `_period_from_text` / `_status_from_text` returned raw prose as a period/status label, declining valid clocks as `clock_period_unusable` | Return `None` and defer to minute-based inference |
+| 3 | Medium | `details.get("time")` was an exact-key lookup while every other clock field used `_direct_field` | Resolve `time` the same way as the other fields |
+| 4 | Medium | `adminPost` cleared the admin token on any error; its only caller is the kill switch | Clear only on 401 |
+| 5 | Medium | `refreshRawSegments` was reachable only after a completed full export | Populate when the System tab opens |
+| 6 | Medium | `/api/match-clocks` was fetched and never read | Render the observation timeline; drop the limit from 200 to 60 |
+| 7 | Low | `timedFetch` leaked one abort listener per poll iteration | Remove the listener explicitly |
+
+Also: `.clock-fault-row.warn` and `.clock-stamp.warn` referenced an undefined
+`var(--yellow)`, so both borders rendered with the wrong colour; they now use
+`var(--amber)`. Dead `.clock-fault` and `.gate-chip` rules removed.
+
+Why defect 1 mattered most: `details.status_text` is precedence 3 in the
+specification (§ 4.1), so the author already expected real payloads to carry the
+clock there, and sports scoreboard strings routinely lead with a period ordinal
+or a score. The mis-parse declined a genuine 90+5 as `clock_pre_88`, reproducing
+the exact Al-Hazm failure this work exists to remove — while the acceptance
+criterion "no price-only record uses `sleeve_outside_window`" would still have
+passed. The stamp persisted `provider_clock: "2′"`, so the audit trail looked
+healthy rather than showing a null with a reason, which violates § 2. The score
+digit reaching the minute is score contamination in effect, and the AST import
+allowlist cannot detect a parse artifact.
+
+The single existing `status_text` test passed only because its fixture placed
+the clock first (`"90+3' 2nd half live"`). Reordering the same words returns 2.
+The new coverage is table-driven across both orderings.
+
+Test-quality note: the independence proof now also walks
+`engine._run_price_only` and `engine._clock_gate_for`. `engine.py` legitimately
+imports both `match_clock` and `goal_latency`, so the module-level scan in
+`tests/test_late_score_sleeve.py` could not cover the function that actually
+assembles the sleeve payload — a future edit could have passed score data into
+`classify()` through `cand` with nothing failing. Verified by mutation: planting
+a `live_data` read inside `_run_price_only` fails the test.
+
+Verified sound during the audit and left unchanged: trade highs (strict `>`,
+held-side `best_yes_bid`/`best_no_bid` only, unreachable from the settlement
+path, all three fields restored on restart); latency quarantine (NaN, ±inf,
+negative, and bool all route to `*_invalid`); `safe_raw_segment_path` traversal
+defense; `require_admin` fail-closed at 503 with `compare_digest`; export secret
+exclusion (byte-scanned against patched `ADMIN_TOKEN` and `KALSHI_PRIVATE_KEY`
+markers); and the gate's terminal-status-before-missing-minute ordering.
+
+Suite after this commit: 155 tests pass (was 146). `compileall`, `ruff` with
+`E9,F63,F7,F82`, `node --check static/app.js`, and `git diff --check` are clean.
