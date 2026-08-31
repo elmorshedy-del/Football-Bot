@@ -155,3 +155,51 @@ class HealthStatusTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClockCoverageHealthTests(unittest.TestCase):
+    """B2: clock coverage must gate the health banner."""
+
+    def test_all_systems_good_is_impossible_with_clock_faults(self):
+        from app.engine import _clock_coverage_check
+        check = _clock_coverage_check({
+            "watched": 1, "mapped": 0, "clock_present": 0, "clock_fresh": 0,
+            "clock_stale": 0, "clock_gate_candidate_misses": 12,
+            "faults": [{"event": "EV", "reason": "unmapped"}], "mapping_errors": [],
+        })
+        self.assertFalse(check["healthy"])
+        self.assertIn("mapped", check["status"])
+        self.assertIn("88-gate", check["status"])
+
+    def test_a_healthy_clock_feed_reports_observing(self):
+        from app.engine import _clock_coverage_check
+        check = _clock_coverage_check({
+            "watched": 2, "mapped": 2, "clock_present": 2, "clock_fresh": 2,
+            "clock_stale": 0, "clock_gate_candidate_misses": 0,
+            "faults": [], "mapping_errors": [],
+        })
+        self.assertTrue(check["healthy"])
+        self.assertEqual(check["status"], "observing")
+
+    def test_stale_clocks_and_mapping_errors_are_faults(self):
+        from app.engine import _clock_coverage_check
+        stale = _clock_coverage_check({
+            "watched": 1, "mapped": 1, "clock_present": 1, "clock_fresh": 0,
+            "clock_stale": 1, "clock_gate_candidate_misses": 0,
+            "faults": [], "mapping_errors": [],
+        })
+        self.assertFalse(stale["healthy"])
+        errored = _clock_coverage_check({
+            "watched": 1, "mapped": 1, "clock_present": 1, "clock_fresh": 1,
+            "clock_stale": 0, "clock_gate_candidate_misses": 0,
+            "faults": [], "mapping_errors": [{"event": "EV", "error": "boom"}],
+        })
+        self.assertFalse(errored["healthy"])
+
+    def test_clock_coverage_participates_in_runtime_ok(self):
+        """It must be a runtime check, not evidence-readiness."""
+        import inspect
+        from app import engine
+        source = inspect.getsource(engine.Engine.status)
+        self.assertIn('"match_clock": _clock_coverage_check', source)
+        self.assertIn('if name != "latency_evidence"', source)

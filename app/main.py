@@ -256,9 +256,8 @@ async def signals(limit: int = 60):
     observations = _event_observations(rows)
     for row in rows:
         _decorate_signal(row, observations, trades_by_signal.get(row["id"]))
-        samples = store.bid_path_for_signal(row["id"])
-        row["forward_path"] = samples
-        row["forward_path_summary"] = store.bid_path_summary(samples)
+        row["forward_path_summary"] = json_object(row.get("forward_path_summary")) or None
+        row["forward_path_url"] = f"/api/signals/{row['id']}/path"
     return rows
 
 
@@ -295,9 +294,11 @@ async def trades(limit: int = 200):
         if r.get("mfe_c") is None and r.get("max_executable_bid") is not None \
                 and r.get("entry_px") is not None:
             r["mfe_c"] = max(0.0, r["max_executable_bid"] - r["entry_px"])
-        samples = store.bid_path_for_trade(r["id"])
-        r["bid_path"] = samples
-        r["bid_path_summary"] = store.bid_path_summary(samples)
+        # Read the summary persisted at close.  Fetching samples per row here
+        # meant up to 500 extra queries and millions of rows per refresh; the
+        # full path is served by /api/trades/{id}/path on demand.
+        r["bid_path_summary"] = json_object(r.get("bid_path_summary")) or None
+        r["bid_path_url"] = f"/api/trades/{r['id']}/path"
     for row in opens:
         signal = signal_rows.get(row.get("signal_id"))
         row.update(_display_names(
@@ -399,6 +400,26 @@ async def match_clocks(limit: int = 100):
         if engine and getattr(engine, "clock_tracker", None) else {}
     )
     return {"coverage": coverage, "observations": rows}
+
+
+@app.get("/api/trades/{trade_id}/path")
+async def trade_bid_path(trade_id: int, limit: int = 2000):
+    """Full execution path for one trade.  Bounded and fetched on demand."""
+    limit = max(1, min(limit, store.BID_PATH_MAX_SAMPLES))
+    samples = store.bid_path_for_trade(trade_id, limit=limit)
+    return {"trade_id": trade_id, "samples": samples,
+            "summary": store.bid_path_summary(samples),
+            "truncated": len(samples) >= limit}
+
+
+@app.get("/api/signals/{signal_id}/path")
+async def signal_forward_path(signal_id: int, limit: int = 2000):
+    """Forward price path recorded after one signal, accepted or declined."""
+    limit = max(1, min(limit, store.BID_PATH_MAX_SAMPLES))
+    samples = store.bid_path_for_signal(signal_id, limit=limit)
+    return {"signal_id": signal_id, "samples": samples,
+            "summary": store.bid_path_summary(samples),
+            "truncated": len(samples) >= limit}
 
 
 @app.get("/api/provider-events")
@@ -695,17 +716,25 @@ async def prepare_study_export(scope: str = "audit"):
         if existing is not None:
             response = JSONResponse(_public_export_job(existing), status_code=202)
             return _set_export_cookie(response, existing)
-    try:
+    def _prepare_inputs():
+        """Recorder rotation, path enumeration, SQLite backup, and the per-file
+        stat walk in _new_export_job are all blocking filesystem work.  Running
+        them inline stalled the event loop for the whole snapshot before the 202
+        was even returned, so live collection paused while a download was
+        requested."""
         engine.recorder.checkpoint_for_export()
         raw_paths = exporter.raw_feed_paths()
         snapshot_path = exporter.prepare_database_snapshot()
+        return raw_paths, snapshot_path, _new_export_job(scope, raw_paths)
+
+    try:
+        raw_paths, snapshot_path, job = await asyncio.to_thread(_prepare_inputs)
     except Exception as exc:  # noqa: BLE001 - keep collection alive and expose the fault
         engine._record_error("study_export", exc)
         raise HTTPException(
             status_code=500,
             detail="Study export failed; see System status for the recorded fault.",
         ) from exc
-    job = _new_export_job(scope, raw_paths)
     _register_job(job)
     task = asyncio.create_task(_build_export_job(
         job["job_id"], engine.mode, raw_paths, snapshot_path, scope,

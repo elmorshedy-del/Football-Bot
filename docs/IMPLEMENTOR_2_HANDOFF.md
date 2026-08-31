@@ -1,8 +1,8 @@
 # Implementor 2 handoff — production integrity
 
-Status: **backend commits 1–4 done locally; frontend commit 5 half-started; nothing pushed; no implementation PR.**  
-Do not merge until independent final review (`docs/PRODUCTION_INTEGRITY_IMPLEMENTATION_SPEC.md` §§11–12).  
-Paper-only. Do not change Gate A. Do not touch Railway service `kalchi-kill`.
+- Status: **backend commits 1–4 done locally; frontend commit 5 half-started; nothing pushed; no implementation PR.**
+- Do not merge until independent final review (`docs/PRODUCTION_INTEGRITY_IMPLEMENTATION_SPEC.md` §§11–12).
+- Paper-only. Do not change Gate A. Do not touch Railway service `kalchi-kill`.
 
 Read first: `AGENTS.md`, then the specification in full.
 

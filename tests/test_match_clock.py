@@ -147,6 +147,84 @@ class ClockParserTests(unittest.TestCase):
         self.assertNotIn("1-0", str(parsed.provider_status))
 
 
+class ClockLineageAndFreshnessTests(unittest.TestCase):
+    """Merge blockers 1 and 2 from architect review."""
+
+    def clock(self, minute, stoppage=None, period="2nd", status="live"):
+        from app.match_clock import ParsedClock
+        rendered = f"{minute}+{stoppage}'" if stoppage else f"{minute}'"
+        return ParsedClock(period, minute, stoppage, rendered, status, "time", {})
+
+    def timing(self, ts):
+        return {"received_wall": ts, "started_wall": ts - 0.05,
+                "response_ms": 50.0, "previous_poll_ts": ts - 0.25}
+
+    def tracker(self):
+        t = MatchClockTracker()
+        t.set_mapping("EV", "m1")
+        return t
+
+    def test_unchanged_poll_keeps_the_persisted_observation_id(self):
+        """B1: the 88 gate must never accept a clock with no database row.
+
+        An unchanged poll confirms an existing reading.  Replacing the cache
+        dropped the persisted row id and advanced observed_ts to a time with no
+        matching row, while the gate still accepted.
+        """
+        t = self.tracker()
+        row = t.observe("EV", "m1", self.clock(90, 5), self.timing(1000.0))
+        self.assertIsNotNone(row)
+        t.latest["EV"]["id"] = 123
+        self.assertIsNone(t.observe("EV", "m1", self.clock(90, 5), self.timing(1002.0)))
+        stamp = t.stamp("EV", 1002.1)
+        self.assertEqual(stamp["observation_id"], 123)
+        self.assertEqual(stamp["observed_ts"], 1000.0, "observed_ts must anchor the persisted row")
+        self.assertEqual(stamp["confirmed_ts"], 1002.0, "confirmation time must advance")
+        self.assertTrue(stamp["usable_for_88_gate"])
+
+    def test_an_accepted_stamp_always_carries_lineage(self):
+        t = self.tracker()
+        t.observe("EV", "m1", self.clock(90, 5), self.timing(1000.0))
+        t.latest["EV"]["id"] = 77
+        for tick in (1001.0, 1002.0, 1003.0):
+            t.observe("EV", "m1", self.clock(90, 5), self.timing(tick))
+            stamp = t.stamp("EV", tick + 0.05)
+            if stamp["usable_for_88_gate"]:
+                self.assertIsNotNone(
+                    stamp["observation_id"],
+                    "an accepted 88+ stamp with no observation id has no lineage",
+                )
+
+    def test_a_changed_clock_still_creates_a_new_observation(self):
+        t = self.tracker()
+        t.observe("EV", "m1", self.clock(90, 4), self.timing(1000.0))
+        row = t.observe("EV", "m1", self.clock(90, 5), self.timing(1002.0))
+        self.assertIsNotNone(row, "a real clock change must persist a new row")
+        self.assertEqual(row["provider_stoppage"], 5)
+
+    def test_freshness_is_not_conflated_with_88_eligibility(self):
+        """B2a: a fresh minute-70 clock is fresh, just not yet eligible."""
+        t = self.tracker()
+        t.observe("EV", "m1", self.clock(70), self.timing(1000.0))
+        coverage = t.coverage({"EV"}, now=1000.1)
+        self.assertEqual(coverage["clock_present"], 1)
+        self.assertEqual(coverage["clock_fresh"], 1)
+        self.assertEqual(coverage["clock_stale"], 0)
+        self.assertEqual(coverage["faults"], [])
+
+    def test_coverage_freshness_decays_and_agrees_with_the_gate(self):
+        """B2b: coverage must not report fresh once the gate calls it stale."""
+        t = self.tracker()
+        t.observe("EV", "m1", self.clock(90), self.timing(1000.0))
+        self.assertEqual(t.coverage({"EV"}, now=1000.1)["clock_fresh"], 1)
+        self.assertEqual(t.stamp("EV", 1000.1)["gate_outcome"], "clock_88_plus")
+        late = t.coverage({"EV"}, now=1010.0)
+        self.assertEqual(late["clock_fresh"], 0)
+        self.assertEqual(late["clock_stale"], 1)
+        self.assertEqual(t.stamp("EV", 1010.0)["gate_outcome"], "clock_stale")
+        self.assertIn("stale", [row["reason"] for row in late["faults"]])
+
+
 class ClockGateAndStampTests(unittest.TestCase):
     def observation(self, minute=90, stoppage=5, period="2nd", status="live", ts=100.0):
         return {

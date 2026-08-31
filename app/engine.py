@@ -42,6 +42,45 @@ def parse_iso(s):
         return None
 
 
+
+def _clock_coverage_check(coverage):
+    """Clock coverage as a runtime health check.
+
+    A watched match with no mapping, a stale or missing clock, or accumulated
+    88-gate misses means the price-only study is not collecting, which is a
+    runtime fault and not merely evidence that is still gathering.
+    """
+    watched = int(coverage.get("watched") or 0)
+    mapped = int(coverage.get("mapped") or 0)
+    present = int(coverage.get("clock_present") or 0)
+    fresh = int(coverage.get("clock_fresh") or 0)
+    stale = int(coverage.get("clock_stale") or 0)
+    misses = int(coverage.get("clock_gate_candidate_misses") or 0)
+    faults = list(coverage.get("faults") or [])
+    mapping_errors = list(coverage.get("mapping_errors") or [])
+    problems = []
+    if watched and not mapped:
+        problems.append("no watched match is mapped to a live clock")
+    elif mapped > present:
+        problems.append(f"{mapped - present} mapped match(es) have no clock")
+    if stale:
+        problems.append(f"{stale} clock(s) stale")
+    if misses:
+        problems.append(f"{misses} 88-gate candidate miss(es)")
+    if mapping_errors:
+        problems.append(f"{len(mapping_errors)} mapping error(s)")
+    if faults and not problems:
+        problems.append(f"{len(faults)} clock fault(s)")
+    return {
+        "healthy": not problems,
+        "status": "observing" if not problems else "; ".join(problems),
+        "watched": watched, "mapped": mapped, "clock_present": present,
+        "clock_fresh": fresh, "clock_stale": stale,
+        "clock_gate_candidate_misses": misses,
+        "faults": len(faults), "mapping_errors": len(mapping_errors),
+    }
+
+
 class Engine:
     def __init__(self, queue):
         self.q = queue
@@ -304,10 +343,10 @@ class Engine:
             "signal_id": sid, "market": ticker, "event": meta.get("event", "?"),
             "side": side, "strategy": cand.get("strategy") or "detector",
             "anchor_ts": now, "expires_at": now + config.SIGNAL_PATH_WINDOW_S,
-            "outcome": outcome, "last": None, "rows": [], "dropped": 0,
+            "outcome": outcome, "last": None, "rows": [], "dropped": 0, "total": 0,
         })
         if len(self._signal_paths) > config.SIGNAL_PATH_MAX_TRACKED:
-            self._flush_signal_path(self._signal_paths.popleft())
+            self._flush_signal_path(self._signal_paths.popleft(), final=True)
 
     def _record_signal_paths(self, ticker, book, now):
         for watch in self._signal_paths:
@@ -324,9 +363,10 @@ class Engine:
             if signature == watch["last"]:
                 continue
             watch["last"] = signature
-            if len(watch["rows"]) >= store.BID_PATH_MAX_SAMPLES:
+            if watch.get("total", 0) >= store.BID_PATH_MAX_SAMPLES:
                 watch["dropped"] += 1
                 continue
+            watch["total"] = watch.get("total", 0) + 1
             watch["rows"].append({
                 "kind": "decline", "trade_id": None, "signal_id": watch["signal_id"],
                 "event": watch["event"], "market": ticker, "side": watch["side"],
@@ -335,18 +375,28 @@ class Engine:
                 "bid": bid, "bid_size": bid_size, "exec_px": None, "qty": None,
             })
 
-    def _flush_signal_path(self, watch):
-        if not watch["rows"]:
-            return
-        rows, watch["rows"] = watch["rows"], []
-        try:
-            store.insert_bid_path(rows)
-        except Exception as exc:
-            self._record_error("signal_path", exc)
+    def _flush_signal_path(self, watch, final=False):
+        if watch["rows"]:
+            rows = list(watch["rows"])
+            try:
+                store.insert_bid_path(rows)
+            except Exception as exc:
+                # Keep the rows for the next attempt rather than dropping them.
+                self._record_error("signal_path", exc)
+            else:
+                watch["rows"] = watch["rows"][len(rows):]
+        if final:
+            try:
+                samples = store.bid_path_for_signal(watch["signal_id"])
+                store.set_signal_path_summary(
+                    watch["signal_id"], store.bid_path_summary(samples),
+                )
+            except Exception as exc:
+                self._record_error("signal_path_summary", exc)
 
     def _expire_signal_paths(self, now):
         while self._signal_paths and self._signal_paths[0]["expires_at"] <= now:
-            self._flush_signal_path(self._signal_paths.popleft())
+            self._flush_signal_path(self._signal_paths.popleft(), final=True)
 
     def on_book(self, ticker, synthetic=False):
         b = self.books.get(ticker)
@@ -720,7 +770,8 @@ class Engine:
         watched = getattr(self, "watched_events", set())
         clock_coverage = tracker.coverage(watched) if tracker else {
             "watched": 0, "mapped": 0, "clock_present": 0, "clock_fresh": 0,
-            "clock_gate_candidate_misses": 0, "faults": [], "mapping_errors": [],
+            "clock_stale": 0, "clock_gate_candidate_misses": 0,
+            "faults": [], "mapping_errors": [],
         }
         database = store.database_health()
         ws_healthy = self.ws_state == "demo" or str(self.ws_state).startswith("connected")
@@ -779,6 +830,7 @@ class Engine:
                 "healthy": not recent_errors,
                 "status": "clear" if not recent_errors else f"{len(recent_errors)} recent",
             },
+            "match_clock": _clock_coverage_check(clock_coverage),
             "latency_evidence": {
                 "healthy": not k4_blocking,
                 "status": k4.get("state") or "COLLECTING",

@@ -259,6 +259,11 @@ def build_study_bundle(output_path=None, mode=None, raw_paths=None, snapshot_pat
                     "match_event_role": "diagnostic_only",
                     "nearest_event_is_causal": False,
                     "event_match_window_s": config.EVENT_MATCH_WINDOW_S,
+                    # Needed to reproduce the recorded paths exactly.
+                    "match_clock_max_age_ms": config.MATCH_CLOCK_MAX_AGE_MS,
+                    "signal_path_window_s": config.SIGNAL_PATH_WINDOW_S,
+                    "signal_path_max_tracked": config.SIGNAL_PATH_MAX_TRACKED,
+                    "bid_path_max_samples": store.BID_PATH_MAX_SAMPLES,
                     "provider_observation_time_is_not_event_occurrence_time": True,
                 },
             }

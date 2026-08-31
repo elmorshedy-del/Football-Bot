@@ -85,6 +85,12 @@ class Position:
         self.exec_path = []
         self.exec_path_last = None
         self.exec_path_dropped = 0
+        # Total ever buffered for this position.  The cap must be checked
+        # against this, not len(exec_path): the buffer is emptied on every
+        # incremental flush, so a length check silently resets the cap.
+        self.exec_path_total = 0
+        self.exec_path_flush_failed = False
+        self.high_dirty = False
         self.max_executable_bid = None
         self.max_executable_bid_ts = None
         self.mfe_c = None
@@ -463,9 +469,10 @@ class PaperDesk:
         if signature == pos.exec_path_last:
             return
         pos.exec_path_last = signature
-        if len(pos.exec_path) >= store.BID_PATH_MAX_SAMPLES:
+        if pos.exec_path_total >= store.BID_PATH_MAX_SAMPLES:
             pos.exec_path_dropped += 1
             return
+        pos.exec_path_total += 1
         pos.exec_path.append({
             "kind": "position", "trade_id": pos.tid, "signal_id": pos.signal_id,
             "event": pos.event, "market": pos.market, "side": pos.side,
@@ -477,6 +484,47 @@ class PaperDesk:
         if len(pos.exec_path) >= BID_PATH_FLUSH_EVERY:
             self._flush_exec_path(pos)
 
+    def _record_exec_gap(self, pos, now):
+        """Record that the held side had no executable bid.
+
+        Skipping these left an unexplained hole in the path, so time-at-peak
+        was computed across a window in which the peak may not have been
+        quotable at all.
+        """
+        if pos.exec_path_last is None and not pos.exec_path:
+            return
+        signature = (None, None, None, pos.remaining)
+        if signature == pos.exec_path_last:
+            return
+        pos.exec_path_last = signature
+        if pos.exec_path_total >= store.BID_PATH_MAX_SAMPLES:
+            pos.exec_path_dropped += 1
+            return
+        pos.exec_path_total += 1
+        pos.exec_path.append({
+            "kind": "position", "trade_id": pos.tid, "signal_id": pos.signal_id,
+            "event": pos.event, "market": pos.market, "side": pos.side,
+            "strategy": pos.strategy, "anchor_ts": pos.entry_ts,
+            "dt_ms": round((now - pos.entry_ts) * 1000.0, 1),
+            "bid": None, "bid_size": None, "exec_px": None, "qty": pos.remaining,
+        })
+
+    def _record_exec_terminal(self, pos, exit_px, now):
+        """Close the path at the exit so the last interval has a real end.
+
+        Without a terminal sample the final segment had no duration and
+        time-at-peak was understated whenever the peak was the last quote.
+        """
+        pos.exec_path_total += 1
+        pos.exec_path.append({
+            "kind": "position", "trade_id": pos.tid, "signal_id": pos.signal_id,
+            "event": pos.event, "market": pos.market, "side": pos.side,
+            "strategy": pos.strategy, "anchor_ts": pos.entry_ts,
+            "dt_ms": round((now - pos.entry_ts) * 1000.0, 1),
+            "bid": exit_px, "bid_size": None, "exec_px": None,
+            "qty": pos.remaining,
+        })
+
     def _flush_exec_path(self, pos, final=False):
         """Write the buffered path in one transaction.
 
@@ -485,11 +533,24 @@ class PaperDesk:
         entry_ts, so partial flushes reassemble in dt_ms order.
         """
         if pos.exec_path:
-            rows, pos.exec_path = pos.exec_path, []
+            rows = list(pos.exec_path)
             try:
                 store.insert_bid_path(rows)
             except Exception as exc:
+                # Keep the buffer.  Clearing before the write made a failed
+                # write lose the rows permanently; retrying on the next flush
+                # is the whole point of buffering.
+                pos.exec_path_flush_failed = True
                 self._report_error("bid_path", exc)
+            else:
+                pos.exec_path = pos.exec_path[len(rows):]
+                pos.exec_path_flush_failed = False
+        if final:
+            try:
+                samples = store.bid_path_for_trade(pos.tid)
+                store.set_trade_path_summary(pos.tid, store.bid_path_summary(samples))
+            except Exception as exc:
+                self._report_error("bid_path_summary", exc)
         if final and pos.exec_path_dropped:
             self._safe_log(
                 "paper",
@@ -505,19 +566,29 @@ class PaperDesk:
         now = time.time() if now is None else now
         if pos.max_executable_bid is not None and bid <= pos.max_executable_bid:
             return
-        pos.max_executable_bid = float(bid)
-        pos.max_executable_bid_ts = now
-        pos.mfe_c = max(0.0, float(bid) - pos.entry_px)
+        candidate_bid = float(bid)
+        candidate_ts = now
+        candidate_mfe = max(0.0, candidate_bid - pos.entry_px)
         try:
-            store.update_trade_high(pos.tid, pos.max_executable_bid, now)
+            store.update_trade_high(pos.tid, candidate_bid, candidate_ts)
         except Exception as exc:
+            # Do not advance the in-memory high on a failed write.  Doing so
+            # made every later quote compare against a high the database never
+            # accepted, so the write was never retried and the high was lost.
+            pos.high_dirty = True
             self._report_error("trade_high", exc)
+            return
+        pos.max_executable_bid = candidate_bid
+        pos.max_executable_bid_ts = candidate_ts
+        pos.mfe_c = candidate_mfe
+        pos.high_dirty = False
 
     def on_book(self, ticker, book):
         """Mark open positions on this market; handle target exits + shadow metrics."""
         for pos in [p for p in self.positions.values() if p.market == ticker]:
             bid = book.best_yes_bid() if pos.side == "yes" else book.best_no_bid()
             if bid is None:
+                self._record_exec_gap(pos, time.time())
                 continue
             self._observe_executable_high(pos, bid)
             self._record_exec_path(pos, book, bid, time.time())
@@ -725,6 +796,7 @@ class PaperDesk:
         }
 
     def _complete_realistic(self, pos, reason, final):
+        self._record_exec_terminal(pos, final.get("exit_px"), time.time())
         self._flush_exec_path(pos, final=True)
         self.positions.pop(pos.tid, None)
         self.pending_exits.pop(pos.tid, None)
@@ -746,6 +818,7 @@ class PaperDesk:
         store.close_trade(pos.tid, round(exit_px, 2), reason, round(gross, 2),
                           round(fees, 2), round(net, 2), round(pos.mae, 2),
                           pos.shadow_stop_hit_px)
+        self._record_exec_terminal(pos, round(exit_px, 2), time.time())
         self._flush_exec_path(pos, final=True)
         self.positions.pop(pos.tid, None)
         self.broadcast({"type": "trade_close", "trade": {

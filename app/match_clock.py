@@ -8,6 +8,7 @@ times are ignored.
 from dataclasses import dataclass
 import json
 import re
+import time
 
 from . import config
 
@@ -406,9 +407,19 @@ def stamp_from_observation(observation, event, signal_local_ts, mapped=True):
         raw_context={},
     )
     observed_ts = observation.get("observed_ts")
+    # observed_ts anchors lineage: it is the receipt time of the persisted row.
+    # confirmed_ts is the most recent poll that re-confirmed the same reading,
+    # and is what freshness must be measured against — otherwise a clock the
+    # provider is still actively confirming would age out on its own.
+    confirmed_ts = observation.get("confirmed_ts")
+    if not isinstance(confirmed_ts, (int, float)):
+        confirmed_ts = observed_ts
     age_ms = None
+    if isinstance(confirmed_ts, (int, float)) and isinstance(signal_local_ts, (int, float)):
+        age_ms = round((signal_local_ts - confirmed_ts) * 1000.0, 3)
+    established_age_ms = None
     if isinstance(observed_ts, (int, float)) and isinstance(signal_local_ts, (int, float)):
-        age_ms = round((signal_local_ts - observed_ts) * 1000.0, 3)
+        established_age_ms = round((signal_local_ts - observed_ts) * 1000.0, 3)
     accepted, outcome, usable, reason = evaluate_clock_gate(
         parsed, age_ms, mapped=mapped,
     )
@@ -426,8 +437,10 @@ def stamp_from_observation(observation, event, signal_local_ts, mapped=True):
         "provider_clock": parsed.provider_clock,
         "provider_status": parsed.provider_status,
         "observed_ts": observed_ts,
+        "confirmed_ts": confirmed_ts,
         "signal_local_ts": signal_local_ts,
         "age_ms": age_ms,
+        "established_age_ms": established_age_ms,
         "poll_uncertainty_ms": poll_uncertainty_ms,
         "source": observation.get("source") or CLOCK_SOURCE,
         "precision": observation.get("precision") or CLOCK_PRECISION,
@@ -446,7 +459,10 @@ class MatchClockTracker:
         self.last_identity = {}
         self.faults = {}
         self.clock_present = set()
-        self.clock_fresh = set()
+        # Last confirmation time per event.  Freshness is derived from this at
+        # query time, never cached as a boolean, so a clock cannot report fresh
+        # long after the provider stopped confirming it.
+        self.last_confirmed = {}
         self.clock_gate_candidate_misses = 0
         self.mapping_errors = {}
 
@@ -462,7 +478,7 @@ class MatchClockTracker:
         self.mapped.pop(event, None)
         self.last_identity.pop(event, None)
         self.clock_present.discard(event)
-        self.clock_fresh.discard(event)
+        self.last_confirmed.pop(event, None)
         self.faults.pop(event, None)
         self.mapping_errors.pop(event, None)
 
@@ -487,26 +503,45 @@ class MatchClockTracker:
             "source": CLOCK_SOURCE,
             "raw_context": parsed.raw_context if parsed else {},
         }
+        confirmed_ts = timing["received_wall"]
+        cached = self.latest.get(event)
+        if previous == identity and cached is not None:
+            # An unchanged poll confirms the existing reading; it does not create
+            # a new one.  Replacing the cache here would drop the persisted row
+            # id and advance observed_ts to a time with no database row, so the
+            # 88 gate would accept a clock with no lineage.  Only freshness moves.
+            cached["confirmed_ts"] = confirmed_ts
+            cached["previous_poll_ts"] = timing.get("previous_poll_ts")
+            cached["response_ms"] = timing["response_ms"]
+            self._mark_presence(event, parsed, confirmed_ts)
+            return None
+        observation["confirmed_ts"] = confirmed_ts
         self.latest[event] = dict(observation)
+        self._mark_presence(event, parsed, confirmed_ts)
+        self.last_identity[event] = identity
+        return observation
+
+    def _mark_presence(self, event, parsed, confirmed_ts):
+        """Track presence and the last confirmation time.
+
+        Freshness is deliberately NOT decided here.  Whether a clock is fresh
+        depends on how long ago it was confirmed, which is only knowable at
+        query time, and it must not be conflated with 88+ eligibility: a
+        perfectly fresh minute-70 clock is fresh and simply not yet eligible.
+        """
         if parsed and parsed.provider_minute is not None:
             self.clock_present.add(event)
         else:
             self.clock_present.discard(event)
-        age_ms = 0.0
-        _accepted, _outcome, usable, reason = evaluate_clock_gate(
-            parsed, age_ms, mapped=event in self.mapped,
-        )
-        if usable:
-            self.clock_fresh.add(event)
-            self.faults.pop(event, None)
+        self.last_confirmed[event] = confirmed_ts
+        if not (event in self.mapped):
+            self.faults[event] = "unmapped"
+        elif parsed is None:
+            self.faults[event] = "malformed"
+        elif parsed.provider_minute is None:
+            self.faults[event] = "missing_clock"
         else:
-            self.clock_fresh.discard(event)
-            if reason in {"stale", "unmapped", "malformed", "missing_clock"}:
-                self.faults[event] = reason
-        if previous == identity:
-            return None
-        self.last_identity[event] = identity
-        return observation
+            self.faults.pop(event, None)
 
     def ingest_synthetic(self, event, milestone_id, parsed, observed_ts, source):
         """Demo/test helper: install a clock without a live poll."""
@@ -535,20 +570,44 @@ class MatchClockTracker:
             result["observation_id"] = observation.get("id")
         return result
 
-    def coverage(self, watched_events=None):
+    def coverage(self, watched_events=None, now=None):
+        """Coverage as of `now`.
+
+        `clock_fresh` means the provider confirmed this clock recently enough to
+        still be trusted.  It is deliberately independent of the 88+ gate: a
+        minute-70 clock polled a moment ago is fresh and simply not yet
+        eligible.  Conflating the two reported a healthy feed as unhealthy and
+        a decayed clock as fresh.
+        """
+        now = time.time() if now is None else now
+        max_age_s = clock_max_age_ms() / 1000.0
         watched = set(watched_events or [])
         mapped = set(self.mapped) & watched if watched else set(self.mapped)
         present = self.clock_present & (watched or self.clock_present)
-        fresh = self.clock_fresh & (watched or self.clock_fresh)
+        scope = watched or set(self.last_confirmed)
+        fresh = {
+            event for event in scope
+            if event in self.clock_present
+            and isinstance(self.last_confirmed.get(event), (int, float))
+            and 0 <= (now - self.last_confirmed[event]) <= max_age_s
+        }
+        stale = {
+            event for event in scope
+            if event in self.clock_present and event not in fresh
+        }
+        faults = dict(self.faults)
+        for event in stale:
+            faults.setdefault(event, "stale")
         return {
             "watched": len(watched) if watched_events is not None else len(self.mapped),
             "mapped": len(mapped),
             "clock_present": len(present),
             "clock_fresh": len(fresh),
+            "clock_stale": len(stale),
             "clock_gate_candidate_misses": self.clock_gate_candidate_misses,
             "faults": [
                 {"event": event, "reason": reason}
-                for event, reason in sorted(self.faults.items())
+                for event, reason in sorted(faults.items())
                 if not watched or event in watched
             ],
             "mapping_errors": [

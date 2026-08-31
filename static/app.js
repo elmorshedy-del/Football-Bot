@@ -372,20 +372,36 @@ function tradeHighBlock(trade) {
   const mfeNet = finite(mfe) ? mfe : (finite(high) && finite(trade.entry_px) ? Math.max(0, high - trade.entry_px) : null);
   return `<div class="trade-high"><div><span>Max executable bid</span><strong>${cents(high)}</strong></div><div><span>MFE from entry</span><strong>${finite(mfeNet) ? cents(mfeNet) : "Not observed"}</strong></div><div><span>UTC time of high</span><strong>${escapeHtml(fullDate(highTs))}</strong></div><div><span>After entry</span><strong>${finite(secondsAfter) ? duration(secondsAfter) : "not derived"}</strong></div></div>`;
 }
+const pathCache = new Map();   // trade id -> samples, filled on demand
+async function loadTradePath(tradeId) {
+  if (pathCache.has(tradeId)) return pathCache.get(tradeId);
+  const payload = await apiJson(`/api/trades/${encodeURIComponent(tradeId)}/path`);
+  pathCache.set(tradeId, payload.samples || []);
+  return pathCache.get(tradeId);
+}
 function pathSparkline(trade) {
   // The path is what a scalar high cannot show: whether the peak was a spike
-  // or a plateau, and whether it was reachable in the held size.
+  // or a plateau, and whether it was reachable in the held size.  The list
+  // endpoint carries only the summary; samples arrive from the per-trade
+  // endpoint when the reader asks for them.
   const summary = trade.bid_path_summary;
-  const samples = trade.bid_path || [];
-  if (!summary || samples.length < 2) return "";
+  const samples = pathCache.get(trade.id) || [];
+  if (!summary) return "";
+  if (samples.length < 2) {
+    const reachablePending = finite(summary.peak_exec_px)
+      ? `${cents(summary.peak_exec_px)} for ${integer(trade.size)}` : "size not fillable at peak";
+    return `<div class="bid-path"><div class="bid-path-head"><span>Executable bid path</span><strong>${integer(summary.samples)} quotes over ${escapeHtml(duration((summary.span_ms || 0) / 1000))}</strong></div><button class="text-button" type="button" data-load-path="${escapeHtml(String(trade.id))}">Show path</button><div class="bid-path-facts"><div><span>Peak held</span><strong>${escapeHtml(relativeMs(summary.ms_at_peak))}</strong></div><div><span>Fillable at peak</span><strong>${escapeHtml(reachablePending)}</strong></div><div><span>Round trip</span><strong>${cents(summary.path_travelled_c)}</strong></div></div></div>`;
+  }
   const width = 320, height = 64, pad = 4;
-  const xs = samples.map(row => row.dt_ms), ys = samples.map(row => row.bid);
+  const priced = samples.filter(row => finite(row.bid));
+  if (priced.length < 2) return "";
+  const xs = priced.map(row => row.dt_ms), ys = priced.map(row => row.bid);
   const minX = Math.min(...xs), maxX = Math.max(...xs);
   const minY = Math.min(...ys, trade.entry_px), maxY = Math.max(...ys, trade.entry_px);
   const spanX = maxX - minX || 1, spanY = maxY - minY || 1;
   const px = value => pad + (value - minX) / spanX * (width - pad * 2);
   const py = value => pad + (maxY - value) / spanY * (height - pad * 2);
-  const d = samples.map((row, index) => `${index ? "L" : "M"}${px(row.dt_ms).toFixed(1)},${py(row.bid).toFixed(1)}`).join(" ");
+  const d = priced.map((row, index) => `${index ? "L" : "M"}${px(row.dt_ms).toFixed(1)},${py(row.bid).toFixed(1)}`).join(" ");
   const entryY = py(trade.entry_px).toFixed(1);
   const peakX = px(summary.peak_dt_ms).toFixed(1), peakY = py(summary.peak_bid).toFixed(1);
   const reachable = finite(summary.peak_exec_px) && finite(summary.peak_bid)
@@ -986,6 +1002,14 @@ document.querySelectorAll("[data-export-scope]").forEach(button => button.addEve
   const scope = button.dataset.exportScope || "audit";
   downloadExport(scope).catch(error => recordClientError(`Study export ${scope}`, error));
 }));
+document.addEventListener("click", event => {
+  const button = event.target.closest?.("[data-load-path]");
+  if (!button) return;
+  const tradeId = button.dataset.loadPath;
+  button.disabled = true; button.textContent = "Loading path…";
+  loadTradePath(tradeId).then(renderTrades)
+    .catch(error => { button.disabled = false; button.textContent = "Show path"; recordClientError("Trade path", error); });
+});
 byId("export-cancel-button")?.addEventListener("click", () => cancelActiveExport().catch(error => recordClientError("Study export cancel", error)));
 byId("market-search").addEventListener("input", renderMatches);
 byId("league-sort").addEventListener("change", renderLeagues);

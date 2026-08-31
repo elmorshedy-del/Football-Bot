@@ -15,10 +15,10 @@
 > `tests/test_spec_corrections.py` fails if this banner is removed.
 
 
-Status: **PLAN ONLY — implementation must not merge before independent final review**  
-Owner: next implementation agent  
-Final reviewer: Codex review requested by the repository owner  
-Scope: paper trading only; no live orders and no promise of profit
+- Status: **PLAN ONLY — implementation must not merge before independent final review**
+- Owner: next implementation agent
+- Final reviewer: Codex review requested by the repository owner
+- Scope: paper trading only; no live orders and no promise of profit
 
 ## 1. Confirmed production defects and evidence
 

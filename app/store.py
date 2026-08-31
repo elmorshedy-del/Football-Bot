@@ -119,11 +119,12 @@ def init():
     _conn.execute("PRAGMA journal_mode=WAL")
     _conn.executescript(SCHEMA)
     # migrate: add mode column to older DBs (persisted on a volume)
-    for tbl in ("signals", "trades"):
+    for tbl in ("signals", "trades", "match_clock_observations",
+                "provider_match_events", "goal_latency_observations"):
         try:
             _conn.execute(f"ALTER TABLE {tbl} ADD COLUMN mode TEXT")
         except sqlite3.OperationalError:
-            pass  # already exists
+            pass  # already exists, or the table is created later in init
     for column, definition in (
         ("remaining", "REAL"),
         ("realized_gross", "REAL DEFAULT 0"),
@@ -135,6 +136,7 @@ def init():
         ("strategy", "TEXT"),
         ("max_executable_bid", "REAL"),
         ("max_executable_bid_ts", "REAL"),
+        ("bid_path_summary", "TEXT"),
         ("mfe_c", "REAL"),
     ):
         try:
@@ -157,10 +159,11 @@ def init():
             )
         except sqlite3.OperationalError:
             pass
-    try:
-        _conn.execute("ALTER TABLE signals ADD COLUMN match_clock_snapshot TEXT")
-    except sqlite3.OperationalError:
-        pass
+    for column in ("match_clock_snapshot", "forward_path_summary"):
+        try:
+            _conn.execute(f"ALTER TABLE signals ADD COLUMN {column} TEXT")
+        except sqlite3.OperationalError:
+            pass
     _conn.executescript(
         """CREATE TABLE IF NOT EXISTS bid_path_samples(
              id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -240,8 +243,15 @@ def purge_non_live():
     """On a live boot, drop demo/legacy rows so live stats start clean.
     Live rows (mode='live') are preserved across redeploys; only demo/NULL go."""
     with _lock:
-        for tbl in ("signals", "trades"):
-            _conn.execute(f"DELETE FROM {tbl} WHERE mode IS NULL OR mode!='live'")
+        for tbl in ("signals", "trades", "bid_path_samples",
+                    "match_clock_observations", "provider_match_events",
+                    "goal_latency_observations"):
+            try:
+                _conn.execute(
+                    f"DELETE FROM {tbl} WHERE mode IS NULL OR mode!='live'"
+                )
+            except sqlite3.OperationalError:
+                pass  # table or column absent on an older volume
         # drop firehose-era junk: signals on markets we never registered
         _conn.execute("DELETE FROM signals WHERE event='?'")
         _conn.execute("DELETE FROM eventlog")
@@ -416,6 +426,21 @@ def insert_bid_path(rows):
     return len(payload)
 
 
+def set_trade_path_summary(trade_id, summary):
+    """Persist the derived summary once, at close.
+
+    Recomputing it per dashboard refresh meant one path query per listed trade
+    and could return millions of sample rows for a single /api/trades call.
+    """
+    ex("UPDATE trades SET bid_path_summary=? WHERE id=?",
+       (json.dumps(summary, separators=(",", ":")) if summary else None, trade_id))
+
+
+def set_signal_path_summary(signal_id, summary):
+    ex("UPDATE signals SET forward_path_summary=? WHERE id=?",
+       (json.dumps(summary, separators=(",", ":")) if summary else None, signal_id))
+
+
 def bid_path_for_trade(trade_id, limit=BID_PATH_MAX_SAMPLES):
     return q(
         """SELECT dt_ms,bid,bid_size,exec_px,qty FROM bid_path_samples
@@ -530,8 +555,8 @@ def insert_match_clock(row):
         """INSERT INTO match_clock_observations(
                observed_ts,poll_started_ts,previous_poll_ts,response_ms,event,milestone_id,
                provider_period,provider_minute,provider_stoppage,provider_clock,
-               provider_status,precision,raw_context)
-             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               provider_status,precision,raw_context,mode)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             row["observed_ts"], row["poll_started_ts"], row.get("previous_poll_ts"),
             row["response_ms"], row["event"], row["milestone_id"],
@@ -539,6 +564,7 @@ def insert_match_clock(row):
             row.get("provider_stoppage"), row.get("provider_clock"),
             row.get("provider_status"), row.get("precision") or "provider_minute_polled",
             json.dumps(row.get("raw_context") or {}, separators=(",", ":")),
+            _mode,
         ),
     )
     return cur.lastrowid

@@ -318,6 +318,58 @@ class AsyncExportJobTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(payload["ok"])
                 release.set()
 
+    async def test_prepare_does_not_stall_the_loop_with_a_slow_snapshot(self):
+        """B3: the previous test mocked the snapshot as instantaneous.
+
+        Recorder rotation, path enumeration and the SQLite backup all run before
+        the 202 is returned.  With a realistic 350 ms snapshot the event loop
+        recorded zero heartbeats instead of roughly 35, so live collection
+        paused for the whole preparation.
+        """
+        fake_engine = self._engine()
+        beats = 0
+        stop = asyncio.Event()
+
+        async def heartbeat():
+            nonlocal beats
+            while not stop.is_set():
+                await asyncio.sleep(0.01)
+                beats += 1
+
+        def slow_snapshot():
+            time.sleep(0.35)          # blocking, as a real sqlite backup is
+            path = Path(tempfile.gettempdir()) / "slow-snap.db"
+            path.write_bytes(b"db")
+            return str(path)
+
+        def slow_rotate(*args, **kwargs):
+            time.sleep(0.05)
+
+        fake_engine.recorder.checkpoint_for_export = slow_rotate
+        ticker = asyncio.create_task(heartbeat())
+        try:
+            with patch.object(main, "engine", fake_engine), \
+                    patch.object(main.exporter, "raw_feed_paths", return_value=[]), \
+                    patch.object(
+                        main.exporter, "prepare_database_snapshot",
+                        side_effect=slow_snapshot,
+                    ), patch.object(
+                        main.exporter, "build_study_bundle",
+                        side_effect=lambda *a, **k: (str(
+                            Path(tempfile.gettempdir()) / "b.zip"
+                        ), {}),
+                    ):
+                (Path(tempfile.gettempdir()) / "b.zip").write_bytes(b"PK")
+                await main.prepare_study_export(scope="full")
+        finally:
+            stop.set()
+            await ticker
+        # ~400 ms of blocking work at a 10 ms tick should yield tens of beats.
+        self.assertGreater(
+            beats, 20,
+            f"event loop stalled during export preparation ({beats} heartbeats)",
+        )
+
     async def test_raw_segment_range_and_traversal(self):
         with tempfile.TemporaryDirectory() as directory:
             raw_dir = Path(directory) / "raw"
