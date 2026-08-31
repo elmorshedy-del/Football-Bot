@@ -307,6 +307,7 @@ class GoalLatencyObserver:
         self.polls += 1
         self.last_poll_wall = received_wall
         self.last_response_ms = timing["response_ms"]
+        store.add_latency("match_response_ms", timing["response_ms"])
         for live_data in response.get("live_datas") or []:
             milestone_id = str(live_data.get("milestone_id") or "")
             if milestone_id not in self.events_by_milestone:

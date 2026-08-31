@@ -276,6 +276,14 @@ async def trades(limit: int = 200):
             r["schedule_window"] = schedule_window(signal)
             r["matched_event"] = match_signal_event(signal, observations)
             r["match_clock"] = parse_stored_stamp(signal.get("match_clock_snapshot"))
+        r["high_after_entry_s"] = (
+            round(r["max_executable_bid_ts"] - r["entry_ts"], 3)
+            if isinstance(r.get("max_executable_bid_ts"), (int, float))
+            and isinstance(r.get("entry_ts"), (int, float)) else None
+        )
+        if r.get("mfe_c") is None and r.get("max_executable_bid") is not None \
+                and r.get("entry_px") is not None:
+            r["mfe_c"] = max(0.0, r["max_executable_bid"] - r["entry_px"])
     for row in opens:
         signal = signal_rows.get(row.get("signal_id"))
         row.update(_display_names(
@@ -321,16 +329,21 @@ async def equity():
 
 @app.get("/api/latency")
 async def latency():
-    rows = store.q("SELECT kind, ms FROM latency ORDER BY ts DESC LIMIT 1000")
-    by = {}
-    for r in rows:
-        by.setdefault(r["kind"], []).append(r["ms"])
+    readiness = store.latency_readiness()
     out = {}
-    for k, v in by.items():
-        v = sorted(v)
-        out[k] = {"n": len(v), "p50": round(v[len(v) // 2], 1),
-                  "p95": round(v[int(0.95 * len(v))], 1) if len(v) > 20 else None,
-                  "hist": v[-200:]}
+    for kind, summary in readiness.items():
+        hist_aliases = store.LATENCY_KIND_ALIASES.get(kind, (kind,))
+        marks = ",".join("?" for _ in hist_aliases)
+        hist_rows = store.q(
+            f"""SELECT ms FROM latency WHERE kind IN ({marks})
+                 ORDER BY ts DESC LIMIT 200""",
+            hist_aliases,
+        )
+        out[kind] = {
+            **summary,
+            "hist": [row["ms"] for row in reversed(hist_rows)
+                     if isinstance(row.get("ms"), (int, float))],
+        }
     return out
 
 

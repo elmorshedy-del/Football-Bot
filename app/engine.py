@@ -361,6 +361,9 @@ class Engine:
             "detail": cand.get("detail") or {},
             "match_clock_snapshot": stamp,
         })
+        age = stamp.get("age_ms")
+        if isinstance(age, (int, float)):
+            store.add_latency("match_clock_age_ms", age)
         if announce:
             self._announce_signal(sid, cand, lag, outcome)
         return sid
@@ -630,14 +633,18 @@ class Engine:
     async def paper_execution_task(self):
         """Low-jitter clock for opt-in paper order arrivals."""
         delay = max(config.PAPER_EXECUTION_POLL_MS, 1.0) / 1000.0
+        next_due = time.monotonic()
         while True:
+            started = time.monotonic()
+            store.add_latency("scheduler_lag_ms", max(0.0, (started - next_due) * 1000.0))
             try:
                 self.desk.process_pending(self.books)
             except Exception as exc:
                 self._record_error("paper_execution", exc)
                 store.log_event("paper", f"execution adapter error: {exc!r}")
                 self.broadcast({"type": "log", "text": f"paper execution error: {exc!r}"})
-            await asyncio.sleep(delay)
+            next_due = started + delay
+            await asyncio.sleep(max(next_due - time.monotonic(), 0.0))
 
     def status(self):
         lat = sorted(self.feed_lag)
@@ -667,6 +674,12 @@ class Engine:
         recent_errors = [row for row in self.errors if row["ts"] >= recent_cutoff]
         execution_errors = [row for row in recent_errors
                             if row["component"].startswith("paper")]
+        try:
+            latency_readiness = store.latency_readiness()
+        except Exception:
+            latency_readiness = {}
+        k4 = latency_readiness.get("order_arrival_ms") or {"state": "COLLECTING"}
+        k4_blocking = k4.get("state") in {"BREACH", "INVALID"}
         checks = {
             "websocket": {"healthy": ws_healthy, "status": self.ws_state},
             "recorder": {"healthy": bool(recorder.get("healthy")),
@@ -700,8 +713,31 @@ class Engine:
                 "healthy": not recent_errors,
                 "status": "clear" if not recent_errors else f"{len(recent_errors)} recent",
             },
+            "latency_evidence": {
+                "healthy": not k4_blocking,
+                "status": k4.get("state") or "COLLECTING",
+                "p95_ms": k4.get("p95"),
+                "n": k4.get("n"),
+                "threshold_ms": k4.get("threshold_ms"),
+            },
         }
-        system_healthy = all(check["healthy"] for check in checks.values())
+        runtime_ok = all(
+            check["healthy"] for name, check in checks.items() if name != "latency_evidence"
+        )
+        system_healthy = runtime_ok and not k4_blocking
+        k4_state = k4.get("state") or "COLLECTING"
+        if not runtime_ok:
+            banner = "attention_required"
+            banner_text = "Attention required"
+        elif k4_blocking:
+            banner = "latency_breach"
+            banner_text = "Runtime healthy · execution latency breached"
+        elif k4_state in {"COLLECTING", "STALE"}:
+            banner = "evidence_not_ready"
+            banner_text = "Runtime healthy · paper evidence not ready"
+        else:
+            banner = "all_systems_good"
+            banner_text = "All systems good"
         return {"mode": self.mode, "ws": self.ws_state, "uptime_s": int(time.time() - self.started),
                 "markets": len(self.meta), "matches": len(self.event_markets),
                 "trades_seen": self.n_trades, "recorded": self.recorder.total,
@@ -713,8 +749,15 @@ class Engine:
                 "price_only_sleeve": config.PRICE_ONLY_SLEEVE_MODE,
                 "goal_latency": goal,
                 "clock_coverage": clock_coverage,
-                "health": {"ok": system_healthy, "checks": checks,
-                           "recent_errors": list(reversed(recent_errors[-20:]))},
+                "latency_readiness": latency_readiness,
+                "health": {
+                    "ok": system_healthy,
+                    "runtime_ok": runtime_ok,
+                    "banner": banner,
+                    "banner_text": banner_text,
+                    "checks": checks,
+                    "recent_errors": list(reversed(recent_errors[-20:])),
+                },
                 "feed_lag_p50": round(lat[len(lat) // 2], 1) if lat else None,
                 "feed_lag_p95": round(lat[int(0.95 * len(lat))], 1) if len(lat) > 20 else None}
 

@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS trades(
   book_at_entry TEXT, status TEXT DEFAULT 'open',
   remaining REAL, realized_gross REAL DEFAULT 0, accrued_fees REAL DEFAULT 0,
   exit_qty REAL DEFAULT 0, exit_vwap_num REAL DEFAULT 0,
-  fee_type TEXT, fee_multiplier REAL, strategy TEXT);
+  fee_type TEXT, fee_multiplier REAL, strategy TEXT,
+  max_executable_bid REAL, max_executable_bid_ts REAL, mfe_c REAL);
 CREATE TABLE IF NOT EXISTS paper_fills(
   id INTEGER PRIMARY KEY AUTOINCREMENT, trade_id INTEGER, signal_id INTEGER,
   ts REAL, leg TEXT, side TEXT, price REAL, quantity REAL, notional REAL,
@@ -132,6 +133,9 @@ def init():
         ("fee_type", "TEXT"),
         ("fee_multiplier", "REAL"),
         ("strategy", "TEXT"),
+        ("max_executable_bid", "REAL"),
+        ("max_executable_bid_ts", "REAL"),
+        ("mfe_c", "REAL"),
     ):
         try:
             _conn.execute(f"ALTER TABLE trades ADD COLUMN {column} {definition}")
@@ -267,8 +271,113 @@ def log_event(kind, text):
     ex("INSERT INTO eventlog(ts,kind,text) VALUES(?,?,?)", (time.time(), kind, text))
 
 
+LATENCY_KIND_CANONICAL = {
+    "feed_lag": "feed_ingress_ms",
+    "paper_entry": "paper_entry_ms",
+    "order_arrival": "order_arrival_ms",
+    "paper_exit": "paper_exit_ms",
+}
+LATENCY_KIND_ALIASES = {
+    "feed_ingress_ms": ("feed_ingress_ms", "feed_lag"),
+    "decision_ms": ("decision_ms",),
+    "paper_entry_ms": ("paper_entry_ms", "paper_entry"),
+    "order_arrival_ms": ("order_arrival_ms", "order_arrival"),
+    "paper_exit_ms": ("paper_exit_ms", "paper_exit"),
+    "match_response_ms": ("match_response_ms",),
+    "match_clock_age_ms": ("match_clock_age_ms",),
+    "scheduler_lag_ms": ("scheduler_lag_ms",),
+}
+LATENCY_KINDS = tuple(LATENCY_KIND_ALIASES)
+K4_THRESHOLD_MS = 250.0
+LATENCY_MIN_SAMPLES = 20
+LATENCY_STALE_AFTER_S = 300.0
+
+
 def add_latency(kind, ms):
-    ex("INSERT INTO latency(ts,kind,ms) VALUES(?,?,?)", (time.time(), kind, ms))
+    kind = LATENCY_KIND_CANONICAL.get(kind, kind)
+    now = time.time()
+    valid = (
+        isinstance(ms, (int, float)) and not isinstance(ms, bool)
+        and ms == ms and ms not in (float("inf"), float("-inf")) and ms >= 0
+    )
+    stored_kind = kind if valid else f"{kind}_invalid"
+    stored_ms = float(ms) if isinstance(ms, (int, float)) and not isinstance(ms, bool) else None
+    ex("INSERT INTO latency(ts,kind,ms) VALUES(?,?,?)", (now, stored_kind, stored_ms))
+
+
+def _percentile(values, p):
+    if not values:
+        return None
+    values = sorted(values)
+    return values[min(len(values) - 1, int(p * len(values)))]
+
+
+def latency_kind_summary(kind, limit=500, now=None, threshold_ms=None):
+    now = time.time() if now is None else now
+    aliases = LATENCY_KIND_ALIASES.get(kind, (kind,))
+    marks = ",".join("?" for _ in aliases)
+    rows = q(
+        f"""SELECT ts, ms FROM latency WHERE kind IN ({marks})
+             ORDER BY ts DESC LIMIT ?""",
+        (*aliases, limit),
+    )
+    invalid = q(
+        f"""SELECT COUNT(*) AS n FROM latency WHERE kind=?""",
+        (f"{kind}_invalid",),
+    )[0]["n"]
+    values = [row["ms"] for row in rows if isinstance(row.get("ms"), (int, float))]
+    latest_ts = rows[0]["ts"] if rows else None
+    age_s = (now - latest_ts) if latest_ts is not None else None
+    threshold = K4_THRESHOLD_MS if threshold_ms is None and kind == "order_arrival_ms" else threshold_ms
+    p95 = _percentile(values, 0.95)
+    if invalid and not values:
+        state = "INVALID"
+    elif not values or len(values) < LATENCY_MIN_SAMPLES:
+        state = "COLLECTING"
+    elif age_s is not None and age_s > LATENCY_STALE_AFTER_S:
+        state = "STALE"
+    elif threshold is not None and p95 is not None and p95 >= threshold:
+        state = "BREACH"
+    else:
+        state = "PASS"
+    return {
+        "kind": kind,
+        "n": len(values),
+        "p50": _percentile(values, 0.50),
+        "p95": p95,
+        "max": max(values) if values else None,
+        "invalid": invalid,
+        "latest_ts": latest_ts,
+        "age_s": round(age_s, 3) if age_s is not None else None,
+        "threshold_ms": threshold,
+        "state": state,
+    }
+
+
+def latency_readiness(limit=500, now=None):
+    return {kind: latency_kind_summary(kind, limit=limit, now=now) for kind in LATENCY_KINDS}
+
+
+def update_trade_high(tid, bid, ts):
+    """Persist a new executable high only when it strictly exceeds the stored high."""
+    with _lock:
+        row = _conn.execute(
+            """SELECT max_executable_bid, entry_px FROM trades WHERE id=?""",
+            (tid,),
+        ).fetchone()
+        if row is None or bid is None:
+            return False
+        current, entry_px = row
+        if current is not None and bid <= current:
+            return False
+        mfe = max(0.0, float(bid) - float(entry_px or 0.0))
+        _conn.execute(
+            """UPDATE trades SET max_executable_bid=?, max_executable_bid_ts=?, mfe_c=?
+                WHERE id=?""",
+            (float(bid), float(ts), mfe, tid),
+        )
+        _conn.commit()
+        return True
 
 
 def insert_goal_latency(row):
@@ -426,10 +535,10 @@ def finish_paper_signal(signal_id, outcome, detail, latency_ms, order_arrival_ms
             _conn.execute("UPDATE signals SET outcome=?, detail=? WHERE id=?",
                           (outcome, json.dumps(detail or {}), signal_id))
             _conn.execute("INSERT INTO latency(ts,kind,ms) VALUES(?,?,?)",
-                          (time.time(), "paper_entry", latency_ms))
+                          (time.time(), "paper_entry_ms", latency_ms))
             if order_arrival_ms is not None:
                 _conn.execute("INSERT INTO latency(ts,kind,ms) VALUES(?,?,?)",
-                              (time.time(), "order_arrival", order_arrival_ms))
+                              (time.time(), "order_arrival_ms", order_arrival_ms))
             _conn.commit()
         except Exception:
             _conn.rollback()
@@ -466,10 +575,10 @@ def open_paper_trade(t, detail, fill_levels, entry_fee, latency_ms, order_arriva
             _conn.execute("UPDATE signals SET outcome='filled', detail=? WHERE id=?",
                           (json.dumps(detail or {}), t["signal_id"]))
             _conn.execute("INSERT INTO latency(ts,kind,ms) VALUES(?,?,?)",
-                          (time.time(), "paper_entry", latency_ms))
+                          (time.time(), "paper_entry_ms", latency_ms))
             if order_arrival_ms is not None:
                 _conn.execute("INSERT INTO latency(ts,kind,ms) VALUES(?,?,?)",
-                              (time.time(), "order_arrival", order_arrival_ms))
+                              (time.time(), "order_arrival_ms", order_arrival_ms))
             for price, quantity, fee in fill_levels:
                 _conn.execute(
                     """INSERT INTO paper_fills(trade_id,signal_id,ts,leg,side,price,quantity,
@@ -507,7 +616,7 @@ def record_paper_exit(tid, signal_id, side, ts, reason, fill_levels, progress,
                 fields,
             )
             _conn.execute("INSERT INTO latency(ts,kind,ms) VALUES(?,?,?)",
-                          (time.time(), "paper_exit", latency_ms))
+                          (time.time(), "paper_exit_ms", latency_ms))
             if final is not None:
                 _conn.execute(
                     """UPDATE trades SET exit_ts=?, exit_px=?, exit_reason=?, gross=?, fees=?,
@@ -611,18 +720,28 @@ def _event_cluster_ci(closed):
 
 
 def _latency_evidence():
-    lat_kind = "order_arrival"
-    lat = q("SELECT ms FROM latency WHERE kind=? ORDER BY ts DESC LIMIT 500", (lat_kind,))
-    if not lat:
-        lat_kind = "feed_lag"
-        lat = q("SELECT ms FROM latency WHERE kind=? ORDER BY ts DESC LIMIT 500", (lat_kind,))
-    lat_ms = sorted(x["ms"] for x in lat)
-    p95 = lat_ms[int(0.95 * len(lat_ms))] if lat_ms else None
+    summary = latency_kind_summary("order_arrival_ms")
+    source = "order_arrival_ms"
+    if summary["n"] == 0:
+        summary = latency_kind_summary("feed_ingress_ms")
+        source = "feed_ingress_ms" if summary["n"] else "order_arrival_ms"
+    status = summary["state"]
+    if status == "PASS":
+        legacy = "OK"
+    elif status == "BREACH":
+        legacy = "BREACH"
+    else:
+        legacy = status
     return {
-        "p95_ms": p95,
-        "source": lat_kind,
-        "status": "OK" if (p95 is None or p95 < 250) else "BREACH",
+        "p95_ms": summary["p95"],
+        "source": source,
+        "status": legacy,
+        "state": summary["state"],
+        "n": summary["n"],
+        "invalid": summary["invalid"],
+        "threshold_ms": summary["threshold_ms"],
         "scope": "shared_execution_adapter",
+        "kinds": latency_readiness(),
     }
 
 

@@ -77,6 +77,9 @@ class Position:
         self.sleeve_anchor_bid = None
         self.peak_bid = entry_px
         self.bid_path = deque(maxlen=240)
+        self.max_executable_bid = None
+        self.max_executable_bid_ts = None
+        self.mfe_c = None
 
     def unrealized(self, bid):
         return self.realized_gross + (bid - self.entry_px) * self.remaining / 100.0
@@ -159,6 +162,9 @@ class PaperDesk:
             pos.exit_vwap_num = float(row["exit_vwap_num"] or 0.0)
             pos.mae = float(row["mae"] or 0.0)
             pos.shadow_stop_hit_px = row["shadow_stop_px"]
+            pos.max_executable_bid = row.get("max_executable_bid")
+            pos.max_executable_bid_ts = row.get("max_executable_bid_ts")
+            pos.mfe_c = row.get("mfe_c")
             self.positions[pos.tid] = pos
         if self.positions:
             self._safe_log("paper", f"restored {len(self.positions)} open paper positions")
@@ -407,7 +413,29 @@ class PaperDesk:
                 "size": round(pos.remaining if self.realistic else pos.size, 1),
                 "initial_size": round(pos.initial_size, 1), "entry_ts": pos.entry_ts,
                 "bid": bid, "upnl": round(pos.unrealized(bid), 2) if bid is not None else None,
-                "strategy": pos.strategy}
+                "strategy": pos.strategy,
+                "max_executable_bid": pos.max_executable_bid,
+                "max_executable_bid_ts": pos.max_executable_bid_ts,
+                "mfe_c": pos.mfe_c,
+                "high_after_entry_s": (
+                    round(pos.max_executable_bid_ts - pos.entry_ts, 3)
+                    if pos.max_executable_bid_ts is not None else None
+                )}
+
+    def _observe_executable_high(self, pos, bid, now=None):
+        """Record the highest executable held-side bid after entry fill."""
+        if bid is None:
+            return
+        now = time.time() if now is None else now
+        if pos.max_executable_bid is not None and bid <= pos.max_executable_bid:
+            return
+        pos.max_executable_bid = float(bid)
+        pos.max_executable_bid_ts = now
+        pos.mfe_c = max(0.0, float(bid) - pos.entry_px)
+        try:
+            store.update_trade_high(pos.tid, pos.max_executable_bid, now)
+        except Exception as exc:
+            self._report_error("trade_high", exc)
 
     def on_book(self, ticker, book):
         """Mark open positions on this market; handle target exits + shadow metrics."""
@@ -415,6 +443,7 @@ class PaperDesk:
             bid = book.best_yes_bid() if pos.side == "yes" else book.best_no_bid()
             if bid is None:
                 continue
+            self._observe_executable_high(pos, bid)
             pos.best_bid = bid
             adverse = pos.entry_px - bid
             if adverse > pos.mae:
