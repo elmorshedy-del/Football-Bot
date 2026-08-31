@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import tempfile
 import zipfile
@@ -24,6 +25,12 @@ TABLES = (
     "provider_match_events",
     "eventlog",
 )
+_RAW_NAME = re.compile(r"^feed-\d{8}-\d{2}(?:-part-\d+)?\.jsonl\.gz$")
+_CHUNK = 1024 * 1024
+
+
+class ExportCancelled(Exception):
+    """Raised when an in-flight study export is cancelled by the operator."""
 
 
 def non_secret_config():
@@ -32,8 +39,6 @@ def non_secret_config():
         "DL_MIN", "LEVELS_MIN", "SIZE_MIN", "CONF_MS", "CONF_SIGN",
         "PRICE_CAP", "NOTIONAL_USD", "TARGET", "TIMEOUT_S", "LOCKOUT_S",
         "EPISODE_COOLDOWN_S", "LATE_ONLY", "LATE_WINDOW_MIN", "USE_STOP",
-        "STOP_FRAC", "FEE_EXIT_TAKER", "PRICE_ONLY_SLEEVE_MODE",
-        "SLEEVE_START_BEFORE_EXPIRY_MIN", "SLEEVE_AFTER_EXPIRY_MIN",
         "STOP_FRAC", "FEE_EXIT_TAKER", "PRICE_ONLY_SLEEVE_MODE",
         "SLEEVE_START_BEFORE_EXPIRY_MIN", "SLEEVE_AFTER_EXPIRY_MIN",
         "SLEEVE_BASELINE_MS", "SLEEVE_MAX_BASELINE_AGE_MS",
@@ -80,13 +85,23 @@ def _jsonl_bytes(rows):
 def _sha256(path):
     digest = hashlib.sha256()
     with open(path, "rb") as source:
-        for block in iter(lambda: source.read(1024 * 1024), b""):
+        for block in iter(lambda: source.read(_CHUNK), b""):
             digest.update(block)
     return digest.hexdigest()
 
 
 def _sha256_bytes(content):
     return hashlib.sha256(content).hexdigest()
+
+
+def _ensure_not_cancelled(cancel_check):
+    if cancel_check and cancel_check():
+        raise ExportCancelled()
+
+
+def _emit_progress(progress, **payload):
+    if progress:
+        progress(payload)
 
 
 def prepare_database_snapshot():
@@ -116,30 +131,118 @@ def raw_feed_paths():
             if path.is_file() and not path.is_symlink()]
 
 
-def build_study_bundle(output_path=None, mode=None, raw_paths=None, snapshot_path=None):
-    """Return ``(zip_path, manifest)`` for a consistent study snapshot."""
+def raw_inventory(paths=None):
+    """Return raw segment metadata without copying bodies."""
+    items = []
+    for path in (raw_feed_paths() if paths is None else [Path(p) for p in paths]):
+        if not path.is_file() or path.is_symlink():
+            continue
+        items.append({
+            "file": f"raw/{path.name}",
+            "name": path.name,
+            "bytes": path.stat().st_size,
+            "included": False,
+        })
+    return items
+
+
+def safe_raw_segment_path(name):
+    """Resolve a recorder segment inside DATA_DIR/raw; reject traversal."""
+    if not name or "/" in name or "\\" in name or name in {".", ".."}:
+        return None
+    if not _RAW_NAME.match(name):
+        return None
+    raw_dir = (Path(config.DATA_DIR) / "raw").resolve()
+    candidate = (raw_dir / name).resolve()
+    try:
+        candidate.relative_to(raw_dir)
+    except ValueError:
+        return None
+    if not candidate.is_file() or candidate.is_symlink():
+        return None
+    return candidate
+
+
+def _copy_raw_stored(archive, source_path, arcname, progress, cancel_check,
+                     processed_bytes, total_bytes, processed_segments, total_segments):
+    """Copy one already-gzipped segment with ZIP64 STORED while hashing it."""
+    info = zipfile.ZipInfo.from_file(str(source_path), arcname)
+    info.compress_type = zipfile.ZIP_STORED
+    digest = hashlib.sha256()
+    copied = 0
+    with archive.open(info, "w") as dest, open(source_path, "rb") as source:
+        while True:
+            _ensure_not_cancelled(cancel_check)
+            chunk = source.read(_CHUNK)
+            if not chunk:
+                break
+            dest.write(chunk)
+            digest.update(chunk)
+            copied += len(chunk)
+            _emit_progress(
+                progress,
+                processed_bytes=processed_bytes + copied,
+                total_bytes=total_bytes,
+                processed_segments=processed_segments,
+                total_segments=total_segments,
+            )
+    return digest.hexdigest(), copied
+
+
+def build_study_bundle(output_path=None, mode=None, raw_paths=None, snapshot_path=None,
+                       include_raw=True, progress=None, cancel_check=None, scope="full"):
+    """Return ``(zip_path, manifest)`` for a consistent study snapshot.
+
+    ``scope="audit"`` / ``include_raw=False`` builds the audit product: tables
+    plus a raw inventory, without copying WebSocket segment bodies.
+    """
+    scope = (scope or ("full" if include_raw else "audit")).lower()
+    if scope not in {"audit", "full"}:
+        scope = "full" if include_raw else "audit"
+    include_raw = scope == "full"
     exports_dir = Path(config.DATA_DIR) / "exports"
     exports_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     if output_path is None:
+        prefix = "football-audit-" if scope == "audit" else "football-study-"
         fd, generated = tempfile.mkstemp(
-            prefix=f"football-study-{stamp}-", suffix=".zip", dir=exports_dir,
+            prefix=f"{prefix}{stamp}-", suffix=".zip", dir=exports_dir,
         )
         os.close(fd)
         output_path = generated
     output_path = str(output_path)
     snapshot_path = snapshot_path or prepare_database_snapshot()
     try:
+        _ensure_not_cancelled(cancel_check)
         connection = sqlite3.connect(snapshot_path)
         try:
             schema_rows = connection.execute(
                 "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name"
             ).fetchall()
             schema_text = ";\n\n".join(row[0].rstrip(";") for row in schema_rows) + ";\n"
+            selected_raw = [
+                path for path in (
+                    raw_feed_paths() if raw_paths is None else [Path(path) for path in raw_paths]
+                )
+                if path.is_file() and not path.is_symlink()
+            ]
+            total_segments = len(selected_raw) if include_raw else 0
+            total_bytes = (
+                sum(path.stat().st_size for path in selected_raw) if include_raw else 0
+            )
+            _emit_progress(
+                progress,
+                processed_bytes=0,
+                total_bytes=total_bytes,
+                processed_segments=0,
+                total_segments=total_segments,
+            )
             manifest = {
                 "schema": EXPORT_SCHEMA,
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "mode": mode or "unknown",
+                "scope": scope,
+                "include_raw": include_raw,
                 "paper_only": True,
                 "guarantee": "none",
                 "configuration": non_secret_config(),
@@ -158,8 +261,10 @@ def build_study_bundle(output_path=None, mode=None, raw_paths=None, snapshot_pat
                     "provider_observation_time_is_not_event_occurrence_time": True,
                 },
             }
-            with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED,
-                                 compresslevel=6) as archive:
+            with zipfile.ZipFile(
+                output_path, "w", compression=zipfile.ZIP_DEFLATED,
+                compresslevel=6, allowZip64=True,
+            ) as archive:
                 archive.write(snapshot_path, manifest["files"]["sqlite_snapshot"])
                 archive.writestr(manifest["files"]["sqlite_schema"], schema_text)
                 manifest["artifacts"][manifest["files"]["sqlite_snapshot"]] = {
@@ -172,6 +277,7 @@ def build_study_bundle(output_path=None, mode=None, raw_paths=None, snapshot_pat
                     "bytes": len(schema_bytes),
                 }
                 for table in TABLES:
+                    _ensure_not_cancelled(cancel_check)
                     columns, rows = _rows(connection, table)
                     csv_name = f"tables/{table}.csv"
                     jsonl_name = f"tables/{table}.jsonl"
@@ -192,27 +298,38 @@ def build_study_bundle(output_path=None, mode=None, raw_paths=None, snapshot_pat
                             "sha256": _sha256_bytes(content),
                             "bytes": len(content),
                         }
-                selected_raw = raw_feed_paths() if raw_paths is None else [
-                    Path(path) for path in raw_paths
-                ]
-                for path in selected_raw:
-                    if not path.is_file() or path.is_symlink():
-                        continue
-                    archived = f"raw/{path.name}"
-                    # Recorder segments are already gzip-compressed. Re-deflating
-                    # them is expensive on long-running volumes and provides no
-                    # meaningful size reduction.
-                    archive.write(path, archived, compress_type=zipfile.ZIP_STORED)
-                    raw_sha256 = _sha256(path)
-                    manifest["raw_feed"].append({
-                        "file": archived,
-                        "bytes": path.stat().st_size,
-                        "sha256": raw_sha256,
-                    })
-                    manifest["artifacts"][archived] = {
-                        "sha256": raw_sha256,
-                        "bytes": path.stat().st_size,
-                    }
+                if include_raw:
+                    processed_bytes = 0
+                    for index, path in enumerate(selected_raw):
+                        _ensure_not_cancelled(cancel_check)
+                        archived = f"raw/{path.name}"
+                        raw_sha256, copied = _copy_raw_stored(
+                            archive, path, archived, progress, cancel_check,
+                            processed_bytes, total_bytes, index, total_segments,
+                        )
+                        processed_bytes += copied
+                        manifest["raw_feed"].append({
+                            "file": archived,
+                            "name": path.name,
+                            "bytes": copied,
+                            "sha256": raw_sha256,
+                            "included": True,
+                        })
+                        manifest["artifacts"][archived] = {
+                            "sha256": raw_sha256,
+                            "bytes": copied,
+                        }
+                        _emit_progress(
+                            progress,
+                            processed_bytes=processed_bytes,
+                            total_bytes=total_bytes,
+                            processed_segments=index + 1,
+                            total_segments=total_segments,
+                        )
+                else:
+                    for item in raw_inventory(selected_raw):
+                        manifest["raw_feed"].append(item)
+                _ensure_not_cancelled(cancel_check)
                 handoff = Path(__file__).resolve().parents[1] / "docs" / \
                     "PRICE_ONLY_BACKTEST_HANDOFF.md"
                 archive.write(handoff, manifest["files"]["backtest_handoff"])
@@ -220,13 +337,19 @@ def build_study_bundle(output_path=None, mode=None, raw_paths=None, snapshot_pat
                     "sha256": _sha256(handoff),
                     "bytes": handoff.stat().st_size,
                 }
-                readme = (
-                    "Paper-study data export. Start with manifest.json and "
-                    "docs/PRICE_ONLY_BACKTEST_HANDOFF.md. No return is guaranteed.\n"
-                ).encode("utf-8")
-                archive.writestr(
-                    "README.txt", readme,
-                )
+                if include_raw:
+                    readme = (
+                        "Paper-study data export including raw WebSocket segments. "
+                        "Start with manifest.json and docs/PRICE_ONLY_BACKTEST_HANDOFF.md. "
+                        "No return is guaranteed.\n"
+                    ).encode("utf-8")
+                else:
+                    readme = (
+                        "Paper-study audit export. Raw WebSocket segment bodies are listed "
+                        "in manifest.json but not copied. Download segments separately or "
+                        "request the full handoff. No return is guaranteed.\n"
+                    ).encode("utf-8")
+                archive.writestr("README.txt", readme)
                 manifest["artifacts"]["README.txt"] = {
                     "sha256": _sha256_bytes(readme),
                     "bytes": len(readme),

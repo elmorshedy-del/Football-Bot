@@ -4,11 +4,12 @@ import json
 import os
 import re
 import secrets
+import threading
 import time
 from contextlib import asynccontextmanager, suppress
 
 from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
@@ -29,7 +30,12 @@ _clients = set()
 _queue = asyncio.Queue(maxsize=2000)
 engine = None
 _export_job = None
+_export_jobs = {}
 _export_tasks = set()
+_export_lock = threading.Lock()
+_raw_download_token = secrets.token_urlsafe(32)
+EXPORT_JOB_TTL_S = 3600
+_RANGE_SPEC = re.compile(r"bytes=(\d*)-(\d*)\Z")
 
 
 def require_admin(x_admin_token: str | None = Header(default=None)):
@@ -53,6 +59,8 @@ async def lifespan(_app):
         pump_task.cancel()
         with suppress(asyncio.CancelledError):
             await pump_task
+        for task in tuple(_export_tasks):
+            task.cancel()
         with suppress(OSError):
             engine.recorder.close()
         await engine.client.close()
@@ -404,6 +412,8 @@ async def provider_events(limit: int = 100):
 
 
 def _remove_export(path):
+    if not path:
+        return
     try:
         os.unlink(path)
     except OSError:
@@ -413,79 +423,328 @@ def _remove_export(path):
 def _public_export_job(job):
     return {
         "job_id": job["job_id"],
+        "scope": job.get("scope") or "full",
         "status": job["status"],
         "created_at": job["created_at"],
         "bytes": job.get("bytes"),
+        "processed_bytes": job.get("processed_bytes") or 0,
+        "total_bytes": job.get("total_bytes") or 0,
+        "processed_segments": job.get("processed_segments") or 0,
+        "total_segments": job.get("total_segments") or 0,
         "error": job.get("error"),
+        "error_code": job.get("error_code"),
     }
 
 
-async def _build_export_job(job_id, mode, raw_paths, snapshot_path):
-    global _export_job
-    try:
-        path, _manifest = await asyncio.to_thread(
-            exporter.build_study_bundle, None, mode, raw_paths, snapshot_path,
-        )
-    except Exception as exc:  # noqa: BLE001 - surface failure without stopping collection
-        if _export_job and _export_job.get("job_id") == job_id:
-            _export_job.update(status="error", error="Study export preparation failed.")
-        engine._record_error("study_export", exc)
-        return
-    if not _export_job or _export_job.get("job_id") != job_id:
-        _remove_export(path)
-        return
-    _export_job.update(status="ready", path=path, bytes=os.path.getsize(path), error=None)
-
-
-@app.post("/api/export/prepare", dependencies=[Depends(require_admin)], status_code=202)
-async def prepare_study_export():
-    """Start one non-blocking export job and return a pollable identifier."""
-    global _export_job
-    if _export_job and _export_job.get("status") == "preparing":
+def _lookup_job(job_id):
+    if not job_id:
+        return None
+    job = _export_jobs.get(job_id)
+    if job is None and _export_job and _export_job.get("job_id") == job_id:
         job = _export_job
-    else:
-        if _export_job and _export_job.get("path"):
-            _remove_export(_export_job["path"])
-        try:
-            engine.recorder.checkpoint_for_export()
-            raw_paths = exporter.raw_feed_paths()
-            snapshot_path = exporter.prepare_database_snapshot()
-        except Exception as exc:  # noqa: BLE001 - keep collection alive and expose the fault
-            engine._record_error("study_export", exc)
-            raise HTTPException(
-                status_code=500,
-                detail="Study export failed; see System status for the recorded fault.",
-            ) from exc
-        job = {
-            "job_id": secrets.token_urlsafe(18),
-            "download_token": secrets.token_urlsafe(32),
-            "status": "preparing",
-            "created_at": time.time(),
-            "path": None,
-            "bytes": None,
-            "error": None,
-        }
-        _export_job = job
-        task = asyncio.create_task(_build_export_job(
-            job["job_id"], engine.mode, raw_paths, snapshot_path,
-        ))
-        _export_tasks.add(task)
-        task.add_done_callback(_export_tasks.discard)
-    response = JSONResponse(_public_export_job(job), status_code=202)
+    if job is None:
+        return None
+    if not secrets.compare_digest(job_id, job["job_id"]):
+        return None
+    return job
+
+
+def _active_full_job():
+    for job in _export_jobs.values():
+        if job.get("scope") == "full" and job.get("status") in {"queued", "preparing"}:
+            return job
+    if _export_job and _export_job.get("scope") == "full" and \
+            _export_job.get("status") in {"queued", "preparing"}:
+        return _export_job
+    return None
+
+
+def _export_cookie_path(job_id):
+    return f"/api/export/jobs/{job_id}"
+
+
+def _set_export_cookie(response, job):
     response.set_cookie(
-        "footballbot_export_job", job["download_token"], max_age=3600,
-        httponly=True, secure=True, samesite="strict", path="/api/export/jobs",
+        "footballbot_export_job", job["download_token"], max_age=EXPORT_JOB_TTL_S,
+        httponly=True, secure=True, samesite="strict",
+        path=_export_cookie_path(job["job_id"]),
     )
     return response
 
 
+def _release_export_lease(job_id, path=None):
+    job = _lookup_job(job_id)
+    if job is None:
+        if path:
+            _remove_export(path)
+        return
+    with _export_lock:
+        job["leases"] = max(0, int(job.get("leases") or 0) - 1)
+        status = job.get("status")
+        remaining = job["leases"]
+        stale_path = job.get("path")
+        if remaining == 0 and status in {"expired", "cancelled", "error"}:
+            job["path"] = None
+        else:
+            stale_path = None
+    if stale_path:
+        _remove_export(stale_path)
+
+
+def _expire_export_jobs(now=None):
+    now = now or time.time()
+    removable = []
+    with _export_lock:
+        for job in list(_export_jobs.values()):
+            anchor = job.get("ready_at") or job.get("created_at") or now
+            if now - anchor < EXPORT_JOB_TTL_S:
+                continue
+            if job.get("status") in {"queued", "preparing"}:
+                continue
+            if int(job.get("leases") or 0) > 0:
+                job["status"] = "expired"
+                job["error_code"] = job.get("error_code") or "EXPIRED"
+                continue
+            removable.append(job.get("path"))
+            job.update(status="expired", error_code="EXPIRED", path=None,
+                       error=job.get("error") or "Study export expired.")
+    for path in removable:
+        _remove_export(path)
+
+
+def _register_job(job):
+    global _export_job
+    with _export_lock:
+        _export_jobs[job["job_id"]] = job
+        _export_job = job
+    return job
+
+
+def _update_job(job_id, **fields):
+    job = _lookup_job(job_id)
+    if job is None:
+        return None
+    with _export_lock:
+        job.update(fields)
+    return job
+
+
+def _ranged_file_response(path, filename, media_type, range_header=None, background=None):
+    if not isinstance(range_header, str) or not range_header.strip():
+        range_header = None
+    file_size = os.path.getsize(path)
+    if not range_header:
+        response = FileResponse(
+            path,
+            media_type=media_type,
+            filename=filename,
+            background=background,
+        )
+        response.headers["Accept-Ranges"] = "bytes"
+        return response
+    match = _RANGE_SPEC.match(range_header.strip())
+    if not match:
+        raise HTTPException(status_code=416, detail="Invalid Range",
+                            headers={"Content-Range": f"bytes */{file_size}"})
+    start_text, end_text = match.groups()
+    if start_text == "" and end_text == "":
+        raise HTTPException(status_code=416, detail="Invalid Range",
+                            headers={"Content-Range": f"bytes */{file_size}"})
+    if start_text == "":
+        suffix = int(end_text)
+        start = max(0, file_size - suffix)
+        end = file_size - 1
+    else:
+        start = int(start_text)
+        end = int(end_text) if end_text else file_size - 1
+    if start >= file_size or start > end:
+        raise HTTPException(
+            status_code=416, detail="Range Not Satisfiable",
+            headers={"Content-Range": f"bytes */{file_size}"},
+        )
+    end = min(end, file_size - 1)
+    length = end - start + 1
+
+    def iterator():
+        with open(path, "rb") as handle:
+            handle.seek(start)
+            remaining = length
+            while remaining:
+                chunk = handle.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+                yield chunk
+
+    headers = {
+        "Content-Range": f"bytes {start}-{end}/{file_size}",
+        "Content-Length": str(length),
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": f'attachment; filename="{filename}"',
+    }
+    return StreamingResponse(
+        iterator(), status_code=206, media_type=media_type, headers=headers,
+        background=background,
+    )
+
+
+def _new_export_job(scope, raw_paths):
+    total_bytes = 0
+    total_segments = 0
+    if scope == "full":
+        for path in raw_paths:
+            try:
+                total_bytes += os.path.getsize(path)
+                total_segments += 1
+            except OSError:
+                pass
+    return {
+        "job_id": secrets.token_urlsafe(18),
+        "download_token": secrets.token_urlsafe(32),
+        "scope": scope,
+        "status": "queued",
+        "created_at": time.time(),
+        "ready_at": None,
+        "path": None,
+        "bytes": None,
+        "processed_bytes": 0,
+        "total_bytes": total_bytes,
+        "processed_segments": 0,
+        "total_segments": total_segments,
+        "error": None,
+        "error_code": None,
+        "leases": 0,
+        "cancel_requested": False,
+    }
+
+
+async def _build_export_job(job_id, mode, raw_paths, snapshot_path, scope):
+    job = _lookup_job(job_id)
+    if job is None:
+        _remove_export(snapshot_path)
+        return
+    _update_job(job_id, status="preparing")
+
+    def progress(payload):
+        _update_job(
+            job_id,
+            processed_bytes=payload.get("processed_bytes") or 0,
+            total_bytes=payload.get("total_bytes") or 0,
+            processed_segments=payload.get("processed_segments") or 0,
+            total_segments=payload.get("total_segments") or 0,
+        )
+
+    def cancel_check():
+        current = _lookup_job(job_id)
+        return current is None or bool(current.get("cancel_requested"))
+
+    try:
+        path, _manifest = await asyncio.to_thread(
+            exporter.build_study_bundle, None, mode, raw_paths, snapshot_path,
+            scope == "full", progress, cancel_check, scope,
+        )
+    except exporter.ExportCancelled:
+        current = _lookup_job(job_id)
+        if current is not None:
+            _update_job(
+                job_id, status="cancelled", error="Study export cancelled.",
+                error_code="CANCELLED",
+            )
+        return
+    except Exception as exc:  # noqa: BLE001 - surface failure without stopping collection
+        current = _lookup_job(job_id)
+        if current is not None:
+            _update_job(
+                job_id, status="error", error="Study export preparation failed.",
+                error_code="PREPARE_FAILED",
+            )
+        engine._record_error("study_export", exc)
+        return
+    current = _lookup_job(job_id)
+    if current is None or current.get("cancel_requested"):
+        _remove_export(path)
+        if current is not None:
+            _update_job(
+                job_id, status="cancelled", error="Study export cancelled.",
+                error_code="CANCELLED", path=None,
+            )
+        return
+    _update_job(
+        job_id, status="ready", path=path, bytes=os.path.getsize(path),
+        error=None, error_code=None, ready_at=time.time(),
+        processed_bytes=current.get("total_bytes") or 0,
+        processed_segments=current.get("total_segments") or 0,
+    )
+
+
+@app.post("/api/export/prepare", dependencies=[Depends(require_admin)], status_code=202)
+async def prepare_study_export(scope: str = "audit"):
+    """Start one non-blocking export job and return a pollable identifier."""
+    scope = (scope or "audit").lower()
+    if scope not in {"audit", "full"}:
+        raise HTTPException(status_code=400, detail="scope must be audit or full")
+    _expire_export_jobs()
+    if scope == "full":
+        existing = _active_full_job()
+        if existing is not None:
+            response = JSONResponse(_public_export_job(existing), status_code=202)
+            return _set_export_cookie(response, existing)
+    try:
+        engine.recorder.checkpoint_for_export()
+        raw_paths = exporter.raw_feed_paths()
+        snapshot_path = exporter.prepare_database_snapshot()
+    except Exception as exc:  # noqa: BLE001 - keep collection alive and expose the fault
+        engine._record_error("study_export", exc)
+        raise HTTPException(
+            status_code=500,
+            detail="Study export failed; see System status for the recorded fault.",
+        ) from exc
+    job = _new_export_job(scope, raw_paths)
+    _register_job(job)
+    task = asyncio.create_task(_build_export_job(
+        job["job_id"], engine.mode, raw_paths, snapshot_path, scope,
+    ))
+    _export_tasks.add(task)
+    task.add_done_callback(_export_tasks.discard)
+    response = JSONResponse(_public_export_job(job), status_code=202)
+    return _set_export_cookie(response, job)
+
+
 @app.get("/api/export/jobs/{job_id}", dependencies=[Depends(require_admin)])
 async def study_export_status(job_id: str):
-    if not _export_job or not secrets.compare_digest(job_id, _export_job["job_id"]):
+    _expire_export_jobs()
+    job = _lookup_job(job_id)
+    if job is None:
         raise HTTPException(status_code=404, detail="Study export job not found")
-    if _export_job["status"] == "ready" and not os.path.isfile(_export_job["path"]):
-        _export_job.update(status="error", error="Prepared export is no longer available.")
-    return _public_export_job(_export_job)
+    if job["status"] == "ready" and not os.path.isfile(job.get("path") or ""):
+        _update_job(
+            job_id, status="error", error="Prepared export is no longer available.",
+            error_code="UNAVAILABLE",
+        )
+        job = _lookup_job(job_id)
+    return _public_export_job(job)
+
+
+@app.post("/api/export/jobs/{job_id}/cancel", dependencies=[Depends(require_admin)])
+async def cancel_study_export(job_id: str):
+    job = _lookup_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Study export job not found")
+    stale = None
+    with _export_lock:
+        job["cancel_requested"] = True
+        if job["status"] in {"queued", "preparing"}:
+            job["status"] = "cancelled"
+            job["error"] = "Study export cancelled."
+            job["error_code"] = "CANCELLED"
+        elif job["status"] == "ready" and int(job.get("leases") or 0) == 0:
+            stale = job.get("path")
+            job["path"] = None
+            job["status"] = "cancelled"
+            job["error"] = "Study export cancelled."
+            job["error_code"] = "CANCELLED"
+    _remove_export(stale)
+    return _public_export_job(job)
 
 
 @app.get("/api/export/jobs/{job_id}/download")
@@ -493,30 +752,78 @@ async def download_study_export(
     job_id: str,
     x_admin_token: str | None = Header(default=None),
     footballbot_export_job: str | None = Cookie(default=None),
+    range_header: str | None = Header(default=None, alias="Range"),
 ):
-    if not _export_job or not secrets.compare_digest(job_id, _export_job["job_id"]):
+    _expire_export_jobs()
+    job = _lookup_job(job_id)
+    if job is None:
         raise HTTPException(status_code=404, detail="Study export job not found")
     header_ok = bool(config.ADMIN_TOKEN) and secrets.compare_digest(
         x_admin_token or "", config.ADMIN_TOKEN,
     )
     cookie_ok = secrets.compare_digest(
-        footballbot_export_job or "", _export_job["download_token"],
+        footballbot_export_job or "", job["download_token"],
     )
     if not header_ok and not cookie_ok:
         raise HTTPException(status_code=401, detail="invalid export authorization")
-    if _export_job["status"] == "preparing":
+    if job["status"] in {"queued", "preparing"}:
         raise HTTPException(status_code=425, detail="Study export is still preparing")
-    if _export_job["status"] != "ready" or not os.path.isfile(_export_job.get("path") or ""):
-        raise HTTPException(status_code=410, detail=_export_job.get("error") or
+    if job["status"] == "cancelled":
+        raise HTTPException(status_code=410, detail="Study export cancelled.")
+    if job["status"] == "expired":
+        raise HTTPException(status_code=410, detail="Study export expired.")
+    if job["status"] != "ready" or not os.path.isfile(job.get("path") or ""):
+        raise HTTPException(status_code=410, detail=job.get("error") or
                             "Study export is unavailable")
-    path = _export_job["path"]
-    response = FileResponse(
+    path = job["path"]
+    with _export_lock:
+        job["leases"] = int(job.get("leases") or 0) + 1
+    response = _ranged_file_response(
         path,
-        media_type="application/zip",
         filename=os.path.basename(path),
+        media_type="application/zip",
+        range_header=range_header,
+        background=BackgroundTask(_release_export_lease, job_id, path),
     )
-    response.delete_cookie("footballbot_export_job", path="/api/export/jobs")
+    return _set_export_cookie(response, job)
+
+
+@app.get("/api/export/raw", dependencies=[Depends(require_admin)])
+async def list_raw_segments():
+    """List immutable recorder segments without copying bodies."""
+    payload = {"segments": exporter.raw_inventory()}
+    response = JSONResponse(payload)
+    response.set_cookie(
+        "footballbot_export_raw", _raw_download_token, max_age=EXPORT_JOB_TTL_S,
+        httponly=True, secure=True, samesite="strict", path="/api/export/raw",
+    )
     return response
+
+
+@app.get("/api/export/raw/{name}")
+async def download_raw_segment(
+    name: str,
+    x_admin_token: str | None = Header(default=None),
+    footballbot_export_raw: str | None = Cookie(default=None),
+    range_header: str | None = Header(default=None, alias="Range"),
+):
+    header_ok = bool(config.ADMIN_TOKEN) and secrets.compare_digest(
+        x_admin_token or "", config.ADMIN_TOKEN,
+    )
+    cookie_ok = secrets.compare_digest(
+        footballbot_export_raw or "", _raw_download_token,
+    )
+    if not header_ok and not cookie_ok:
+        raise HTTPException(status_code=401, detail="invalid export authorization")
+    path = exporter.safe_raw_segment_path(name)
+    if path is None:
+        raise HTTPException(status_code=404, detail="Raw segment not found")
+    return _ranged_file_response(
+        str(path),
+        filename=path.name,
+        media_type="application/gzip",
+        range_header=range_header,
+    )
 
 
 @app.get("/api/export", dependencies=[Depends(require_admin)])
@@ -532,6 +839,7 @@ async def export_study_data():
         snapshot_path = exporter.prepare_database_snapshot()
         path, _manifest = await asyncio.to_thread(
             exporter.build_study_bundle, None, engine.mode, raw_paths, snapshot_path,
+            True, None, None, "full",
         )
     except Exception as exc:  # noqa: BLE001 - keep collection alive and expose the fault
         engine._record_error("study_export", exc)
