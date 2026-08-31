@@ -104,16 +104,25 @@ class PriceOnlyClassifierTests(unittest.TestCase):
 
     def test_price_only_path_does_not_import_match_feed_fields(self):
         root = Path(__file__).resolve().parents[1]
-        source = "\n".join(
-            (root / "app" / filename).read_text()
-            for filename in ("late_score_sleeve.py", "detector.py", "paper.py")
-        )
-
-        for forbidden in (
-            "goal_latency", "normalize_match_event", "score_before",
-            "score_after", "normalized_event",
-        ):
-            self.assertNotIn(forbidden, source)
+        import ast
+        for filename in ("late_score_sleeve.py", "detector.py", "paper.py"):
+            source = (root / "app" / filename).read_text()
+            for forbidden in (
+                "goal_latency", "normalize_match_event", "score_before",
+                "score_after", "normalized_event", "live_data",
+            ):
+                self.assertNotIn(forbidden, source)
+            tree = ast.parse(source)
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    self.assertNotIn("goal_latency", node.module)
+                    self.assertNotIn("match_events", node.module)
+                    self.assertNotRegex(node.module or "", r"(^|\.)match_clock$")
+                if isinstance(node, ast.Name):
+                    self.assertNotIn(node.id, {
+                        "score_before", "score_after", "scorer", "live_data",
+                        "normalized_event",
+                    })
 
 
 class PriceOnlyExitTests(unittest.TestCase):

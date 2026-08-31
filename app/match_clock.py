@@ -501,13 +501,7 @@ class MatchClockTracker:
             observation["id"] = persist_id
         result = stamp_from_observation(observation, event, signal_local_ts, mapped=mapped)
         if observation is not None and observation.get("id") is None and persist_id is None:
-            # Stamp can still carry in-memory fields before SQLite assigns id.
             result["observation_id"] = observation.get("id")
-        if not result["usable_for_88_gate"]:
-            reason = result.get("unusable_reason")
-            if reason in {"unmapped", "stale", "malformed", "missing_clock"}:
-                self.clock_gate_candidate_misses += 1
-                self.faults[event] = reason
         return result
 
     def coverage(self, watched_events=None):

@@ -12,7 +12,7 @@ from .detector import Detector
 from .goal_latency import GoalLatencyObserver
 from .kalshi import KalshiClient, KalshiWS
 from .late_score_sleeve import PriceOnlyLateScoreSleeve
-from .match_clock import MatchClockTracker, unusable_stamp
+from .match_clock import MatchClockGate, MatchClockTracker, unusable_stamp
 from .paper import PaperDesk
 from .recorder import RawRecorder
 
@@ -346,6 +346,8 @@ class Engine:
             if not stamp.get("usable_for_88_gate"):
                 reason = stamp.get("unusable_reason")
                 if reason in {"unmapped", "stale", "malformed", "missing_clock"}:
+                    self.clock_tracker.clock_gate_candidate_misses += 1
+                    self.clock_tracker.faults[event] = reason
                     self._record_error(
                         "match_clock",
                         f"{event}: clock stamp unusable ({reason})",
@@ -433,16 +435,33 @@ class Engine:
             return "not_late"
         return self._execute_strategy_candidate(tagged, lag, decision_start)
 
+    def _clock_gate_for(self, ticker, signal_ts):
+        """Evaluate the persisted live clock; expected expiration is not consulted."""
+        event = self.meta.get(ticker, {}).get("event", "?")
+        stamp = self.clock_tracker.stamp(event, signal_ts)
+        return stamp, MatchClockGate(stamp).evaluate()
+
     def _run_price_only(self, cand, lag, decision_start):
-        if not self.is_sleeve_window(cand["ticker"]):
+        stamp, gate = self._clock_gate_for(cand["ticker"], cand.get("local_ts"))
+        if not gate["accepted"]:
             sleeve = {
                 "strategy": "price_only_late_score_v1",
                 "feed_independent": True,
-                "decision": "outside_minute_88_window",
+                "decision": gate["outcome"],
+                "match_clock_gate": {
+                    "outcome": gate["outcome"],
+                    "provider_clock": gate.get("provider_clock"),
+                    "provider_minute": gate.get("provider_minute"),
+                    "provider_period": gate.get("provider_period"),
+                    "provider_status": gate.get("provider_status"),
+                    "age_ms": gate.get("age_ms"),
+                    "observation_id": gate.get("observation_id"),
+                    "source": gate.get("source"),
+                },
             }
             tagged = self._strategy_candidate(cand, PRICE_ONLY_STRATEGY, sleeve)
-            self.record_signal(tagged, lag, "sleeve_outside_window")
-            return "sleeve_outside_window"
+            self.record_signal(tagged, lag, f"sleeve_{gate['outcome']}")
+            return f"sleeve_{gate['outcome']}"
         m = self.meta.get(cand["ticker"], {"event": "?", "series": "?"})
         event = m.get("event", "?")
         decision = self.late_score_sleeve.classify(
@@ -453,7 +472,20 @@ class Engine:
             self.books,
             cand.get("local_ts", time.time()) * 1000.0,
         )
-        sleeve = dict(decision.detail, decision=decision.reason)
+        sleeve = dict(
+            decision.detail,
+            decision=decision.reason,
+            match_clock_gate={
+                "outcome": gate["outcome"],
+                "provider_clock": gate.get("provider_clock"),
+                "provider_minute": gate.get("provider_minute"),
+                "provider_period": gate.get("provider_period"),
+                "provider_status": gate.get("provider_status"),
+                "age_ms": gate.get("age_ms"),
+                "observation_id": gate.get("observation_id"),
+                "source": gate.get("source"),
+            },
+        )
         tagged = self._strategy_candidate(cand, PRICE_ONLY_STRATEGY, sleeve)
         if not decision.accepted:
             self.record_signal(tagged, lag, f"sleeve_{decision.reason}")
