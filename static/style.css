@@ -116,6 +116,54 @@ strong, .tabular { font-variant-numeric: tabular-nums; }
 .button.danger { color: #ffc1c5; border-color: rgba(255, 115, 126, .28); background: var(--red-soft); }
 .button.danger.active { color: var(--text); background: var(--red); }
 .button:disabled { opacity: .62; cursor: wait; }
+.button.quiet:disabled { cursor: not-allowed; }
+
+.export-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  width: 100%;
+}
+.export-actions .button { flex: 1 1 160px; min-width: 0; overflow-wrap: anywhere; }
+.export-progress, .export-error {
+  margin: 8px 0 0;
+  overflow-wrap: anywhere;
+}
+.export-error { color: var(--red); }
+.raw-segment-list { display: grid; gap: 6px; width: 100%; margin-top: 12px; }
+.raw-segment-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 0;
+  border-top: 1px solid var(--border);
+}
+.raw-segment-row span, .raw-segment-row a { overflow-wrap: anywhere; }
+.raw-segment-row a { color: var(--blue); font-weight: 700; }
+.clock-faults { margin-top: 10px; display: grid; gap: 6px; }
+.clock-fault { padding: 8px 10px; border-radius: 8px; background: var(--red-soft); overflow-wrap: anywhere; }
+.loss-path {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  margin: 12px 0;
+  padding: 10px;
+  border-radius: 10px;
+  background: var(--red-soft);
+}
+.loss-path span { display: block; color: var(--subtle); font-size: .72rem; text-transform: uppercase; }
+.loss-path strong { display: block; margin-top: 2px; }
+.trade-high, .clock-stamp {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+  margin: 12px 0;
+}
+.trade-high div, .clock-stamp div { min-width: 0; overflow-wrap: anywhere; }
+.trade-high span, .clock-stamp span { display: block; color: var(--subtle); font-size: .72rem; text-transform: uppercase; }
+.gate-chip { margin-top: 8px; }
+.latency-table { margin-top: 12px; }
 
 .health-link {
   min-height: 38px;
@@ -495,4 +543,15 @@ td.numeric, th.numeric { text-align: right; font-variant-numeric: tabular-nums; 
   .table-wrap td::before { content: attr(data-label) ": "; color: var(--subtle); }
   .equity-chart { min-height: 330px; }
   .equity-chart svg { min-height: 310px; }
+}
+
+@media (max-width: 360px) {
+  .header-main, .primary-tabs, .page-shell { width: min(100% - 12px, 1480px); }
+  .header-actions, .export-actions { grid-template-columns: 1fr; display: grid; }
+  .export-actions .button, #export-button, #export-audit-button, #export-full-button, #export-cancel-button {
+    width: 100%;
+    min-height: 44px;
+  }
+  .loss-path, .trade-high, .clock-stamp { grid-template-columns: 1fr; }
+  .raw-segment-row { grid-template-columns: 1fr; }
 }

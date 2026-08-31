@@ -5,9 +5,9 @@ const state = {
   status: null, config: {}, stats: {}, matches: [],
   trades: {open: [], closed: []}, signals: [], events: [], latency: {},
   equity: {combined: [], gate_a: [], price_only_late_score: []},
-  activity: [], hydrated: false,
+  activity: [], clocks: {coverage: {}, observations: []}, hydrated: false,
 };
-const filters = {query: "", strategy: "all", match: "all", result: "all", association: "all", period: "all"};
+const filters = {query: "", strategy: "all", match: "all", result: "all", association: "all", gate: "all", period: "all"};
 const visibleEquitySeries = new Set(["combined", "gate_a", "price_only_late_score"]);
 const clientErrors = [];
 const activeClientFaults = new Map();
@@ -99,6 +99,20 @@ const outcomeLabels = {
   sleeve_incomplete_book: "Ignored: a contract order book was incomplete",
   sleeve_ambiguous_draw_leg: "Ignored: draw contract could not be identified",
   sleeve_not_rising_leg: "Ignored: target contract was not rising", execution_error: "Execution adapter error",
+  sleeve_clock_88_plus: "Price-only 88+ clock accepted",
+  sleeve_clock_pre_88: "Declined: persisted clock is before minute 88",
+  sleeve_clock_unmapped: "Declined: match is not mapped to a live clock",
+  sleeve_clock_missing: "Declined: live clock is missing",
+  sleeve_clock_malformed: "Declined: live clock is malformed",
+  sleeve_clock_stale: "Declined: live clock is stale",
+  sleeve_clock_not_live: "Declined: provider status is not live",
+  sleeve_clock_final: "Declined: match clock is final",
+  sleeve_clock_suspended: "Declined: match clock is suspended",
+  sleeve_clock_abandoned: "Declined: match clock is abandoned",
+  sleeve_clock_first_half: "Declined: clock is still first half",
+  sleeve_clock_half_time: "Declined: clock is half-time",
+  sleeve_clock_pre_match: "Declined: clock is pre-match",
+  sleeve_clock_period_unusable: "Declined: clock period is unusable",
 };
 const exitLabels = {
   target: "Profit target reached", timeout: "Gate A time limit", sleeve_timeout: "Price-only time limit",
@@ -110,10 +124,28 @@ const associationLabels = {
   state_consistent: "State-consistent match event", nearby_goal: "Nearby goal; state not confirmed",
   nearby_correction: "Nearby score correction", state_mismatch: "Nearby event conflicts with inference",
   time_only: "Time proximity only", unmatched: "No nearby same-match event",
+  temporally_associated: "Temporally associated", no_nearby_same_match_event: "No nearby same-match event",
+};
+const clockGateLabels = {
+  clock_88_plus: "88+ clock accepted", clock_pre_88: "Clock before minute 88",
+  clock_unmapped: "Clock unmapped", clock_missing: "Clock missing", clock_malformed: "Clock malformed",
+  clock_stale: "Clock stale", clock_not_live: "Clock not live", clock_final: "Clock final",
+  clock_suspended: "Clock suspended", clock_abandoned: "Clock abandoned",
+  clock_first_half: "First-half clock", clock_half_time: "Half-time clock",
+  clock_pre_match: "Pre-match clock", clock_period_unusable: "Clock period unusable",
+};
+const latencyLabels = {
+  feed_ingress_ms: "Feed ingress", feed_lag: "Feed ingress",
+  decision_ms: "Decision", paper_entry_ms: "Paper entry", paper_entry: "Paper entry",
+  order_arrival_ms: "Order arrival (K4)", order_arrival: "Order arrival (K4)",
+  paper_exit_ms: "Paper exit", paper_exit: "Paper exit",
+  match_response_ms: "Match-feed response", goal_provider_response: "Match-feed response",
+  match_clock_age_ms: "Match-clock age", scheduler_lag_ms: "Scheduler lag",
 };
 function humanOutcome(value) { return outcomeLabels[value] || String(value || "Unknown outcome").replaceAll("_", " "); }
 function humanExit(value) { return exitLabels[value] || String(value || "Unknown exit").replaceAll("_", " "); }
 function humanAssociation(value) { return associationLabels[value] || String(value || "unmatched").replaceAll("_", " "); }
+function humanClockGate(value) { return clockGateLabels[value] || String(value || "not recorded").replaceAll("_", " "); }
 function humanStatus(value) {
   const text = String(value || "unknown").replaceAll("_", " ");
   return text.charAt(0).toUpperCase() + text.slice(1);
