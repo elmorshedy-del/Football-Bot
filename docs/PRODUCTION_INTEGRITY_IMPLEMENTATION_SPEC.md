@@ -1,5 +1,20 @@
 # Production Integrity Implementation Specification
 
+> ## ⚠ STOP — read before revising this specification
+>
+> Parts of this document, as originally written, produced defects in
+> production-shaped data. Corrections, deviations, and deliberate extensions are
+> recorded in **[`docs/SPEC_CORRECTIONS_AND_DEVIATIONS.md`](SPEC_CORRECTIONS_AND_DEVIATIONS.md)**.
+>
+> Re-issuing the original wording of **§3.4, §4.1, §4.2, §4.3, §5, §6.2, §7.1, or
+> §9** without reading that file **will reintroduce a known defect**. The most
+> serious is §4.1: the clock-parsing precedence names `status_text` as a source
+> but gives no rule for identifying the clock inside it, and the obvious reading
+> parses `"2nd Half 90+5'"` as minute 2.
+>
+> `tests/test_spec_corrections.py` fails if this banner is removed.
+
+
 Status: **PLAN ONLY — implementation must not merge before independent final review**  
 Owner: next implementation agent  
 Final reviewer: Codex review requested by the repository owner  

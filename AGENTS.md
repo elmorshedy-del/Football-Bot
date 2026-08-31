@@ -4,6 +4,13 @@ These instructions apply to the entire repository.
 
 ## Read before changing code
 
+0. **Read `docs/SPEC_CORRECTIONS_AND_DEVIATIONS.md` first — before the
+   specification.** It records where the specification is wrong or
+   under-specified, what was deliberately extended beyond it, and what must not
+   be "fixed". Several entries exist because the specification as written
+   produced a defect. This applies to anyone *revising the specification* as
+   much as to anyone implementing it. `tests/test_spec_corrections.py` enforces
+   that this file exists and stays referenced.
 1. Read `docs/PRODUCTION_INTEGRITY_IMPLEMENTATION_SPEC.md` completely. It is the authoritative
    contract for the clock, 88+ sleeve, event ledger, trade-high, export, latency, frontend, testing,
    production-verification, review, and rollback work.
