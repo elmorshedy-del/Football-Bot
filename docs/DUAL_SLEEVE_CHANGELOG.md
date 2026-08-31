@@ -438,3 +438,122 @@ Validation performed:
   `/api/stats`, and all six rendered route markers pass locally.
 - Local `/api/config` exposes the 20-second event-match audit window, 8c maximum sleeve spread,
   and 46 human-readable league names. Demo stats expose independent Gate A and price-only buckets.
+
+## 2026-08-31 — Production integrity: clock gate, highs, split exports, UI
+
+Status: implementation `PASSED` locally; independent final review, deploy, and § 11 production
+evidence are pending. Paper-only. Do not merge until the reviewer clears specification §§ 11–12.
+
+Motivating production evidence (from the specification's § 1, verified again against the deployed
+schema before implementation):
+
+- The 88+ sleeve was not producing a valid study. Production carried 86 `sleeve_outside_window`
+  records and zero price-only classified or fill samples. The Al-Hazm vs Al-Shabab 90+5 equalizer
+  signal was rejected because `expected_expiration_time` was 3,820.188 seconds after the signal —
+  expected expiration is not the match clock.
+- Downloads never reached the `/download` route. Railway HTTP logs showed accepted prepare
+  requests and repeated status polling (single polls blocked for 32.4 and 93.6 seconds), but no
+  `/download` request; RSS was 2.54 GB during review. A single multi-GB archive cannot be the
+  only browser export path.
+- Latency evidence was breached while the health banner said all was good. `/api/stats` reported
+  total order-arrival p95 = 3,642.1875 ms with K4 `BREACH`; `/api/status` reported
+  `health.ok = true`. `/api/latency` sampled only the newest 1,000 rows across all kinds, so
+  frequent feed-lag rows crowded out order-arrival rows and left four visible K4 samples.
+- The event table was sparse by construction: it stored score-signature changes, not a match-clock
+  timeline or all provider events. Most signals therefore could not receive a match-minute stamp
+  and could not legitimately be associated with a stored event.
+- Closed trades did not retain a maximum favorable executable price: entry, exit, and MAE did not
+  answer what highest bid was available or how many seconds after entry it occurred.
+
+Changes made (six-commit stack on `cursor/production-integrity-clock-export-aaf8`, one revertible
+draft PR):
+
+1. `d0a02aa` — Persist match clocks and canonical provider events. New
+   `app/match_clock.py` (parser + tracker), `match_clock_observations` and
+   `provider_match_events` tables, immutable `signals.match_clock_snapshot`
+   (`football.match_clock_stamp.v1`) on every new signal, `/api/match-clocks` and
+   `/api/provider-events` endpoints. Config: `MATCH_CLOCK_MAX_AGE_MS = 2500`. Demo replay
+   injects a synthetic 90+5 stamp.
+2. `89d15d0` — Gate paper 88+ sleeve on persisted live clock. Narrow `MatchClockGate`
+   accepts on mapping + live status + fresh age + second-half (or equivalent) + minute ≥ 88;
+   `90'` and `90+N'` stay eligible while the market is open. Distinct decline outcomes are
+   persisted as `sleeve_<outcome>`. Expected expiration is now a UI-only calibration diagnostic;
+   Gate A detection, sizing, entry, exit, fee, lockout, and settlement behavior are unchanged.
+   An AST/import allowlist test proves the classifier and paper desk cannot read
+   score/scorer/goal/penalty/VAR/correction/narrative or canonical-event fields.
+3. `f669841` — Record executable trade highs and latency readiness. `trades.max_executable_bid`,
+   `trades.max_executable_bid_ts`, `trades.mfe_c`; held-side executable best bid only;
+   ask/mid/last/settlement cannot update; equal high keeps first timestamp; partial-exit tracking;
+   restart recovery. `/api/latency` samples per canonical kind (`feed_ingress_ms`, `decision_ms`,
+   `paper_entry_ms`, `order_arrival_ms`, `paper_exit_ms`, `match_response_ms`,
+   `match_clock_age_ms`, `scheduler_lag_ms`) instead of one global `LIMIT`. States: `PASS`,
+   `BREACH`, `COLLECTING`, `STALE`, `INVALID`. K4 threshold stays 250 ms, minimum sample count
+   stays 20. `/api/status.health` now carries `banner` (`all_systems_good` / `evidence_not_ready`
+   / `latency_breach` / `attention_required`) and `banner_text`; `health.ok` is false when K4 is
+   `BREACH` or `INVALID`.
+4. `d828357` — Split reliable audit and raw exports. `POST /api/export/prepare?scope=audit|full`
+   → 202 + job id. `audit` (default) prepares tables + snapshot + schema + hashes + raw inventory
+   only. `full` copies raw recorder segments in one ZIP64 `STORED` pass with SHA-256 and
+   per-segment progress. `POST /api/export/jobs/{id}/cancel` sets `cancel_requested`. Download
+   uses `FileResponse` with HTTP Range and either the admin header or a job-scoped HttpOnly
+   cookie set on prepare. `GET /api/export/raw` lists immutable segments (scoped cookie);
+   `GET /api/export/raw/{name}` streams one segment natively with `safe_raw_segment_path`
+   rejecting traversal. One `full` job at a time; audit jobs remain usable while a full runs;
+   TTL cleanup respects active leases so a served file is never deleted mid-transfer.
+5. `e551e6d` — Expose clock, high, event, latency, and export audit UI. Frontend consumes
+   `/api/match-clocks`, renders persisted clock stamps and executable-bid highs on trade and
+   signal cards (losers get an entry → high → exit `.loss-path`), renders every canonical
+   latency kind including `COLLECTING` in a table plus the chart, renders the clock coverage
+   panel and per-event faults, wires `renderHealth` to `banner`/`banner_text` while keeping the
+   literal `ALL SYSTEMS GOOD`, adds a `gate` filter select, and rewrites `downloadExport` to
+   take a `scope`, poll `queued` and `preparing`, show progress, cancel via
+   `/jobs/{id}/cancel` and an `AbortController`, and clear the admin token only on a 401.
+6. `f7e0000` (this commit) — Documentation-only. Adds this changelog entry and appends
+   sections 11–16 to `docs/DUAL_SLEEVE_IMPLEMENTATION_CHECKLIST.md`. No code changes.
+
+Validation performed locally:
+
+- `python -X dev -m unittest discover -s tests` — 146 tests pass (baseline 145 + one new
+  `test_trade_and_signal_surface_persisted_clock_and_high`).
+- `python -m compileall -q app tests` — clean.
+- `ruff check --select E9,F63,F7,F82 app tests` — clean.
+- `node --check static/app.js` — clean.
+- `git diff --check` — clean.
+- Deterministic Al-Hazm 90+5 replay (unit test) — the price-only classifier is reached instead
+  of `sleeve_outside_window`; the match-clock stamp records `90+5'` and the gate outcome is
+  `clock_88_plus`; no score, event, or narrative field appears anywhere in the price-only
+  decision record. Independence is enforced by the AST/import allowlist test in
+  `tests/test_late_score_sleeve.py`.
+
+Live acceptance not yet run (needs deploy + production `ADMIN_TOKEN`):
+
+- 100 % of new signals carrying a structured clock stamp.
+- 100 % of new price-only fills carrying a fresh `usable_for_88_gate = true` stamp at minute 88+.
+- No new price-only record using `sleeve_outside_window` on expected expiration.
+- K4 state identical across `/api/stats`, `/api/status`, and the UI.
+- Audit bundle ready in under 10 seconds; ZIP valid; manifest and table counts reconciled.
+- One protected raw-segment range download.
+- Runtime requests remain responsive during a `full` prepare.
+- Rendered desktop and 360 px mobile screenshots for the trade, signal, system, and download
+  states.
+
+Rollback:
+
+- Additive schema. Application rollback is `git revert <merge-sha>`; old code tolerates the added
+  tables and columns. Do not drop clock, event, or high data.
+- Cancel any in-flight export worker before reverting the app.
+- For immediate containment without a revert, set `PRICE_ONLY_SLEEVE_MODE=off`. Gate A is
+  unaffected.
+- The unrelated Railway service `kalchi-kill` was not touched.
+
+Known limitations recorded before final review:
+
+- The specification's freshness threshold defaults to `MATCH_CLOCK_MAX_AGE_MS = 2500`; the
+  spec also asks for it to be measured against p95 poll interval per deployment. Adjust after
+  the first production `/api/status.clock_coverage` sample.
+- Association windows in `app/audit.py::match_signal_event` still use the pre-existing
+  `EVENT_MATCH_WINDOW_S` default; consider a tighter default for goal.observed → signal after
+  reviewing one deployment's associations.
+- Frontend uses the browser's `sessionStorage` for the admin token; the rewrite now leaves the
+  token in place on transient 5xx and network errors, but the token is still cleared on 401 or
+  when a user cancels then re-prompts.
