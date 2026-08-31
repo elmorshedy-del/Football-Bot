@@ -20,6 +20,7 @@ class FrontendContractTests(unittest.TestCase):
             "runtime-event-response", "timing-diagnostics", "league-chart",
             "league-table", "association-chart", "chart-tooltip",
             "clock-coverage-panel", "clock-coverage", "clock-faults",
+            "clock-observations",
             "export-panel", "export-audit-button", "export-full-button",
             "export-cancel-button", "export-progress", "export-error",
             "raw-segment-list",
@@ -97,6 +98,30 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("overflow-x: hidden", self.css)
         self.assertIn("overflow-wrap: anywhere", self.css)
         self.assertNotIn("text-overflow: ellipsis", self.css)
+
+    def test_admin_token_survives_transient_failures(self):
+        """Only a 401 may invalidate the operator's admin token.
+
+        The kill switch runs through adminPost; a transient 5xx there must not
+        wipe the token and force a re-prompt mid-incident.
+        """
+        admin_post = self.js.split("async function adminPost", 1)[1]
+        admin_post = admin_post.split("\nasync function", 1)[0]
+        self.assertIn("response.status === 401", admin_post)
+        # The blanket clear in the catch block must be gone.
+        catch_block = admin_post.split("} catch", 1)[1]
+        self.assertNotIn("removeItem", catch_block)
+
+    def test_raw_segment_list_does_not_require_a_completed_full_export(self):
+        """Per-segment downloads are the fallback when the full archive is
+        impractical, so the list must be reachable without building one."""
+        self.assertIn('safeName === "system"', self.js)
+        self.assertIn("refreshRawSegments", self.js)
+
+    def test_clock_observations_are_rendered_not_just_fetched(self):
+        self.assertIn("/api/match-clocks", self.js)
+        self.assertIn("state.clocks?.observations", self.js)
+        self.assertIn("renderClockObservations", self.js)
 
     def test_trade_and_signal_surface_persisted_clock_and_high(self):
         # Persisted clock stamps and executable-bid highs must render without

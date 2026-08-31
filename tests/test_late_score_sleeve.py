@@ -125,6 +125,44 @@ class PriceOnlyClassifierTests(unittest.TestCase):
                     })
 
 
+    def test_engine_price_only_decision_path_reads_no_match_feed_content(self):
+        """The orchestrator is the weak link the module-level scan cannot cover.
+
+        engine.py legitimately imports both match_clock and goal_latency, so a
+        whole-file scan cannot protect it.  Walk only the functions that make
+        the price-only admission decision and prove no score, scorer, event, or
+        narrative field is referenced inside them.
+        """
+        import ast
+        root = Path(__file__).resolve().parents[1]
+        tree = ast.parse((root / "app" / "engine.py").read_text())
+        forbidden = {
+            "score_before", "score_after", "scorer", "live_data",
+            "normalized_event", "canonical_type", "canonical_side",
+            "human_label", "provider_description", "goal_latency",
+            "normalize_match_event", "change_kind",
+        }
+        checked = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            if node.name not in {"_run_price_only", "_clock_gate_for"}:
+                continue
+            checked.append(node.name)
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Name):
+                    self.assertNotIn(inner.id, forbidden, f"{node.name} reads {inner.id}")
+                if isinstance(inner, ast.Attribute):
+                    self.assertNotIn(
+                        inner.attr, forbidden, f"{node.name} reads .{inner.attr}",
+                    )
+                if isinstance(inner, ast.Constant) and isinstance(inner.value, str):
+                    self.assertNotIn(
+                        inner.value, forbidden, f"{node.name} names {inner.value!r}",
+                    )
+        self.assertEqual(sorted(checked), ["_clock_gate_for", "_run_price_only"])
+
+
 class PriceOnlyExitTests(unittest.TestCase):
     def position(self):
         pos = Position(

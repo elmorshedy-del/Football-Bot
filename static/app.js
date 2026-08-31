@@ -202,6 +202,9 @@ function activateTab(name, focus = false) {
   document.querySelectorAll(".tab-panel").forEach(panel => { panel.hidden = panel.id !== `panel-${safeName}`; });
   history.replaceState(null, "", `#${safeName}`);
   if (safeName === "overview") requestAnimationFrame(renderEquity);
+  // Per-segment downloads are the fallback for when the full archive is
+  // impractical, so the list must be reachable without first building one.
+  if (safeName === "system") refreshRawSegments().catch(error => recordClientError("Raw segment listing", error));
 }
 function initializeTabs() {
   document.querySelectorAll("[data-tab]").forEach(button => {
@@ -702,6 +705,24 @@ function renderClockCoverage() {
     ...mapping.map(row => `<div class="clock-fault-row bad"><strong>${escapeHtml(row.event || "unknown event")}</strong><span>Mapping error: ${escapeHtml(String(row.error || "unknown"))}</span></div>`),
   ].join("");
 }
+function renderClockObservations() {
+  // The persisted observation timeline is the middle link in the lineage the
+  // reviewer has to trace: raw provider payload -> normalized observation ->
+  // immutable signal stamp -> 88 gate.
+  const holder = byId("clock-observations");
+  if (!holder) return;
+  const rows = (state.clocks?.observations || []).slice(0, 12);
+  if (!rows.length) {
+    holder.innerHTML = '<div class="empty-state">No match-clock observations persisted yet.</div>';
+    return;
+  }
+  holder.innerHTML = `<p class="timing-subheading">Recent persisted clock observations</p>${rows.map(row => {
+    const clock = providerClock(row);
+    const status = row.provider_status || "status unavailable";
+    const period = row.provider_period || "period unavailable";
+    return `<div class="clock-observation-row"><span><strong>${escapeHtml(row.event || "unknown event")}</strong><br><small>${escapeHtml(fullDate(row.observed_ts))}</small></span><span>${escapeHtml(clock)}</span><span>${escapeHtml(period)} · ${escapeHtml(status)}</span></div>`;
+  }).join("")}`;
+}
 function renderEvidence() {
   const cards = [];
   Object.entries(state.stats.sleeves || {}).forEach(([strategy, summary]) => Object.entries(summary.evidence || {}).forEach(([key, gate]) => {
@@ -724,13 +745,13 @@ function renderAll() {
   renderHealth(); renderRuntime(); renderSleeves(); renderFilters(); renderTrades(); renderSignals(); renderEvents();
   renderTimingDiagnostics();
   renderEquity(); renderAssociationChart(); renderExitChart(); renderFeaturedTrades(); renderPositions(); renderLeagues();
-  renderMatches(); renderLatency(); renderClockCoverage(); renderEvidence(); renderActivity();
+  renderMatches(); renderLatency(); renderClockCoverage(); renderClockObservations(); renderEvidence(); renderActivity();
 }
 
 async function refreshAll() {
   if (refreshInFlight) return;
   refreshInFlight = true;
-  const requests = [["status", "/api/status"], ["config", "/api/config"], ["matches", "/api/matches"], ["trades", "/api/trades?limit=500"], ["signals", "/api/signals?limit=500"], ["stats", "/api/stats"], ["events", "/api/goal-latency?limit=200"], ["latency", "/api/latency"], ["equity", "/api/equity"], ["activity", "/api/eventlog?limit=100"], ["clocks", "/api/match-clocks?limit=200"]];
+  const requests = [["status", "/api/status"], ["config", "/api/config"], ["matches", "/api/matches"], ["trades", "/api/trades?limit=500"], ["signals", "/api/signals?limit=500"], ["stats", "/api/stats"], ["events", "/api/goal-latency?limit=200"], ["latency", "/api/latency"], ["equity", "/api/equity"], ["activity", "/api/eventlog?limit=100"], ["clocks", "/api/match-clocks?limit=60"]];
   try {
     const results = await Promise.allSettled(requests.map(([, path]) => apiJson(path)));
     results.forEach((result, index) => {
@@ -778,12 +799,16 @@ async function adminPost(path, body) {
   try {
     const response = await fetch(path, {method: "POST", headers: {"Content-Type": "application/json", "X-Admin-Token": token}, body: body == null ? null : JSON.stringify(body)});
     if (!response.ok) {
+      // Only an explicit auth failure invalidates the token. The kill switch
+      // runs this path, and a transient 5xx must not wipe the operator's token
+      // mid-incident and force a re-prompt.
+      if (response.status === 401) sessionStorage.removeItem("footballbot_admin_token");
       const payload = await response.json().catch(error => ({detail: `Unable to read error response: ${error.message}`}));
       throw new Error(payload.detail || `${response.status} ${response.statusText}`);
     }
     clearClientFault(`Admin ${path}`);
     return await response.json();
-  } catch (error) { sessionStorage.removeItem("footballbot_admin_token"); recordClientError(`Admin ${path}`, error); return null; }
+  } catch (error) { recordClientError(`Admin ${path}`, error); return null; }
 }
 // One in-flight export at a time per scope; the cancel button targets it.
 const activeExports = new Map(); // scope → {jobId, controller}
@@ -810,10 +835,17 @@ async function timedFetch(url, options = {}, timeoutMs = 15000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error(`request timed out after ${timeoutMs} ms`)), timeoutMs);
   const upstream = options.signal;
-  if (upstream) upstream.addEventListener("abort", () => controller.abort(upstream.reason), {once: true});
+  // {once:true} only detaches after the listener fires, so a poll loop that
+  // completes normally would leave one listener per iteration on the caller's
+  // signal. Detach explicitly instead.
+  const forward = () => controller.abort(upstream.reason);
+  if (upstream) upstream.addEventListener("abort", forward, {once: true});
   try {
     return await fetch(url, {...options, signal: controller.signal});
-  } finally { clearTimeout(timer); }
+  } finally {
+    clearTimeout(timer);
+    if (upstream) upstream.removeEventListener("abort", forward);
+  }
 }
 async function readExportError(response) {
   try { return (await response.json()).detail || `${response.status} ${response.statusText}`; }

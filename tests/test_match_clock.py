@@ -6,6 +6,7 @@ from unittest.mock import patch
 from app.match_clock import (
     MatchClockGate,
     MatchClockTracker,
+    evaluate_clock_gate,
     parse_current_clock,
     parse_clock_text,
     parse_stored_stamp,
@@ -73,6 +74,77 @@ class ClockParserTests(unittest.TestCase):
         self.assertEqual(parsed.source_field, "status_text")
         self.assertEqual(parsed.provider_period, "2nd")
         self.assertEqual(parsed.provider_status, "live")
+
+
+    def test_clock_is_not_read_from_leading_digits_in_prose(self):
+        """A period ordinal or score must never be read as the match minute.
+
+        Regression: the parser previously took the first integer anywhere in the
+        string, so "2nd Half 90+5'" parsed as minute 2 and "1-0 90+5'" as minute
+        1.  Both declined a genuine 88+ clock as clock_pre_88 while persisting a
+        confident-looking wrong stamp.
+        """
+        for text, minute, stoppage in (
+            ("90+3' 2nd half live", 90, 3),
+            ("2nd half 90+3' live", 90, 3),
+            ("2nd Half 90+5'", 90, 5),
+            ("1-0 90+5'", 90, 5),
+            ("2nd Half 1-0 90+5'", 90, 5),
+            ("HT 45+1'", 45, 1),
+            ("Second Half, 88'", 88, None),
+        ):
+            with self.subTest(text=text):
+                parsed = parse_clock_text(text)
+                self.assertEqual(parsed[0], minute)
+                self.assertEqual(parsed[1], stoppage)
+
+    def test_unmarked_integer_is_a_clock_only_when_it_is_the_whole_value(self):
+        for text in ("90", " 90 ", "88"):
+            with self.subTest(text=text):
+                self.assertEqual(parse_clock_text(text)[0], int(text.strip()))
+        # Inside prose an unmarked integer is ambiguous and must be refused
+        # rather than guessed.
+        for text in ("2nd half", "1-0", "Second Half", "halftime 1-0"):
+            with self.subTest(text=text):
+                self.assertEqual(parse_clock_text(text), (None, None, None))
+
+    def test_prose_clock_reaches_the_88_gate(self):
+        """The whole point of the parser: a real 90+5 must open the sleeve."""
+        for details in (
+            {"time": "90+5'", "status": "live"},
+            {"status_text": "2nd Half 90+5'", "status": "live"},
+            {"status_text": "1-0 90+5'", "status": "live"},
+            {"status_text": "2nd Half 1-0 90+5'"},
+        ):
+            with self.subTest(details=details):
+                parsed = parse_current_clock(details)
+                self.assertEqual(parsed.provider_minute, 90)
+                accepted, outcome, usable, _reason = evaluate_clock_gate(
+                    parsed, age_ms=100.0, mapped=True,
+                )
+                self.assertTrue(accepted)
+                self.assertTrue(usable)
+                self.assertEqual(outcome, "clock_88_plus")
+
+    def test_current_clock_field_lookup_is_case_insensitive(self):
+        """`time` resolves like every other clock field, not by exact key.
+
+        Regression: `details.get("time")` bypassed the compact key matching used
+        for match_clock/game_clock/clock, so a capitalized `Time` key was
+        recorded in raw_context but ignored by the parser.
+        """
+        parsed = parse_current_clock({"Time": "90+5'", "status": "live"})
+        self.assertEqual(parsed.provider_minute, 90)
+        self.assertEqual(parsed.provider_stoppage, 5)
+        self.assertEqual(parsed.source_field, "time")
+
+    def test_unclassifiable_prose_does_not_become_a_period_or_status(self):
+        """Raw scoreboard text must not be persisted as a period/status label."""
+        parsed = parse_current_clock({"status_text": "1-0 90+5'"})
+        self.assertEqual(parsed.provider_period, "2nd")
+        self.assertEqual(parsed.provider_status, "live")
+        self.assertNotIn("1-0", str(parsed.provider_period))
+        self.assertNotIn("1-0", str(parsed.provider_status))
 
 
 class ClockGateAndStampTests(unittest.TestCase):

@@ -147,15 +147,14 @@ strong, .tabular { font-variant-numeric: tabular-nums; }
   padding: 6px 10px; border-radius: 6px; background: rgba(255, 255, 255, .04);
   font-size: .8rem; overflow-wrap: anywhere;
 }
-.clock-fault-row.warn { border-left: 3px solid var(--yellow); }
+.clock-fault-row.warn { border-left: 3px solid var(--amber); }
 .clock-fault-row.bad { border-left: 3px solid var(--red); }
 .clock-fault-row strong { color: var(--text); }
 .clock-fault-row span { color: var(--subtle); }
 .clock-stamp.good { border-left: 3px solid var(--green); }
-.clock-stamp.warn { border-left: 3px solid var(--yellow); }
+.clock-stamp.warn { border-left: 3px solid var(--amber); }
 .clock-legacy, .clock-reason { grid-column: 1 / -1; color: var(--subtle); font-size: .75rem; }
 .raw-details summary { cursor: pointer; }
-.clock-fault { padding: 8px 10px; border-radius: 8px; background: var(--red-soft); overflow-wrap: anywhere; }
 .loss-path {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -175,7 +174,6 @@ strong, .tabular { font-variant-numeric: tabular-nums; }
 }
 .trade-high div, .clock-stamp div { min-width: 0; overflow-wrap: anywhere; }
 .trade-high span, .clock-stamp span { display: block; color: var(--subtle); font-size: .72rem; text-transform: uppercase; }
-.gate-chip { margin-top: 8px; }
 .latency-table { margin-top: 12px; }
 
 .health-link {
@@ -567,4 +565,17 @@ td.numeric, th.numeric { text-align: right; font-variant-numeric: tabular-nums; 
   }
   .loss-path, .trade-high, .clock-stamp { grid-template-columns: 1fr; }
   .raw-segment-row { grid-template-columns: 1fr; }
+}
+
+.clock-observations { margin-top: 12px; display: grid; gap: 6px; }
+.clock-observation-row {
+  display: grid; grid-template-columns: minmax(140px, 2fr) minmax(60px, 1fr) minmax(120px, 1.4fr);
+  gap: 8px; padding: 6px 10px; border-radius: 6px;
+  background: rgba(255, 255, 255, .03); font-size: .8rem; overflow-wrap: anywhere;
+}
+.clock-observation-row span { min-width: 0; color: var(--subtle); }
+.clock-observation-row strong { color: var(--text); }
+
+@media (max-width: 360px) {
+  .clock-observation-row { grid-template-columns: 1fr; }
 }

@@ -19,10 +19,13 @@ MAX_MINUTE = 130
 
 # Typographic and ASCII minute marks used by Kalshi payloads.
 _MINUTE_MARK = r"['’′`´]"
+# Named mark groups so a candidate can be tested for an explicit minute mark.
+# A bare integer inside prose ("2nd half", a "1-0" score) is NOT a clock.
 _CLOCK_RE = re.compile(
-    r"(?P<minute>\d{1,3})\s*(?:" + _MINUTE_MARK + r")?\s*"
-    r"(?:\+\s*(?P<stoppage>\d{1,2})\s*(?:" + _MINUTE_MARK + r")?)?"
+    r"(?P<minute>\d{1,3})\s*(?P<mark>" + _MINUTE_MARK + r")?\s*"
+    r"(?:\+\s*(?P<stoppage>\d{1,2})\s*(?P<stoppage_mark>" + _MINUTE_MARK + r")?)?"
 )
+_BARE_NUMBER_RE = re.compile(r"^\s*\d{1,3}\s*$")
 
 _SKIP_CLOCK_KEYS = {
     "last_play", "lastplay",
@@ -89,14 +92,37 @@ def parse_clock_text(value):
     text = str(value).strip()
     if not text:
         return None, None, None
-    matched = _CLOCK_RE.search(text)
-    if not matched:
-        return None, None, None
-    minute = int(matched.group("minute"))
-    if minute > MAX_MINUTE:
-        return None, None, None
-    stoppage = int(matched.group("stoppage")) if matched.group("stoppage") else None
-    return minute, stoppage, render_clock(minute, stoppage)
+
+    # Prefer a candidate carrying an explicit minute mark ("90+5′") or an
+    # explicit stoppage ("90+5").  Scanning for the first bare integer would
+    # read the period ordinal out of "2nd Half 90+5′" as minute 2, or the
+    # home score out of "1-0 90+5′" as minute 1, and then persist that
+    # wrong minute as a confident clock stamp.
+    fallback = None
+    for matched in _CLOCK_RE.finditer(text):
+        minute = int(matched.group("minute"))
+        if minute > MAX_MINUTE:
+            continue
+        stoppage = (
+            int(matched.group("stoppage")) if matched.group("stoppage") else None
+        )
+        marked = bool(
+            matched.group("mark")
+            or matched.group("stoppage_mark")
+            or matched.group("stoppage")
+        )
+        if marked:
+            return minute, stoppage, render_clock(minute, stoppage)
+        if fallback is None:
+            fallback = (minute, stoppage)
+
+    # An unmarked integer is only a clock when it is the entire value, which is
+    # how a dedicated clock field carries a plain minute.  Inside prose it is
+    # ambiguous, so it is refused rather than guessed.
+    if fallback is not None and _BARE_NUMBER_RE.match(text):
+        minute, stoppage = fallback
+        return minute, stoppage, render_clock(minute, stoppage)
+    return None, None, None
 
 
 def normalize_period(value):
@@ -191,7 +217,10 @@ def _period_from_text(text):
         return "final"
     if re.search(r"\b(half[\s-]*time|\bht\b)\b", lowered):
         return "half-time"
-    return normalize_period(text)
+    # Unrecognized prose is not a period label.  Returning the raw string here
+    # ("1-0 90+5′") would reach the gate as an unusable period and decline a
+    # legitimate 88+ clock; None lets the minute-based inference apply instead.
+    return None
 
 
 def _status_from_text(text):
@@ -208,7 +237,9 @@ def _status_from_text(text):
         return "half-time"
     if re.search(r"\b(live|in[\s-]*play|in[\s-]*progress|playing)\b", lowered):
         return "live"
-    return normalize_status(text)
+    # Unrecognized prose is not a status label; fall through to the period-based
+    # inference rather than persisting raw scoreboard text as provider_status.
+    return None
 
 
 def parse_current_clock(details):
@@ -240,7 +271,7 @@ def parse_current_clock(details):
 
     minute = stoppage = rendered = source_field = None
     for field_name, value in (
-        ("time", details.get("time") if "time" in details else None),
+        ("time", _direct_field(details, ("time",))),
         ("match_clock", _direct_field(details, ("match_clock",))),
         ("game_clock", _direct_field(details, ("game_clock",))),
         ("clock", _direct_field(details, ("clock",))),
