@@ -519,23 +519,39 @@ the final reviewer decision vocabulary.
 
 Current blocking groups:
 
-- [ ] `BR-CLOCK`: no decision-visible clock before successful persistence; positive database id is
+- [x] `BR-CLOCK`: no decision-visible clock before successful persistence; positive database id is
   mandatory; failed identical inserts retry; confirmation uncertainty is non-negative.
-- [ ] `BR-HEALTH`: pre-match waiting is not an error, current faults recover, cumulative misses do
+  Commit `4fbb79d`. Baseline red and mutation proof recorded.
+- [x] `BR-HEALTH`: pre-match waiting is not an error, current faults recover, cumulative misses do
   not permanently poison health, and id-less state can never appear fresh.
-- [ ] `BR-MODE`: live/demo/legacy rows are preserved and isolated across all study tables and
+  Commit `4fbb79d`. Seven section 4.3 cases pass.
+- [x] `BR-MODE`: live/demo/legacy rows are preserved and isolated across all study tables and
   restarts; startup deletes no observations.
-- [ ] `BR-EVENT`: normalized provider occurrence supports real raw shapes and correction lineage
+  Commit `f3d3de0`. Export manifest per-mode counts and the API mode selector remain open.
+- [x] `BR-EVENT`: normalized provider occurrence supports real raw shapes and correction lineage
   survives restart without cross-match links.
-- [ ] `BR-EXPORT`: a real SQLite backup cannot block event-loop store/status work; legacy export
+  Commit `f3d3de0`. Source-string assertions replaced by runtime tests.
+- [x] `BR-EXPORT`: a real SQLite backup cannot block event-loop store/status work; legacy export
   delegates to the job flow; every task exception is retrieved.
-- [ ] `BR-PATH`: final trade/signal paths retain ownership on failure, end exactly once within the
-  cap, record gaps, calculate without bridging outages, and render after an actual browser click.
-- [ ] `BR-LOCAL` / `BR-AUDIT`: behavioral tests, migration, full validation, API reconciliation,
-  two sleeve/league/frontend/error/download contracts all pass.
+  Commit `00d41f8`. Contention measured under the 250ms bound against a real WAL database.
+- [ ] `BR-PATH`: **PARTIAL — BLOCKED.** Commit `9f831c6` delivers the cap including the terminal
+  row, gap semantics with no bridging, the section 8.3 fixture result exactly, and a real
+  headless-browser click test. Section 8.2's transactional final-close ownership is **not**
+  implemented: a failed final write still does not retain the position or the signal watch, there
+  is no `forward_path_finalized` flag, no `signal_path_persistence_failed` fault, and no startup
+  rebuild. Four section 8.5 tests are unwritten.
+- [ ] `BR-LOCAL` / `BR-AUDIT`: **PARTIAL.** Local gate passes — 260 tests twice, static checks
+  clean, zero tracebacks, zero unretrieved task exceptions; production-schema copy migrates twice
+  with no loss (`BR-04`); section 10 documentation-routing test added. Section 9 API reconciliation
+  assertions and the rendered league/download/mobile contracts are not yet written.
 - [ ] `BR-PROD` / `BR-REVIEW`: authorized review deployment, machine-readable and rendered
   evidence, restart proof, paper-only proof, `kalchi-kill` untouched proof, and independent signoff.
 
 Earlier section-level `PASSED` entries are historical implementation notes, not current acceptance.
 Sections 11, 12, 14, and 15 are explicitly reopened. Section 16 remains blocked. A green unit suite
 does not close this section.
+
+Status at candidate `9f831c6`: **BLOCKED.** Five of eight `BR-*` items are satisfied with baseline
+red, behavioral tests and mutation proof. `BR-PATH` is partial, `BR-LOCAL`/`BR-AUDIT` is partial,
+and `BR-PROD`/`BR-REVIEW` cannot start without an authorised deployment target. Evidence index:
+`docs/evidence/pr12/9f831c6/EVIDENCE_INDEX.md`. PR 12 stays draft.

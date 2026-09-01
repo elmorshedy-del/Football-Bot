@@ -1083,3 +1083,85 @@ all priced samples). The browser tests failed with
 **Rollback.** `git revert <this commit>`. The migration only adds nullable columns and two partial
 indexes; reverting leaves them in place, unread and non-destructive. Summaries persisted under the
 new shape remain readable, but a reverted UI would show the pre-gap fields only.
+
+## PR 12 blocker resolution — work package 5: validation and evidence (`BR-LOCAL`, partial `BR-AUDIT`)
+
+Documentation, tests and evidence only; no runtime behaviour changes in this commit.
+
+**Change.**
+
+- `tests/test_spec_corrections.py` gains the section 10 documentation-routing test. This was
+  specified by the handoff but **was not added by the handoff commit `5f546fe` itself**: that
+  commit edited `AGENTS.md` but added no test to enforce the routing. The test asserts the handoff
+  exists, is substantive, and is listed after `SPEC_CORRECTIONS_AND_DEVIATIONS.md` and before
+  `PRODUCTION_INTEGRITY_IMPLEMENTATION_SPEC.md`. Its docstring records that it is a routing check
+  and not evidence for any runtime behaviour.
+- `tests/test_production_migration.py` builds a database with the schema deployed at the reviewed
+  head — no `latency.mode`, no clock `source`, no provider occurrence columns, no path
+  `sample_seq`, and the old two-column unique fingerprint index — seeds live, demo and legacy
+  null-mode rows, then migrates it twice. It asserts unchanged row counts and value hashes, no
+  duplicate columns or indexes, the fingerprint index replaced rather than duplicated, unrewritten
+  provenance, and that a live boot deletes nothing (`BR-04`).
+- `docs/evidence/pr12/9f831c6/local-validation-gate.txt` records the complete section 10 gate
+  verbatim, and `EVIDENCE_INDEX.md` indexes every artifact with SHA-256 hashes.
+- Checklist section 17 updated per item with commit SHAs and honest partial states.
+
+**After.** Full suite **260 tests, OK**, run twice consecutively under
+`-X dev -W error::RuntimeWarning`. `compileall`, `ruff`, `node --check`, `git diff --check`
+clean. Zero tracebacks; zero unretrieved task exceptions.
+
+## §13 implementer hand-back
+
+```text
+Candidate head/tree:            9f831c6af3b3366451393421ad10666ae655570a
+                                e9515218dda9c574a122bdbb9c526d916213268e
+Commits by work package:        4fbb79d  §3-4  clock publication + current health
+                                f3d3de0  §5-6  evidence modes + provider lineage
+                                00d41f8  §7    non-blocking export + captured failures
+                                9f831c6  §8.3-8.4 gap-aware paths + working chart
+                                (this)   §10   validation, migration and evidence
+Baseline red-test artifact:     docs/evidence/pr12/baseline-cd4d36e/baseline-red-tests.txt
+Targeted test results:          per work package in the entries above; all OK
+Full local/CI results:          260 tests OK, twice; static checks clean;
+                                docs/evidence/pr12/9f831c6/local-validation-gate.txt
+                                CI not yet run on this branch
+Migration-from-production:      tests/test_production_migration.py — 5 tests, migrated
+                                twice, no loss, no duplicate columns/indexes,
+                                provenance unchanged
+Review deployment id/service:   BLOCKED — no authorised target; no deploy access
+Machine-readable evidence:      docs/evidence/pr12/9f831c6/EVIDENCE_INDEX.md
+Rendered evidence index:        PARTIAL — 3 headless-Chromium interaction tests;
+                                desktop/360px screenshots BLOCKED (§11.8)
+Mode/table reconciliation:      tests/test_evidence_modes.py — all 8 study tables
+                                write live mode; demo/legacy preserved across two
+                                restarts; export manifest per-mode counts OUTSTANDING
+Accepted clock-id reconciliation: local only — every accepted stamp resolves to exactly
+                                one match_clock_observations row
+                                (test_every_accepted_clock_stamp_resolves_to_matching_database_row);
+                                production reconciliation BLOCKED (§11.7)
+Export concurrency p50/p95/max: local bound only — max status delay under 250ms against a
+                                real WAL backup; production figures BLOCKED (§11.5)
+Known limitations:              §8.2 transactional final-close ownership NOT implemented;
+                                4 §8.5 tests unwritten; §9 API reconciliation assertions
+                                unwritten; export manifest per-mode counts and API mode
+                                selector outstanding; MATCH_CLOCK_MAX_AGE_MS still a
+                                default not a measurement; store.ex() per-statement commit
+                                on the event loop still unaddressed (own PR)
+Exact rollback command:         git revert 9f831c6 00d41f8 f3d3de0 4fbb79d
+                                Migrations add only nullable columns and two partial
+                                indexes; reverting drops no collected data. Back up
+                                footballbot.db first: reverting f3d3de0 restores the
+                                destructive purge_non_live().
+Paper-only proof:               no live-order endpoint or call added; the diff touches no
+                                order-placement path; Gate A detection, confirmation,
+                                sizing, entry, exit, fees, lockout and settlement are
+                                unchanged. Runtime proof BLOCKED (§11.9)
+kalchi-kill untouched proof:    no file in this diff references the service; no Railway
+                                configuration was modified
+Requested final-review decision: BLOCKED
+```
+
+**Why `BLOCKED` and not `APPROVED`.** `BR-01` is not satisfied while §8.2 is incomplete;
+`BR-05` cannot be satisfied without an authorised deployment; and `BR-07` forbids the
+implementer from self-approving. Per §1, the exact incomplete items are marked `BLOCKED` above
+rather than relabeled as limitations, and PR 12 stays draft.

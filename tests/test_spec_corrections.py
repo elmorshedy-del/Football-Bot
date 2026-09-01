@@ -15,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 NOTES = ROOT / "docs" / "SPEC_CORRECTIONS_AND_DEVIATIONS.md"
 SPEC = ROOT / "docs" / "PRODUCTION_INTEGRITY_IMPLEMENTATION_SPEC.md"
 AGENTS = ROOT / "AGENTS.md"
+HANDOFF = ROOT / "docs" / "PR12_BLOCKER_RESOLUTION_HANDOFF.md"
 
 
 class SpecCorrectionsAreDiscoverableTests(unittest.TestCase):
@@ -36,6 +37,32 @@ class SpecCorrectionsAreDiscoverableTests(unittest.TestCase):
             text.index("SPEC_CORRECTIONS_AND_DEVIATIONS.md"),
             text.index("PRODUCTION_INTEGRITY_IMPLEMENTATION_SPEC.md"),
             "the corrections notes must be listed before the specification",
+        )
+
+    def test_pr12_handoff_exists_and_is_routed_between_notes_and_specification(self):
+        """Handoff section 10: protect instruction discovery for PR 12.
+
+        This is a documentation-routing check only.  It is deliberately NOT
+        evidence for any runtime behaviour -- every `BR-*` item still requires
+        its own behavioural test.
+        """
+        self.assertTrue(HANDOFF.is_file(), f"{HANDOFF.name} was deleted")
+        self.assertGreater(
+            len(HANDOFF.read_text().splitlines()), 100,
+            "the handoff was emptied rather than removed",
+        )
+
+        text = AGENTS.read_text()
+        self.assertIn(HANDOFF.name, text, "AGENTS.md no longer routes to the handoff")
+        self.assertLess(
+            text.index("SPEC_CORRECTIONS_AND_DEVIATIONS.md"),
+            text.index(HANDOFF.name),
+            "the corrections notes must still be listed before the handoff",
+        )
+        self.assertLess(
+            text.index(HANDOFF.name),
+            text.index("PRODUCTION_INTEGRITY_IMPLEMENTATION_SPEC.md"),
+            "the handoff must be listed before the production specification",
         )
 
     def test_every_recorded_item_is_still_present(self):
