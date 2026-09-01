@@ -11,13 +11,16 @@ These instructions apply to the entire repository.
    produced a defect. This applies to anyone *revising the specification* as
    much as to anyone implementing it. `tests/test_spec_corrections.py` enforces
    that this file exists and stays referenced.
-1. Read `docs/PRODUCTION_INTEGRITY_IMPLEMENTATION_SPEC.md` completely. It is the authoritative
+1. **For pull request 12, read `docs/PR12_BLOCKER_RESOLUTION_HANDOFF.md` completely.** It is the
+   binding independent-review remediation contract. Every `BR-*` item requires behavioral and
+   production evidence; earlier `PASSED` labels do not override it.
+2. Read `docs/PRODUCTION_INTEGRITY_IMPLEMENTATION_SPEC.md` completely. It is the authoritative
    contract for the clock, 88+ sleeve, event ledger, trade-high, export, latency, frontend, testing,
    production-verification, review, and rollback work.
-2. Read `docs/DUAL_SLEEVE_IMPLEMENTATION_CHECKLIST.md` and
+3. Read `docs/DUAL_SLEEVE_IMPLEMENTATION_CHECKLIST.md` and
    `docs/DUAL_SLEEVE_CHANGELOG.md`. Update them with exact actions and evidence as work proceeds;
    do not rely on conversational memory.
-3. The README describes the currently deployed behavior. Where its expected-expiration 88-window
+4. The README describes the currently deployed behavior. Where its expected-expiration 88-window
    description conflicts with the production-integrity specification, the specification governs
    the new implementation.
 
@@ -44,8 +47,10 @@ These instructions apply to the entire repository.
 
 ## Working method
 
-- Use implementation branch `codex/production-integrity-clock-export` and one independently
-  revertible PR. Keep the commit boundaries prescribed in Section 10 of the specification.
+- For PR 12, continue the existing branch `cursor/production-integrity-clock-export-aaf8` and the
+  existing draft PR; do not open a replacement PR or force-push. Keep the commit boundaries in the
+  blocker-resolution handoff. For later work, use the branch/commit boundaries prescribed by the
+  applicable specification.
 - Before each implementation section, mark its checklist item in progress and record the exact plan
   and acceptance test. Afterward, record files changed, tests, results, limitations, and rollback.
 - Keep unrelated refactors and formatting out of the PR. Preserve user changes in a dirty worktree.

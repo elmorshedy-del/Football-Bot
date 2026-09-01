@@ -309,7 +309,7 @@ Acceptance tests:
 - The production UI makes trade 51 and its event trace findable in at most two interactions.
 - The repo changelog records findings, exact tests, deployment identifier, and limitations.
 
-## 11. Persist match clocks and canonical provider events — PASSED
+## 11. Persist match clocks and canonical provider events — REOPENED / BLOCKED BY §17
 
 Plan:
 
@@ -337,7 +337,7 @@ Acceptance tests:
 Evidence: PR 12 commit `d0a02aa` — `Persist match clocks and canonical provider events`. Config
 `MATCH_CLOCK_MAX_AGE_MS=2500`. Local suite: 145 tests pass after commit 4.
 
-## 12. Gate paper 88+ sleeve on persisted live clock — PASSED
+## 12. Gate paper 88+ sleeve on persisted live clock — REOPENED / BLOCKED BY §17
 
 Plan:
 
@@ -395,7 +395,7 @@ Acceptance tests:
 Evidence: PR 12 commit `f669841` — `Record executable trade highs and latency readiness`. Local
 suite: 136 tests pass at commit 3.
 
-## 14. Split reliable audit and raw exports — PASSED
+## 14. Split reliable audit and raw exports — REOPENED / BLOCKED BY §17
 
 Plan:
 
@@ -427,7 +427,7 @@ Acceptance tests:
 Evidence: PR 12 commit `d828357` — `Split reliable audit and raw exports`. Local suite: 145 tests
 pass at commit 4.
 
-## 15. Expose clock, high, event, latency, and export audit UI — PASSED
+## 15. Expose clock, high, event, latency, and export audit UI — REOPENED / BLOCKED BY §17
 
 Plan:
 
@@ -505,3 +505,37 @@ replay unit test are already green.
 
 Post-merge: record commit SHA, CI run, deployment ID, exact validation outputs, known
 limitations, and the exact rollback command in `docs/DUAL_SLEEVE_CHANGELOG.md`.
+
+## 17. Resolve independent-review blockers at PR 12 head `cd4d36e` — BLOCKED
+
+Binding plan and acceptance contract:
+
+- `docs/PR12_BLOCKER_RESOLUTION_HANDOFF.md`
+
+The handoff pins the reviewed head/tree, exact implementation sequence, forbidden shortcuts,
+behavioral regression tests, mode/migration rules, export concurrency threshold, path failure and
+gap semantics, browser checks, evidence file names, production/restart verification, rollback, and
+the final reviewer decision vocabulary.
+
+Current blocking groups:
+
+- [ ] `BR-CLOCK`: no decision-visible clock before successful persistence; positive database id is
+  mandatory; failed identical inserts retry; confirmation uncertainty is non-negative.
+- [ ] `BR-HEALTH`: pre-match waiting is not an error, current faults recover, cumulative misses do
+  not permanently poison health, and id-less state can never appear fresh.
+- [ ] `BR-MODE`: live/demo/legacy rows are preserved and isolated across all study tables and
+  restarts; startup deletes no observations.
+- [ ] `BR-EVENT`: normalized provider occurrence supports real raw shapes and correction lineage
+  survives restart without cross-match links.
+- [ ] `BR-EXPORT`: a real SQLite backup cannot block event-loop store/status work; legacy export
+  delegates to the job flow; every task exception is retrieved.
+- [ ] `BR-PATH`: final trade/signal paths retain ownership on failure, end exactly once within the
+  cap, record gaps, calculate without bridging outages, and render after an actual browser click.
+- [ ] `BR-LOCAL` / `BR-AUDIT`: behavioral tests, migration, full validation, API reconciliation,
+  two sleeve/league/frontend/error/download contracts all pass.
+- [ ] `BR-PROD` / `BR-REVIEW`: authorized review deployment, machine-readable and rendered
+  evidence, restart proof, paper-only proof, `kalchi-kill` untouched proof, and independent signoff.
+
+Earlier section-level `PASSED` entries are historical implementation notes, not current acceptance.
+Sections 11, 12, 14, and 15 are explicitly reopened. Section 16 remains blocked. A green unit suite
+does not close this section.

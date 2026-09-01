@@ -711,3 +711,58 @@ Suite: 167 tests pass (was 155). `compileall`, `ruff E9,F63,F7,F82`,
 
 Rollback: additive. Revert the commit; `bid_path_samples` can stay. Set
 `SIGNAL_PATH_WINDOW_S=0` to stop decline-path collection without a deploy.
+
+## 2026-09-01 — Independent final review reopened PR 12
+
+Status: `BLOCKED`. Documentation-only handoff; no strategy logic, deployment, merge, database, or
+Railway service changed in this entry.
+
+Reviewed baseline:
+
+- Pull request `#12`, draft branch `cursor/production-integrity-clock-export-aaf8`.
+- Head `cd4d36e1adeb01d63381fce79b58d6311cfc7b2d`.
+- Tree `70b550d8f620db82e8ca22ee58c4ea294eb5d925`.
+- The existing local suite passed 193 tests and the existing GitHub Actions run passed, but those
+  results did not exercise the failures below. One full-suite run also printed `Task exception was
+  never retrieved` while returning success, which is itself a test-harness blocker.
+
+Executable review findings:
+
+- A new clock identity becomes decision-visible before its SQLite insert completes. An id-less
+  minute-88 clock is accepted, and an insert failure leaves an unchanged id-less identity that is
+  not retried. Reconfirmation can report negative poll uncertainty.
+- Clock health marks ordinary mapped pre-match waiting as unhealthy, treats a cumulative candidate
+  miss as a permanent current fault, and can count id-less state as present/fresh.
+- Goal/provider insert paths omit `mode`; live restart deletes their null-mode rows, while demo
+  fills/latency contaminate live evidence. Legacy null history is deleted rather than preserved.
+- Provider occurrence parsing assumes only nested `details.last_play.occurence_ts`, although the
+  persisted significant-event raw row commonly carries the value at its root. Correction linkage
+  is not restart-safe and its current tests inspect source strings rather than behavior.
+- SQLite backup holds the same global lock used by event-loop status/store calls. Moving the owner
+  to a worker thread does not prevent those event-loop calls from blocking. Legacy `GET /api/export`
+  still snapshots inline, and background-task failure can escape unobserved.
+- Final trade/signal path write failure orphans the retained buffer; the terminal row can exceed and
+  then fall outside the 4,000-row query cap; summary/chart logic bridges quote gaps; and the frontend
+  path cache mixes string and numeric ids so **Show path** can fetch but display nothing.
+
+Binding remediation:
+
+- Added `docs/PR12_BLOCKER_RESOLUTION_HANDOFF.md`, which specifies exact state/schema/API behavior,
+  named behavioral regression tests, failure injection, mutation proof, migration checks, real
+  SQLite export contention, browser interaction, production/restart evidence, rollback, and final
+  reviewer stop/go criteria.
+- Updated `AGENTS.md` so every PR 12 implementer must read that handoff before the production
+  specification.
+- Reopened checklist sections 11, 12, 14, and 15 and added blocking section 17. Section 16 remains
+  blocked on production evidence.
+
+Decision:
+
+- Do not merge or deploy PR 12 from the reviewed head. The next implementer must continue the same
+  draft PR and satisfy every `BR-*` item. A green unit suite alone is not acceptance.
+- No profitability conclusion can be drawn until collection integrity is fixed and a separate
+  leakage-safe backtest has enough evidence.
+- The unrelated Railway service `kalchi-kill` was not touched.
+
+Rollback for this documentation-only commit: revert that commit. It creates no schema/data change
+and does not alter runtime behavior.
