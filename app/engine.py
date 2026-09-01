@@ -55,29 +55,55 @@ def _clock_coverage_check(coverage):
     present = int(coverage.get("clock_present") or 0)
     fresh = int(coverage.get("clock_fresh") or 0)
     stale = int(coverage.get("clock_stale") or 0)
-    misses = int(coverage.get("clock_gate_candidate_misses") or 0)
+    misses = int(
+        coverage.get("clock_gate_candidate_misses_total")
+        or coverage.get("clock_gate_candidate_misses") or 0
+    )
     faults = list(coverage.get("faults") or [])
     mapping_errors = list(coverage.get("mapping_errors") or [])
+    events = coverage.get("events")
     problems = []
-    if watched and not mapped:
-        problems.append("no watched match is mapped to a live clock")
-    elif mapped > present:
-        problems.append(f"{mapped - present} mapped match(es) have no clock")
-    if stale:
-        problems.append(f"{stale} clock(s) stale")
+    if events is None:
+        # Legacy count-only coverage.
+        if watched and not mapped:
+            problems.append("no watched match is mapped to a live clock")
+        if stale:
+            problems.append(f"{stale} clock(s) stale")
+        if mapping_errors:
+            problems.append(f"{len(mapping_errors)} mapping error(s)")
+        if faults and not problems:
+            problems.append(f"{len(faults)} clock fault(s)")
+    else:
+        # Health is decided from per-event CURRENT state.  Count arithmetic
+        # reported a mapped pre-match fixture as a missing clock, and a single
+        # cumulative miss as a permanent fault that recovery could never clear.
+        if watched and not mapped:
+            problems.append("no watched match is mapped to a live clock")
+        reasons = {}
+        for row in events:
+            if row.get("state") == "fault" and row.get("current_fault"):
+                reasons.setdefault(row["current_fault"], 0)
+                reasons[row["current_fault"]] += 1
+        for reason, count in sorted(reasons.items()):
+            problems.append(f"{count} clock {reason.replace('_', ' ')}")
+    # Cumulative evidence is reported but never blocks recovery.
+    notes = []
     if misses:
-        problems.append(f"{misses} 88-gate candidate miss(es)")
-    if mapping_errors:
-        problems.append(f"{len(mapping_errors)} mapping error(s)")
-    if faults and not problems:
-        problems.append(f"{len(faults)} clock fault(s)")
+        notes.append(f"{misses} 88-gate candidate miss(es) recorded")
+    waiting = int(coverage.get("clock_waiting") or 0)
+    if waiting and not problems:
+        notes.append(f"{waiting} match(es) waiting for kickoff")
+    status = "; ".join(problems + notes) if (problems or notes) else "observing"
     return {
         "healthy": not problems,
-        "status": "observing" if not problems else "; ".join(problems),
+        "status": status,
         "watched": watched, "mapped": mapped, "clock_present": present,
         "clock_fresh": fresh, "clock_stale": stale,
+        "clock_waiting": waiting,
         "clock_gate_candidate_misses": misses,
+        "clock_gate_candidate_misses_total": misses,
         "faults": len(faults), "mapping_errors": len(mapping_errors),
+        "events": events or [],
     }
 
 
@@ -460,9 +486,12 @@ class Engine:
             stamp = self.clock_tracker.stamp(event, signal_ts)
             if not stamp.get("usable_for_88_gate"):
                 reason = stamp.get("unusable_reason")
-                if reason in {"unmapped", "stale", "malformed", "missing_clock"}:
+                if reason in {
+                    "unmapped", "stale", "malformed", "missing_clock", "unpersisted",
+                }:
+                    # Count it as cumulative evidence only.  Latching it as a
+                    # current fault made the banner unrecoverable after one miss.
                     self.clock_tracker.clock_gate_candidate_misses += 1
-                    self.clock_tracker.faults[event] = reason
                     self._record_error(
                         "match_clock",
                         f"{event}: clock stamp unusable ({reason})",

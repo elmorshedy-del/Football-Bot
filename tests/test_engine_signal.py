@@ -24,7 +24,7 @@ class SignalPersistenceTests(unittest.TestCase):
             "received_wall": 1.0, "started_wall": 0.999,
             "previous_poll_ts": 0.75, "response_ms": 5.0,
         })
-        engine.clock_tracker.latest["E"]["id"] = 9
+        engine.clock_tracker.promote("E", 9)
         engine.record_signal = Mock(return_value=42)
         engine._announce_signal = Mock()
         return engine
@@ -203,6 +203,9 @@ class SignalPersistenceTests(unittest.TestCase):
             "received_wall": 1.0, "started_wall": 0.999,
             "previous_poll_ts": 0.75, "response_ms": 5.0,
         })
+        # A reading is only decision-visible once persisted, so the 87 must be
+        # promoted to replace the 90+5 established by make_engine().
+        engine.clock_tracker.promote("E", 10)
         candidate = {
             "ticker": "T", "ts_ms": 1000, "local_ts": 1.0, "dir": 1,
             "dl": 1.0, "levels": 5, "size": 200.0, "ref": 40.0, "ext": 60.0,

@@ -98,7 +98,7 @@ class DemoReplay:
         )
         if row is not None:
             row_id = store.insert_match_clock(row)
-            self.e.clock_tracker.latest[EVENT]["id"] = row_id
+            self.e.clock_tracker.promote(EVENT, row_id)
         while True:
             loop_n += 1
             self.e.demo_status = f"loop {loop_n} — Espanyol 1-1 Real Madrid, closing minutes"

@@ -323,6 +323,18 @@ def clock_max_age_ms():
     return max(float(config.GOAL_LATENCY_POLL_MS) * 10.0, 2500.0)
 
 
+def is_persisted_id(value):
+    """True only for a positive integer database row id.
+
+    The 88+ gate must fail closed on anything else.  A candidate clock that has
+    not yet been written -- or whose insert failed -- has no lineage, so an
+    accepted signal could never be reconciled against SQLite afterwards.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return False
+    return value > 0
+
+
 def evaluate_clock_gate(parsed, age_ms, mapped=True):
     """Return (accepted, outcome, usable, unusable_reason).
 
@@ -356,7 +368,12 @@ def evaluate_clock_gate(parsed, age_ms, mapped=True):
         return False, "clock_period_unusable", False, "period_unusable"
     if parsed.provider_period is None and parsed.provider_minute < 46:
         return False, "clock_first_half", False, "first_half"
-    if age_ms is None or age_ms < 0 or age_ms > clock_max_age_ms():
+    if age_ms is not None and age_ms < 0:
+        # A receipt later than the signal cannot have informed it.  Coercing the
+        # age to zero here would let a clock from the future look perfectly
+        # fresh, so the reading is refused and the negative age is preserved.
+        return False, "clock_future", False, "future_timestamp"
+    if age_ms is None or age_ms > clock_max_age_ms():
         return False, "clock_stale", False, "stale"
     if parsed.provider_minute < 88:
         return False, "clock_pre_88", False, "pre_88"
@@ -374,8 +391,11 @@ def unusable_stamp(event, signal_local_ts, reason, **extra):
         "provider_clock": None,
         "provider_status": None,
         "observed_ts": None,
+        "confirmed_ts": None,
+        "confirmation_previous_poll_ts": None,
         "signal_local_ts": signal_local_ts,
         "age_ms": None,
+        "established_age_ms": None,
         "poll_uncertainty_ms": None,
         "source": CLOCK_SOURCE,
         "precision": CLOCK_PRECISION,
@@ -396,6 +416,17 @@ def stamp_from_observation(observation, event, signal_local_ts, mapped=True):
         return unusable_stamp(
             event, signal_local_ts, reason,
             gate_outcome="clock_unmapped" if reason == "unmapped" else "clock_missing",
+        )
+    if not mapped:
+        return unusable_stamp(
+            event, signal_local_ts, "unmapped", gate_outcome="clock_unmapped",
+        )
+    observation_id = observation.get("id")
+    if not is_persisted_id(observation_id):
+        # Fail closed before any minute/status logic: without a row id this
+        # reading cannot be reconciled to SQLite, so it is not evidence.
+        return unusable_stamp(
+            event, signal_local_ts, "unpersisted", gate_outcome="clock_unpersisted",
         )
     parsed = ParsedClock(
         provider_period=observation.get("provider_period"),
@@ -420,16 +451,34 @@ def stamp_from_observation(observation, event, signal_local_ts, mapped=True):
     established_age_ms = None
     if isinstance(observed_ts, (int, float)) and isinstance(signal_local_ts, (int, float)):
         established_age_ms = round((signal_local_ts - observed_ts) * 1000.0, 3)
+    gate_age_ms = age_ms
+    if (
+        isinstance(established_age_ms, (int, float))
+        and established_age_ms < 0
+        and (gate_age_ms is None or gate_age_ms >= 0)
+    ):
+        # The persisted receipt itself is in the future; fail closed on that too.
+        gate_age_ms = established_age_ms
     accepted, outcome, usable, reason = evaluate_clock_gate(
-        parsed, age_ms, mapped=mapped,
+        parsed, gate_age_ms, mapped=mapped,
     )
-    previous = observation.get("previous_poll_ts")
+    # Confirmation uncertainty describes the poll interval that established the
+    # CURRENT confirmation, so both endpoints must come from that confirmation.
+    # Measuring from the original observed_ts went negative as soon as the row
+    # was re-confirmed by a later poll.
+    confirmation_previous = observation.get("confirmation_previous_poll_ts")
+    if confirmation_previous is None and confirmed_ts == observed_ts:
+        confirmation_previous = observation.get("previous_poll_ts")
     poll_uncertainty_ms = None
-    if isinstance(observed_ts, (int, float)) and isinstance(previous, (int, float)):
-        poll_uncertainty_ms = round((observed_ts - previous) * 1000.0, 3)
+    if isinstance(confirmed_ts, (int, float)) and isinstance(
+        confirmation_previous, (int, float),
+    ):
+        interval_ms = round((confirmed_ts - confirmation_previous) * 1000.0, 3)
+        if interval_ms >= 0:
+            poll_uncertainty_ms = interval_ms
     return {
         "schema": CLOCK_STAMP_SCHEMA,
-        "observation_id": observation.get("id"),
+        "observation_id": observation_id,
         "event": event,
         "provider_period": parsed.provider_period,
         "provider_minute": parsed.provider_minute,
@@ -438,6 +487,7 @@ def stamp_from_observation(observation, event, signal_local_ts, mapped=True):
         "provider_status": parsed.provider_status,
         "observed_ts": observed_ts,
         "confirmed_ts": confirmed_ts,
+        "confirmation_previous_poll_ts": confirmation_previous,
         "signal_local_ts": signal_local_ts,
         "age_ms": age_ms,
         "established_age_ms": established_age_ms,
@@ -465,6 +515,14 @@ class MatchClockTracker:
         self.last_confirmed = {}
         self.clock_gate_candidate_misses = 0
         self.mapping_errors = {}
+        # Candidates awaiting their database id.  Nothing in here is
+        # decision-visible: `latest` still holds the previous persisted row.
+        self.pending = {}
+        self.persistence_faults = {}
+        # Current provider status per event, even when no minute parsed.  A
+        # live match with no clock is a fault; a pre-match one is just waiting.
+        self.provider_status = {}
+        self.candidate_active = set()
 
     def set_mapping(self, event, milestone_id, error=None):
         if milestone_id:
@@ -481,12 +539,57 @@ class MatchClockTracker:
         self.last_confirmed.pop(event, None)
         self.faults.pop(event, None)
         self.mapping_errors.pop(event, None)
+        self.pending.pop(event, None)
+        self.persistence_faults.pop(event, None)
+        self.provider_status.pop(event, None)
+        self.candidate_active.discard(event)
+
+    def mark_candidate_active(self, event, active=True):
+        """Record whether a price-only candidate is currently live on this event."""
+        if active:
+            self.candidate_active.add(event)
+        else:
+            self.candidate_active.discard(event)
+
+    def promote(self, event, row_id):
+        """Publish the pending candidate now that its row id exists.
+
+        This is the only path that makes a new reading decision-visible.
+        """
+        if not is_persisted_id(row_id):
+            raise ValueError(f"refusing to promote non-positive row id {row_id!r}")
+        pending = self.pending.pop(event, None)
+        if pending is None:
+            return None
+        row = dict(pending["row"])
+        row["id"] = row_id
+        self.latest[event] = row
+        self.last_identity[event] = pending["identity"]
+        self.persistence_faults.pop(event, None)
+        self._mark_presence(event, pending["parsed"], row.get("confirmed_ts"))
+        return row
+
+    def fail_persist(self, event, error):
+        """Record a failed insert.
+
+        The candidate is discarded and the identity was never committed, so the
+        next identical poll builds a fresh candidate and retries.  The previous
+        persisted observation stays visible in the meantime.
+        """
+        self.pending.pop(event, None)
+        self.persistence_faults[event] = str(error) or "clock_persistence_failed"
 
     def observe(self, event, milestone_id, parsed, timing):
-        """Update cache. Return a row to persist if identity changed, else None."""
+        """Build a candidate row to persist, or None when nothing new is needed.
+
+        A new identity is NOT published here: it goes to `pending` and only
+        becomes decision-visible through `promote()` once SQLite has given it a
+        positive row id.
+        """
         self.set_mapping(event, milestone_id)
         identity = parsed.identity if parsed else (None, None, None, None)
         previous = self.last_identity.get(event)
+        self.provider_status[event] = parsed.provider_status if parsed else None
         observation = {
             "observed_ts": timing["received_wall"],
             "poll_started_ts": timing["started_wall"],
@@ -510,15 +613,27 @@ class MatchClockTracker:
             # a new one.  Replacing the cache here would drop the persisted row
             # id and advance observed_ts to a time with no database row, so the
             # 88 gate would accept a clock with no lineage.  Only freshness moves.
+            #
+            # The original previous_poll_ts stays untouched: it belongs to the
+            # receipt that established the row.  The confirmation interval is
+            # tracked separately, otherwise uncertainty measured from the
+            # original observed_ts goes negative on the second reconfirmation.
             cached["confirmed_ts"] = confirmed_ts
-            cached["previous_poll_ts"] = timing.get("previous_poll_ts")
+            cached["confirmation_previous_poll_ts"] = timing.get("previous_poll_ts")
             cached["response_ms"] = timing["response_ms"]
             self._mark_presence(event, parsed, confirmed_ts)
             return None
+        in_flight = self.pending.get(event)
+        if in_flight is not None and in_flight["identity"] == identity:
+            # An insert for this exact reading is already in flight; a second
+            # candidate would duplicate the row.  A failed insert clears pending,
+            # so the retry path stays open.
+            return None
         observation["confirmed_ts"] = confirmed_ts
-        self.latest[event] = dict(observation)
-        self._mark_presence(event, parsed, confirmed_ts)
-        self.last_identity[event] = identity
+        observation["confirmation_previous_poll_ts"] = timing.get("previous_poll_ts")
+        self.pending[event] = {
+            "row": observation, "identity": identity, "parsed": parsed,
+        }
         return observation
 
     def _mark_presence(self, event, parsed, confirmed_ts):
@@ -534,14 +649,10 @@ class MatchClockTracker:
         else:
             self.clock_present.discard(event)
         self.last_confirmed[event] = confirmed_ts
-        if not (event in self.mapped):
-            self.faults[event] = "unmapped"
-        elif parsed is None:
-            self.faults[event] = "malformed"
-        elif parsed.provider_minute is None:
-            self.faults[event] = "missing_clock"
-        else:
-            self.faults.pop(event, None)
+        # Current fault reasons are derived in `coverage()` from live state, not
+        # latched here: a latched reason outlived the condition that caused it
+        # and made recovery to a green banner impossible.
+        self.faults.pop(event, None)
 
     def ingest_synthetic(self, event, milestone_id, parsed, observed_ts, source):
         """Demo/test helper: install a clock without a live poll."""
@@ -554,21 +665,30 @@ class MatchClockTracker:
         row = self.observe(event, milestone_id, parsed, timing)
         if row is not None:
             row["source"] = source
-            self.latest[event]["source"] = source
+            self.pending[event]["row"]["source"] = source
         elif event in self.latest:
             self.latest[event]["source"] = source
         return row
 
     def stamp(self, event, signal_local_ts, persist_id=None):
+        """Stamp from the decision-visible observation only.
+
+        `pending` is never consulted: a candidate without a row id has no
+        lineage and must not reach the 88+ gate.
+        """
         mapped = event in self.mapped
         observation = self.latest.get(event)
         if observation is not None and persist_id is not None:
             observation = dict(observation)
             observation["id"] = persist_id
-        result = stamp_from_observation(observation, event, signal_local_ts, mapped=mapped)
-        if observation is not None and observation.get("id") is None and persist_id is None:
-            result["observation_id"] = observation.get("id")
-        return result
+        if observation is None and event in self.pending:
+            return unusable_stamp(
+                event, signal_local_ts, "unpersisted",
+                gate_outcome="clock_unpersisted",
+            )
+        return stamp_from_observation(
+            observation, event, signal_local_ts, mapped=mapped,
+        )
 
     def coverage(self, watched_events=None, now=None):
         """Coverage as of `now`.
@@ -582,33 +702,90 @@ class MatchClockTracker:
         now = time.time() if now is None else now
         max_age_s = clock_max_age_ms() / 1000.0
         watched = set(watched_events or [])
-        mapped = set(self.mapped) & watched if watched else set(self.mapped)
-        present = self.clock_present & (watched or self.clock_present)
-        scope = watched or set(self.last_confirmed)
-        fresh = {
-            event for event in scope
-            if event in self.clock_present
-            and isinstance(self.last_confirmed.get(event), (int, float))
-            and 0 <= (now - self.last_confirmed[event]) <= max_age_s
-        }
-        stale = {
-            event for event in scope
-            if event in self.clock_present and event not in fresh
-        }
-        faults = dict(self.faults)
-        for event in stale:
-            faults.setdefault(event, "stale")
+        scope = watched or (
+            set(self.mapped) | set(self.latest) | set(self.pending)
+            | set(self.provider_status) | set(self.last_confirmed)
+        )
+
+        events = []
+        for event in sorted(scope):
+            observation = self.latest.get(event)
+            observation_id = observation.get("id") if observation else None
+            persisted = is_persisted_id(observation_id)
+            minute = observation.get("provider_minute") if persisted else None
+            confirmed = self.last_confirmed.get(event)
+            present = bool(persisted and minute is not None)
+            fresh = bool(
+                present and isinstance(confirmed, (int, float))
+                and 0 <= (now - confirmed) <= max_age_s
+            )
+            status = self.provider_status.get(event)
+            candidate = event in self.candidate_active
+            mapped = event in self.mapped
+            # A live match or an active candidate needs a usable clock right
+            # now.  A mapped fixture that has not kicked off is simply waiting,
+            # which is healthy and must not redden the banner.
+            needs_clock = candidate or status in {"live", "suspended"}
+            fault = self.faults.get(event)
+            if fault is None:
+                if not mapped:
+                    fault = "unmapped"
+                elif event in self.mapping_errors:
+                    fault = "mapping_error"
+                elif event in self.persistence_faults:
+                    fault = "clock_persistence_failed"
+                elif present and not fresh:
+                    fault = "stale"
+                elif not present and needs_clock:
+                    in_flight = self.pending.get(event)
+                    in_flight_parsed = in_flight.get("parsed") if in_flight else None
+                    if in_flight_parsed is not None and (
+                        in_flight_parsed.provider_minute is not None
+                    ):
+                        # A real minute is parsed but not yet written.
+                        fault = "unpersisted"
+                    elif observation is not None or status is not None:
+                        fault = "missing_clock"
+                    else:
+                        fault = "malformed"
+            if fault:
+                state = "fault"
+            elif present:
+                state = "observing"
+            else:
+                state = "waiting"
+            events.append({
+                "event": event,
+                "mapped": mapped,
+                "provider_status": status,
+                "observation_id": observation_id if persisted else None,
+                "clock_present": present,
+                "clock_fresh": fresh,
+                "last_confirmed_ts": confirmed,
+                "candidate_active": candidate,
+                "current_fault": fault,
+                "state": state,
+            })
+
+        faulted = [row for row in events if row["current_fault"]]
         return {
             "watched": len(watched) if watched_events is not None else len(self.mapped),
-            "mapped": len(mapped),
-            "clock_present": len(present),
-            "clock_fresh": len(fresh),
-            "clock_stale": len(stale),
+            "mapped": sum(1 for row in events if row["mapped"]),
+            "clock_present": sum(1 for row in events if row["clock_present"]),
+            "clock_fresh": sum(1 for row in events if row["clock_fresh"]),
+            "clock_stale": sum(
+                1 for row in events
+                if row["clock_present"] and not row["clock_fresh"]
+            ),
+            "clock_waiting": sum(1 for row in events if row["state"] == "waiting"),
+            # Cumulative evidence, kept for audit.  It is deliberately NOT a
+            # current fault: one historical miss must not block recovery forever.
+            "clock_gate_candidate_misses_total": self.clock_gate_candidate_misses,
             "clock_gate_candidate_misses": self.clock_gate_candidate_misses,
+            "events": events,
             "faults": [
-                {"event": event, "reason": reason}
-                for event, reason in sorted(faults.items())
-                if not watched or event in watched
+                {"event": row["event"], "reason": row["current_fault"]}
+                for row in faulted
             ],
             "mapping_errors": [
                 {"event": event, "error": error}
@@ -628,10 +805,13 @@ class MatchClockGate:
         "event", "observation_id", "provider_period", "provider_minute",
         "provider_stoppage", "provider_clock", "provider_status",
         "age_ms", "source", "precision", "mapped",
+        "declared_outcome", "declared_reason",
     )
 
     def __init__(self, stamp, mapped=None):
         stamp = stamp or {}
+        self.declared_outcome = stamp.get("gate_outcome")
+        self.declared_reason = stamp.get("unusable_reason")
         self.event = stamp.get("event")
         self.observation_id = stamp.get("observation_id")
         self.provider_period = stamp.get("provider_period")
@@ -647,7 +827,32 @@ class MatchClockGate:
         else:
             self.mapped = mapped
 
+    def _result(self, accepted, outcome, usable, reason):
+        return {
+            "accepted": accepted,
+            "outcome": outcome,
+            "usable_for_88_gate": usable,
+            "unusable_reason": reason,
+            "provider_clock": self.provider_clock,
+            "provider_minute": self.provider_minute,
+            "provider_stoppage": self.provider_stoppage,
+            "provider_period": self.provider_period,
+            "provider_status": self.provider_status,
+            "age_ms": self.age_ms,
+            "observation_id": self.observation_id,
+            "source": self.source,
+        }
+
     def evaluate(self):
+        if self.declared_reason and self.declared_outcome:
+            # The stamp already failed closed upstream.  Re-deriving here would
+            # relabel a specific refusal (unmapped, stale, unpersisted) as
+            # whatever the null fields happen to evaluate to.
+            return self._result(False, self.declared_outcome, False, self.declared_reason)
+        if not is_persisted_id(self.observation_id):
+            # Fail closed before minute/status logic.  A caller that hands in a
+            # raw dict must not be able to bypass the lineage requirement.
+            return self._result(False, "clock_unpersisted", False, "unpersisted")
         parsed = ParsedClock(
             provider_period=self.provider_period,
             provider_minute=self.provider_minute,

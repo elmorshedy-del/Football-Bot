@@ -7,6 +7,7 @@ import threading
 import time
 
 from . import config
+from . import match_clock
 from .match_events import normalize_match_event
 
 _lock = threading.Lock()
@@ -148,6 +149,20 @@ def init():
             _conn.execute(f"ALTER TABLE markets ADD COLUMN {column} TEXT")
         except sqlite3.OperationalError:
             pass
+    # Every new clock row records the exact source behind its stamp.  Legacy
+    # rows keep a null source and are presented as legacy_unknown; they are
+    # never relabeled as the current provider.
+    for column, definition in (
+        ("source", "TEXT"),
+        ("confirmed_ts", "REAL"),
+        ("confirmation_previous_poll_ts", "REAL"),
+    ):
+        try:
+            _conn.execute(
+                f"ALTER TABLE match_clock_observations ADD COLUMN {column} {definition}"
+            )
+        except sqlite3.OperationalError:
+            pass  # already exists
     for column, definition in (
         ("canonical_type", "TEXT"),
         ("canonical_side", "TEXT"),
@@ -555,8 +570,9 @@ def insert_match_clock(row):
         """INSERT INTO match_clock_observations(
                observed_ts,poll_started_ts,previous_poll_ts,response_ms,event,milestone_id,
                provider_period,provider_minute,provider_stoppage,provider_clock,
-               provider_status,precision,raw_context,mode)
-             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               provider_status,precision,raw_context,mode,source,confirmed_ts,
+               confirmation_previous_poll_ts)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             row["observed_ts"], row["poll_started_ts"], row.get("previous_poll_ts"),
             row["response_ms"], row["event"], row["milestone_id"],
@@ -565,6 +581,9 @@ def insert_match_clock(row):
             row.get("provider_status"), row.get("precision") or "provider_minute_polled",
             json.dumps(row.get("raw_context") or {}, separators=(",", ":")),
             _mode,
+            row.get("source") or match_clock.CLOCK_SOURCE,
+            row.get("confirmed_ts"),
+            row.get("confirmation_previous_poll_ts"),
         ),
     )
     return cur.lastrowid

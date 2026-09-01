@@ -766,3 +766,90 @@ Decision:
 
 Rollback for this documentation-only commit: revert that commit. It creates no schema/data change
 and does not alter runtime behavior.
+
+## PR 12 blocker resolution — work package 1: clock publication and current health (`BR-CLOCK`, `BR-HEALTH`)
+
+Implements sections 3 and 4 of `docs/PR12_BLOCKER_RESOLUTION_HANDOFF.md`. Starting head for this
+pass was `5f546fe` (the reviewed head `cd4d36e` plus the docs-only handoff commit; no code delta,
+so every finding at the reviewed head still applied unchanged).
+
+**Before (`BR-00`).** The named regressions were written first and run against that head. Full
+command and output: `docs/evidence/pr12/baseline-cd4d36e/baseline-red-tests.txt` — 22 red
+assertions across 19 tests. Representative failures:
+
+- `test_signal_during_blocked_clock_insert_rejects_unpersisted_clock` —
+  `'clock_88_plus' == 'clock_88_plus' : an unpersisted candidate was accepted by the 88+ gate`.
+  A signal running while `insert_match_clock` was still awaiting read the id-less candidate and
+  the gate accepted it.
+- `test_unchanged_poll_preserves_id_and_uses_latest_confirmation_interval` — receipts
+  10.00/10.25/10.50 reported `poll_uncertainty_ms = -250.0`, reproducing the reviewed defect
+  exactly. Reconfirmation advanced `previous_poll_ts` on the cached row while pinning
+  `observed_ts`, and uncertainty was measured between those two unrelated endpoints.
+- `test_unpersisted_clock_fails_closed_before_minute_logic` — an observation with `id` of `None`,
+  `0`, `-1` or `"12"` still reached `clock_88_plus`.
+- `test_future_observation_and_confirmation_fail_closed` — a receipt later than the signal was
+  labelled `clock_stale` rather than refused as a future timestamp.
+- The seven section 4.3 health cases errored: coverage exposed no per-event state at all.
+- `test_restart_requires_new_provider_confirmation_for_freshness` passed at the reviewed head and
+  is retained as a guard, not claimed as a fixed defect.
+
+**Change.** Files: `app/match_clock.py`, `app/goal_latency.py`, `app/engine.py`, `app/store.py`,
+`app/replay.py`.
+
+- Two-phase publication. `MatchClockTracker.observe()` now parks a new identity in `pending` and
+  changes no decision-visible value; `promote(event, row_id)` is the only path that publishes, and
+  it rejects any non-positive id; `fail_persist(event, error)` discards the candidate, records a
+  current `clock_persistence_failed` fault and leaves the identity uncommitted so the next
+  identical poll retries. `_record_clock()` persists before publishing and no longer lets an
+  insert exception escape.
+- Gate invariant. `is_persisted_id()` gates both `stamp_from_observation()` and
+  `MatchClockGate.evaluate()`, which fail closed to
+  `{"accepted": false, "outcome": "clock_unpersisted", "usable_for_88_gate": false,
+  "unusable_reason": "unpersisted"}` before any minute/status logic. A stamp that already failed
+  closed upstream keeps its own reason instead of being re-derived from null fields. A receipt
+  later than the signal returns `clock_future` / `future_timestamp` with the negative age
+  preserved, never coerced to zero.
+- Confirmation lineage. The cached row keeps its original `observed_ts` and `previous_poll_ts` and
+  tracks `confirmation_previous_poll_ts` separately, so `poll_uncertainty_ms` is
+  `(confirmed_ts - confirmation_previous_poll_ts) * 1000`, is null when either endpoint is missing,
+  and is never negative.
+- Schema. `source`, `confirmed_ts` and `confirmation_previous_poll_ts` added idempotently to
+  `match_clock_observations` following the existing `mode` migration pattern. Every new row stores
+  its exact clock source; legacy rows keep a null source and are not relabeled.
+- Health. `coverage()` returns an `events` array carrying `event`, `mapped`, `provider_status`,
+  `observation_id`, `clock_present`, `clock_fresh`, `last_confirmed_ts`, `candidate_active`,
+  `current_fault` and `state` (`waiting` / `observing` / `fault`). Presence and freshness count
+  only a positive-id decision-visible observation; freshness is derived from the current time on
+  every request. Fault reasons are derived at query time rather than latched, so a successful
+  persisted reconfirmation clears the event's fault. Cumulative misses moved to
+  `clock_gate_candidate_misses_total`, reported but never blocking. `_clock_coverage_check()` reads
+  per-event current state instead of count arithmetic, so a mapped pre-match fixture is healthy
+  `waiting`; it retains a legacy count path for callers that pass count-only coverage.
+
+**After.** Targeted: `python -m unittest tests.test_match_clock.TwoPhaseClockPublicationTests
+tests.test_match_clock.ClockDatabaseLineageTests
+tests.test_goal_latency.ClockPersistenceHandoffTests tests.test_health.CurrentClockHealthTests`
+— 19 tests, OK. Full suite: `python -X dev -W error::RuntimeWarning -m unittest discover -s tests`
+— 212 tests, OK. `compileall`, `ruff check --select E9,F63,F7,F82`, `node --check static/app.js`
+and `git diff --check` all clean.
+
+**Mutation.** `is_persisted_id()` was temporarily replaced with `return True`. The suite went to 13
+failing assertions across four files, including
+`test_unpersisted_clock_fails_closed_before_minute_logic` (all four id shapes),
+`test_gate_object_fails_closed_on_unpersisted_id_even_when_mapped`,
+`test_candidate_is_invisible_until_promoted` and the five affected health cases. The mutation was
+reverted and is not committed.
+
+**Limitations.**
+
+- `MATCH_CLOCK_MAX_AGE_MS = 2500` is still a default, not a measurement, and is unchanged here.
+- A pre-existing unretrieved background-export task exception still prints during the suite while
+  unittest exits zero. It is `BR-EXPORT` section 7.1 work and is not addressed in this commit; it
+  remains a `BR-03` gate failure until then.
+- Production evidence for these paths (`BR-PROD`) is not collected: it needs an authorised deploy.
+- Existing tests that published a clock by assigning `latest[event]["id"]` were rewritten to call
+  `promote()`. That is the intended semantic change, not a test weakening: under the new model an
+  unpersisted reading is not decision-visible.
+
+**Rollback.** `git revert <this commit>`. The migration only adds nullable columns; reverting the
+code leaves them in place, unread and non-destructive. No collected data is dropped.

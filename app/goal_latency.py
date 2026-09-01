@@ -16,7 +16,7 @@ _SUBSTANTIVE_FOR_REVISION = {
     "goal.observed", "penalty.scored", "score.correction",
     "goal.disallowed", "var.overturned",
 }
-from .match_clock import MatchClockTracker, parse_current_clock
+from .match_clock import MatchClockTracker, is_persisted_id, parse_current_clock
 from .match_events import (
     iter_provider_event_rows,
     normalize_match_event,
@@ -225,9 +225,24 @@ class GoalLatencyObserver:
         })
         if row is None:
             return parsed
-        row_id = await asyncio.to_thread(store.insert_match_clock, row)
-        if event in self.clock_tracker.latest:
-            self.clock_tracker.latest[event]["id"] = row_id
+        # Persist first, publish second.  Until this returns a positive row id
+        # the previous persisted observation stays the only decision-visible
+        # one, so a signal racing this await cannot read an id-less clock.
+        try:
+            row_id = await asyncio.to_thread(store.insert_match_clock, row)
+        except Exception as exc:
+            self.clock_tracker.fail_persist(event, exc)
+            store.log_event(
+                "match_clock",
+                f"{event}: clock insert failed ({exc!r}); retrying on next poll",
+            )
+            return parsed
+        if not is_persisted_id(row_id):
+            self.clock_tracker.fail_persist(
+                event, ValueError(f"insert returned non-positive id {row_id!r}"),
+            )
+            return parsed
+        self.clock_tracker.promote(event, row_id)
         self.clocks_recorded += 1
         return parsed
 

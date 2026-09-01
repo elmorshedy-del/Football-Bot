@@ -203,3 +203,123 @@ class ClockCoverageHealthTests(unittest.TestCase):
         source = inspect.getsource(engine.Engine.status)
         self.assertIn('"match_clock": _clock_coverage_check', source)
         self.assertIn('if name != "latency_evidence"', source)
+
+
+class CurrentClockHealthTests(unittest.TestCase):
+    """Handoff section 4: current state and cumulative evidence are separate."""
+
+    def tracker(self, event="EV"):
+        from app.match_clock import MatchClockTracker
+        t = MatchClockTracker()
+        t.set_mapping(event, "m1")
+        return t
+
+    def parsed(self, minute=None, period=None, status="live", stoppage=None):
+        from app.match_clock import ParsedClock
+        rendered = None
+        if minute is not None:
+            rendered = f"{minute}+{stoppage}'" if stoppage else f"{minute}'"
+        return ParsedClock(period, minute, stoppage, rendered, status, "time", {})
+
+    def timing(self, ts):
+        return {"received_wall": ts, "started_wall": ts - 0.05,
+                "response_ms": 50.0, "previous_poll_ts": ts - 0.25}
+
+    def event_row(self, coverage, event="EV"):
+        rows = [row for row in coverage.get("events") or [] if row["event"] == event]
+        self.assertEqual(len(rows), 1, f"expected exactly one coverage row for {event}")
+        return rows[0]
+
+    def test_mapped_pre_match_without_clock_is_healthy_waiting(self):
+        from app.engine import _clock_coverage_check
+        t = self.tracker()
+        t.observe("EV", "m1", self.parsed(status="pre-match"), self.timing(1000.0))
+
+        coverage = t.coverage({"EV"}, now=1000.05)
+        row = self.event_row(coverage)
+        self.assertEqual(row["state"], "waiting")
+        self.assertIsNone(row["current_fault"])
+        self.assertTrue(_clock_coverage_check(coverage)["healthy"])
+
+    def test_live_provider_without_persisted_clock_is_fault(self):
+        from app.engine import _clock_coverage_check
+        t = self.tracker()
+        t.observe("EV", "m1", self.parsed(status="live"), self.timing(1000.0))
+
+        coverage = t.coverage({"EV"}, now=1000.05)
+        row = self.event_row(coverage)
+        self.assertEqual(row["state"], "fault")
+        self.assertEqual(row["current_fault"], "missing_clock")
+        self.assertFalse(_clock_coverage_check(coverage)["healthy"])
+
+    def test_active_candidate_with_missing_or_stale_clock_is_fault(self):
+        from app.engine import _clock_coverage_check
+        t = self.tracker()
+        t.observe("EV", "m1", self.parsed(status=None), self.timing(1000.0))
+        t.mark_candidate_active("EV", True)
+
+        coverage = t.coverage({"EV"}, now=1000.05)
+        row = self.event_row(coverage)
+        self.assertTrue(row["candidate_active"])
+        self.assertEqual(row["state"], "fault")
+        self.assertFalse(_clock_coverage_check(coverage)["healthy"])
+
+    def test_persisted_reconfirmation_clears_current_fault_but_keeps_total_miss_count(self):
+        from app.engine import _clock_coverage_check
+        t = self.tracker()
+        t.observe("EV", "m1", self.parsed(status="live"), self.timing(1000.0))
+        t.clock_gate_candidate_misses += 3
+        self.assertFalse(_clock_coverage_check(t.coverage({"EV"}, now=1000.05))["healthy"])
+
+        t.observe("EV", "m1", self.parsed(90, "2nd", "live"), self.timing(1001.0))
+        t.promote("EV", 12)
+
+        coverage = t.coverage({"EV"}, now=1001.05)
+        row = self.event_row(coverage)
+        self.assertEqual(row["state"], "observing")
+        self.assertIsNone(row["current_fault"])
+        self.assertEqual(coverage["clock_gate_candidate_misses_total"], 3)
+        self.assertTrue(
+            _clock_coverage_check(coverage)["healthy"],
+            "a historical miss must not block recovery forever",
+        )
+
+    def test_pending_idless_clock_never_counts_present_or_fresh(self):
+        t = self.tracker()
+        t.observe("EV", "m1", self.parsed(90, "2nd", "live"), self.timing(1000.0))
+
+        coverage = t.coverage({"EV"}, now=1000.05)
+        row = self.event_row(coverage)
+        self.assertIsNone(row["observation_id"])
+        self.assertFalse(row["clock_present"])
+        self.assertFalse(row["clock_fresh"])
+        self.assertEqual(coverage["clock_present"], 0)
+        self.assertEqual(coverage["clock_fresh"], 0)
+
+    def test_clock_freshness_decays_at_status_time(self):
+        t = self.tracker()
+        t.observe("EV", "m1", self.parsed(90, "2nd", "live"), self.timing(1000.0))
+        t.promote("EV", 5)
+
+        self.assertTrue(self.event_row(t.coverage({"EV"}, now=1000.05))["clock_fresh"])
+        later = t.coverage({"EV"}, now=1030.0)
+        self.assertFalse(self.event_row(later)["clock_fresh"])
+        self.assertEqual(self.event_row(later)["current_fault"], "stale")
+
+    def test_all_good_is_impossible_during_current_clock_fault_and_returns_after_recovery(self):
+        from app.engine import _clock_coverage_check
+        t = self.tracker()
+        t.observe("EV", "m1", self.parsed(90, "2nd", "live"), self.timing(1000.0))
+        t.promote("EV", 9)
+        self.assertTrue(_clock_coverage_check(t.coverage({"EV"}, now=1000.05))["healthy"])
+
+        stale = t.coverage({"EV"}, now=1030.0)
+        self.assertFalse(_clock_coverage_check(stale)["healthy"])
+
+        t.observe("EV", "m1", self.parsed(91, "2nd", "live"), self.timing(1031.0))
+        t.promote("EV", 10)
+        recovered = t.coverage({"EV"}, now=1031.05)
+        self.assertTrue(
+            _clock_coverage_check(recovered)["healthy"],
+            "all-good must be reachable again after the current fault clears",
+        )

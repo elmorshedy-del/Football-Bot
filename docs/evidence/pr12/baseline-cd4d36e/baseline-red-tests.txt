@@ -1,0 +1,315 @@
+# BR-00 baseline red tests
+# Reviewed head: cd4d36e1adeb01d63381fce79b58d6311cfc7b2d
+# Run at:        5f546fe (cd4d36e + docs-only handoff commit; no code delta)
+# Tree:          $(git rev-parse HEAD^{tree})
+# Date (UTC):    $(date -u +%Y-%m-%dT%H:%M:%SZ)
+# Python:        $(.venv/bin/python --version 2>&1)
+
+$ .venv/bin/python -m unittest -v tests.test_match_clock.TwoPhaseClockPublicationTests tests.test_match_clock.ClockDatabaseLineageTests tests.test_goal_latency.ClockPersistenceHandoffTests tests.test_health.CurrentClockHealthTests
+
+test_candidate_is_invisible_until_promoted (tests.test_match_clock.TwoPhaseClockPublicationTests.test_candidate_is_invisible_until_promoted) ... FAIL
+test_failed_persist_keeps_previous_observation_and_leaves_identity_open (tests.test_match_clock.TwoPhaseClockPublicationTests.test_failed_persist_keeps_previous_observation_and_leaves_identity_open) ... ERROR
+test_future_observation_and_confirmation_fail_closed (tests.test_match_clock.TwoPhaseClockPublicationTests.test_future_observation_and_confirmation_fail_closed)
+A receipt later than the signal is refused, not coerced to age zero. ... FAIL
+test_gate_object_fails_closed_on_unpersisted_id_even_when_mapped (tests.test_match_clock.TwoPhaseClockPublicationTests.test_gate_object_fails_closed_on_unpersisted_id_even_when_mapped)
+MatchClockGate must apply the invariant itself, not trust its caller. ... FAIL
+test_restart_requires_new_provider_confirmation_for_freshness (tests.test_match_clock.TwoPhaseClockPublicationTests.test_restart_requires_new_provider_confirmation_for_freshness)
+A database row alone is not a fresh live confirmation. ... FAIL
+test_unchanged_poll_preserves_id_and_uses_latest_confirmation_interval (tests.test_match_clock.TwoPhaseClockPublicationTests.test_unchanged_poll_preserves_id_and_uses_latest_confirmation_interval)
+Receipts 10.00/10.25/10.50 keep one id and report +250ms, never -250. ... ERROR
+test_unpersisted_clock_fails_closed_before_minute_logic (tests.test_match_clock.TwoPhaseClockPublicationTests.test_unpersisted_clock_fails_closed_before_minute_logic)
+An id-less observation must never reach 88+ acceptance. ... 
+  test_unpersisted_clock_fails_closed_before_minute_logic (tests.test_match_clock.TwoPhaseClockPublicationTests.test_unpersisted_clock_fails_closed_before_minute_logic) (observation_id=None)
+An id-less observation must never reach 88+ acceptance. ... FAIL
+  test_unpersisted_clock_fails_closed_before_minute_logic (tests.test_match_clock.TwoPhaseClockPublicationTests.test_unpersisted_clock_fails_closed_before_minute_logic) (observation_id=0)
+An id-less observation must never reach 88+ acceptance. ... FAIL
+  test_unpersisted_clock_fails_closed_before_minute_logic (tests.test_match_clock.TwoPhaseClockPublicationTests.test_unpersisted_clock_fails_closed_before_minute_logic) (observation_id=-1)
+An id-less observation must never reach 88+ acceptance. ... FAIL
+  test_unpersisted_clock_fails_closed_before_minute_logic (tests.test_match_clock.TwoPhaseClockPublicationTests.test_unpersisted_clock_fails_closed_before_minute_logic) (observation_id='12')
+An id-less observation must never reach 88+ acceptance. ... FAIL
+test_every_accepted_clock_stamp_resolves_to_matching_database_row (tests.test_match_clock.ClockDatabaseLineageTests.test_every_accepted_clock_stamp_resolves_to_matching_database_row) ... ERROR
+test_new_rows_record_their_source_and_legacy_null_stays_legacy_unknown (tests.test_match_clock.ClockDatabaseLineageTests.test_new_rows_record_their_source_and_legacy_null_stays_legacy_unknown) ... ERROR
+test_failed_clock_insert_retries_identical_next_poll (tests.test_goal_latency.ClockPersistenceHandoffTests.test_failed_clock_insert_retries_identical_next_poll)
+A failed insert must leave the identity uncommitted so it retries. ... ERROR
+test_persistence_failure_is_reported_as_a_current_fault (tests.test_goal_latency.ClockPersistenceHandoffTests.test_persistence_failure_is_reported_as_a_current_fault) ... ERROR
+test_signal_during_blocked_clock_insert_rejects_unpersisted_clock (tests.test_goal_latency.ClockPersistenceHandoffTests.test_signal_during_blocked_clock_insert_rejects_unpersisted_clock)
+A signal racing a pending insert must never see the candidate. ... FAIL
+test_active_candidate_with_missing_or_stale_clock_is_fault (tests.test_health.CurrentClockHealthTests.test_active_candidate_with_missing_or_stale_clock_is_fault) ... ERROR
+test_all_good_is_impossible_during_current_clock_fault_and_returns_after_recovery (tests.test_health.CurrentClockHealthTests.test_all_good_is_impossible_during_current_clock_fault_and_returns_after_recovery) ... ERROR
+test_clock_freshness_decays_at_status_time (tests.test_health.CurrentClockHealthTests.test_clock_freshness_decays_at_status_time) ... ERROR
+test_live_provider_without_persisted_clock_is_fault (tests.test_health.CurrentClockHealthTests.test_live_provider_without_persisted_clock_is_fault) ... FAIL
+test_mapped_pre_match_without_clock_is_healthy_waiting (tests.test_health.CurrentClockHealthTests.test_mapped_pre_match_without_clock_is_healthy_waiting) ... FAIL
+test_pending_idless_clock_never_counts_present_or_fresh (tests.test_health.CurrentClockHealthTests.test_pending_idless_clock_never_counts_present_or_fresh) ... FAIL
+test_persisted_reconfirmation_clears_current_fault_but_keeps_total_miss_count (tests.test_health.CurrentClockHealthTests.test_persisted_reconfirmation_clears_current_fault_but_keeps_total_miss_count) ... ERROR
+
+======================================================================
+ERROR: test_failed_persist_keeps_previous_observation_and_leaves_identity_open (tests.test_match_clock.TwoPhaseClockPublicationTests.test_failed_persist_keeps_previous_observation_and_leaves_identity_open)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_match_clock.py", line 516, in test_failed_persist_keeps_previous_observation_and_leaves_identity_open
+    t.promote("EV", 7)
+    ^^^^^^^^^
+AttributeError: 'MatchClockTracker' object has no attribute 'promote'
+
+======================================================================
+ERROR: test_unchanged_poll_preserves_id_and_uses_latest_confirmation_interval (tests.test_match_clock.TwoPhaseClockPublicationTests.test_unchanged_poll_preserves_id_and_uses_latest_confirmation_interval)
+Receipts 10.00/10.25/10.50 keep one id and report +250ms, never -250.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_match_clock.py", line 452, in test_unchanged_poll_preserves_id_and_uses_latest_confirmation_interval
+    t.promote("EV", 55)
+    ^^^^^^^^^
+AttributeError: 'MatchClockTracker' object has no attribute 'promote'
+
+======================================================================
+ERROR: test_every_accepted_clock_stamp_resolves_to_matching_database_row (tests.test_match_clock.ClockDatabaseLineageTests.test_every_accepted_clock_stamp_resolves_to_matching_database_row)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_match_clock.py", line 561, in test_every_accepted_clock_stamp_resolves_to_matching_database_row
+    tracker.promote("EV", row_id)
+    ^^^^^^^^^^^^^^^
+AttributeError: 'MatchClockTracker' object has no attribute 'promote'
+
+======================================================================
+ERROR: test_new_rows_record_their_source_and_legacy_null_stays_legacy_unknown (tests.test_match_clock.ClockDatabaseLineageTests.test_new_rows_record_their_source_and_legacy_null_stays_legacy_unknown)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_match_clock.py", line 595, in test_new_rows_record_their_source_and_legacy_null_stays_legacy_unknown
+    stored = store.q(
+             ^^^^^^^^
+  File "/home/user/Football-Bot/app/store.py", line 270, in q
+    cur = _conn.execute(sql, args)
+          ^^^^^^^^^^^^^^^^^^^^^^^^
+sqlite3.OperationalError: no such column: source
+
+======================================================================
+ERROR: test_failed_clock_insert_retries_identical_next_poll (tests.test_goal_latency.ClockPersistenceHandoffTests.test_failed_clock_insert_retries_identical_next_poll)
+A failed insert must leave the identity uncommitted so it retries.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/unittest/async_case.py", line 90, in _callTestMethod
+    if self._callMaybeAsync(method) is not None:
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/unittest/async_case.py", line 112, in _callMaybeAsync
+    return self._asyncioRunner.run(
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/asyncio/base_events.py", line 654, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "/home/user/Football-Bot/tests/test_goal_latency.py", line 180, in test_failed_clock_insert_retries_identical_next_poll
+    await observer._record_clock("E", "m1", self.DETAILS, self.timing(1000.0))
+  File "/home/user/Football-Bot/app/goal_latency.py", line 228, in _record_clock
+    row_id = await asyncio.to_thread(store.insert_match_clock, row)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/asyncio/threads.py", line 25, in to_thread
+    return await loop.run_in_executor(None, func_call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/concurrent/futures/thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/Football-Bot/tests/test_goal_latency.py", line 173, in flaky_insert
+    raise sqlite3.OperationalError("database is locked")
+sqlite3.OperationalError: database is locked
+
+======================================================================
+ERROR: test_persistence_failure_is_reported_as_a_current_fault (tests.test_goal_latency.ClockPersistenceHandoffTests.test_persistence_failure_is_reported_as_a_current_fault)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/unittest/async_case.py", line 90, in _callTestMethod
+    if self._callMaybeAsync(method) is not None:
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/unittest/async_case.py", line 112, in _callMaybeAsync
+    return self._asyncioRunner.run(
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/asyncio/base_events.py", line 654, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "/home/user/Football-Bot/tests/test_goal_latency.py", line 206, in test_persistence_failure_is_reported_as_a_current_fault
+    await observer._record_clock("E", "m1", self.DETAILS, self.timing(1000.0))
+  File "/home/user/Football-Bot/app/goal_latency.py", line 228, in _record_clock
+    row_id = await asyncio.to_thread(store.insert_match_clock, row)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/asyncio/threads.py", line 25, in to_thread
+    return await loop.run_in_executor(None, func_call)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/concurrent/futures/thread.py", line 58, in run
+    result = self.fn(*self.args, **self.kwargs)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/Football-Bot/tests/test_goal_latency.py", line 200, in always_fails
+    raise sqlite3.OperationalError("disk I/O error")
+sqlite3.OperationalError: disk I/O error
+
+======================================================================
+ERROR: test_active_candidate_with_missing_or_stale_clock_is_fault (tests.test_health.CurrentClockHealthTests.test_active_candidate_with_missing_or_stale_clock_is_fault)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_health.py", line 259, in test_active_candidate_with_missing_or_stale_clock_is_fault
+    t.mark_candidate_active("EV", True)
+    ^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'MatchClockTracker' object has no attribute 'mark_candidate_active'
+
+======================================================================
+ERROR: test_all_good_is_impossible_during_current_clock_fault_and_returns_after_recovery (tests.test_health.CurrentClockHealthTests.test_all_good_is_impossible_during_current_clock_fault_and_returns_after_recovery)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_health.py", line 313, in test_all_good_is_impossible_during_current_clock_fault_and_returns_after_recovery
+    t.promote("EV", 9)
+    ^^^^^^^^^
+AttributeError: 'MatchClockTracker' object has no attribute 'promote'
+
+======================================================================
+ERROR: test_clock_freshness_decays_at_status_time (tests.test_health.CurrentClockHealthTests.test_clock_freshness_decays_at_status_time)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_health.py", line 302, in test_clock_freshness_decays_at_status_time
+    t.promote("EV", 5)
+    ^^^^^^^^^
+AttributeError: 'MatchClockTracker' object has no attribute 'promote'
+
+======================================================================
+ERROR: test_persisted_reconfirmation_clears_current_fault_but_keeps_total_miss_count (tests.test_health.CurrentClockHealthTests.test_persisted_reconfirmation_clears_current_fault_but_keeps_total_miss_count)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_health.py", line 275, in test_persisted_reconfirmation_clears_current_fault_but_keeps_total_miss_count
+    t.promote("EV", 12)
+    ^^^^^^^^^
+AttributeError: 'MatchClockTracker' object has no attribute 'promote'
+
+======================================================================
+FAIL: test_candidate_is_invisible_until_promoted (tests.test_match_clock.TwoPhaseClockPublicationTests.test_candidate_is_invisible_until_promoted)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_match_clock.py", line 509, in test_candidate_is_invisible_until_promoted
+    self.assertNotEqual(stamp["gate_outcome"], "clock_88_plus")
+AssertionError: 'clock_88_plus' == 'clock_88_plus'
+
+======================================================================
+FAIL: test_future_observation_and_confirmation_fail_closed (tests.test_match_clock.TwoPhaseClockPublicationTests.test_future_observation_and_confirmation_fail_closed)
+A receipt later than the signal is refused, not coerced to age zero.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_match_clock.py", line 475, in test_future_observation_and_confirmation_fail_closed
+    self.assertEqual(future_confirm["gate_outcome"], "clock_future")
+AssertionError: 'clock_stale' != 'clock_future'
+- clock_stale
++ clock_future
+
+
+======================================================================
+FAIL: test_gate_object_fails_closed_on_unpersisted_id_even_when_mapped (tests.test_match_clock.TwoPhaseClockPublicationTests.test_gate_object_fails_closed_on_unpersisted_id_even_when_mapped)
+MatchClockGate must apply the invariant itself, not trust its caller.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_match_clock.py", line 444, in test_gate_object_fails_closed_on_unpersisted_id_even_when_mapped
+    self.assertFalse(gate["accepted"])
+AssertionError: True is not false
+
+======================================================================
+FAIL: test_restart_requires_new_provider_confirmation_for_freshness (tests.test_match_clock.TwoPhaseClockPublicationTests.test_restart_requires_new_provider_confirmation_for_freshness)
+A database row alone is not a fresh live confirmation.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_match_clock.py", line 497, in test_restart_requires_new_provider_confirmation_for_freshness
+    self.assertEqual(
+AssertionError: 1 != 0 : an unpromoted candidate must not count as fresh
+
+======================================================================
+FAIL: test_unpersisted_clock_fails_closed_before_minute_logic (tests.test_match_clock.TwoPhaseClockPublicationTests.test_unpersisted_clock_fails_closed_before_minute_logic) (observation_id=None)
+An id-less observation must never reach 88+ acceptance.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_match_clock.py", line 426, in test_unpersisted_clock_fails_closed_before_minute_logic
+    self.assertFalse(stamp["usable_for_88_gate"])
+AssertionError: True is not false
+
+======================================================================
+FAIL: test_unpersisted_clock_fails_closed_before_minute_logic (tests.test_match_clock.TwoPhaseClockPublicationTests.test_unpersisted_clock_fails_closed_before_minute_logic) (observation_id=0)
+An id-less observation must never reach 88+ acceptance.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_match_clock.py", line 426, in test_unpersisted_clock_fails_closed_before_minute_logic
+    self.assertFalse(stamp["usable_for_88_gate"])
+AssertionError: True is not false
+
+======================================================================
+FAIL: test_unpersisted_clock_fails_closed_before_minute_logic (tests.test_match_clock.TwoPhaseClockPublicationTests.test_unpersisted_clock_fails_closed_before_minute_logic) (observation_id=-1)
+An id-less observation must never reach 88+ acceptance.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_match_clock.py", line 426, in test_unpersisted_clock_fails_closed_before_minute_logic
+    self.assertFalse(stamp["usable_for_88_gate"])
+AssertionError: True is not false
+
+======================================================================
+FAIL: test_unpersisted_clock_fails_closed_before_minute_logic (tests.test_match_clock.TwoPhaseClockPublicationTests.test_unpersisted_clock_fails_closed_before_minute_logic) (observation_id='12')
+An id-less observation must never reach 88+ acceptance.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_match_clock.py", line 426, in test_unpersisted_clock_fails_closed_before_minute_logic
+    self.assertFalse(stamp["usable_for_88_gate"])
+AssertionError: True is not false
+
+======================================================================
+FAIL: test_signal_during_blocked_clock_insert_rejects_unpersisted_clock (tests.test_goal_latency.ClockPersistenceHandoffTests.test_signal_during_blocked_clock_insert_rejects_unpersisted_clock)
+A signal racing a pending insert must never see the candidate.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/unittest/async_case.py", line 90, in _callTestMethod
+    if self._callMaybeAsync(method) is not None:
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/unittest/async_case.py", line 112, in _callMaybeAsync
+    return self._asyncioRunner.run(
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/asyncio/base_events.py", line 654, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "/home/user/Football-Bot/tests/test_goal_latency.py", line 154, in test_signal_during_blocked_clock_insert_rejects_unpersisted_clock
+    self.assertNotEqual(
+AssertionError: 'clock_88_plus' == 'clock_88_plus' : an unpersisted candidate was accepted by the 88+ gate
+
+======================================================================
+FAIL: test_live_provider_without_persisted_clock_is_fault (tests.test_health.CurrentClockHealthTests.test_live_provider_without_persisted_clock_is_fault)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_health.py", line 250, in test_live_provider_without_persisted_clock_is_fault
+    row = self.event_row(coverage)
+          ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/Football-Bot/tests/test_health.py", line 230, in event_row
+    self.assertEqual(len(rows), 1, f"expected exactly one coverage row for {event}")
+AssertionError: 0 != 1 : expected exactly one coverage row for EV
+
+======================================================================
+FAIL: test_mapped_pre_match_without_clock_is_healthy_waiting (tests.test_health.CurrentClockHealthTests.test_mapped_pre_match_without_clock_is_healthy_waiting)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_health.py", line 239, in test_mapped_pre_match_without_clock_is_healthy_waiting
+    row = self.event_row(coverage)
+          ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/Football-Bot/tests/test_health.py", line 230, in event_row
+    self.assertEqual(len(rows), 1, f"expected exactly one coverage row for {event}")
+AssertionError: 0 != 1 : expected exactly one coverage row for EV
+
+======================================================================
+FAIL: test_pending_idless_clock_never_counts_present_or_fresh (tests.test_health.CurrentClockHealthTests.test_pending_idless_clock_never_counts_present_or_fresh)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_health.py", line 292, in test_pending_idless_clock_never_counts_present_or_fresh
+    row = self.event_row(coverage)
+          ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/Football-Bot/tests/test_health.py", line 230, in event_row
+    self.assertEqual(len(rows), 1, f"expected exactly one coverage row for {event}")
+AssertionError: 0 != 1 : expected exactly one coverage row for EV
+
+----------------------------------------------------------------------
+Ran 19 tests in 0.058s
+
+FAILED (failures=12, errors=10)
