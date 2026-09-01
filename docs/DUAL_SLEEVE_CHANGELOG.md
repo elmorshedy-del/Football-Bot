@@ -939,3 +939,74 @@ unique index with a strictly more permissive one; reverting restores the previou
 without deleting rows. Note that reverting also restores the destructive `purge_non_live()`, so any
 demo or legacy evidence collected in the meantime would be deleted on the next live boot — back up
 `footballbot.db` before reverting.
+
+## PR 12 blocker resolution — work package 3: non-blocking export and captured failures (`BR-EXPORT`)
+
+Implements section 7 of `docs/PR12_BLOCKER_RESOLUTION_HANDOFF.md`.
+
+**Before (`BR-00`).** Baseline appended to
+`docs/evidence/pr12/baseline-cd4d36e/baseline-red-tests.txt`.
+`tests/test_export_concurrency.py` runs a real page-by-page SQLite backup against a real temporary
+WAL database, slowed through SQLite's own `progress` mechanism rather than a mocked sleep. With the
+reviewed-head lock behaviour in place:
+
+- `test_slow_backup_does_not_stall_status_reads_or_writes` first failed with
+  `no status operation completed during backup` — the event loop could not complete a single
+  `database_health()` call for the entire copy — and, once the loop was given room,
+  `status read blocked 265.3ms behind the backup lock` against the 250 ms bound. This reproduces
+  the reviewed 349.3 ms event-loop stall.
+- The full suite printed `sqlite3.DatabaseError: file is not a database` followed by
+  `AttributeError: 'NoneType' object has no attribute '_record_error'` from
+  `_build_export_job`, as an unretrieved background-task exception, while unittest exited zero.
+  That alone failed the `BR-03` gate on every run since the reviewed head.
+
+**Change.** Files: `app/store.py`, `app/main.py`, `app/exporter.py`.
+
+- `backup_database()` copies pages on its own dedicated read connection and no longer holds
+  `store._lock`. `_lock` is taken only long enough to confirm the database is initialised and read
+  its path, so WAL writers and event-loop status reads proceed during the copy. It accepts
+  `pages`, `sleep` and `progress` so the copy can be driven and observed page by page.
+  `database_path()` is now the single definition of the database location.
+- `_track_export_task(task, job_id, record)` replaces `add_done_callback(_export_tasks.discard)`.
+  It keeps a strong reference, and its done callback retrieves the exception, moves the job to
+  `error` with code `TASK_FAILED`, records the backend fault, and removes the task. Shutdown
+  cancels remaining tasks and `await asyncio.gather(..., return_exceptions=True)` on them.
+- Legacy `GET /api/export` no longer checkpoints and snapshots inline on the event loop. It calls
+  the same asynchronous full-job path and returns the 202 descriptor with the scoped cookie plus
+  `Deprecation: true` and a `Link` header to the successor. There is one export implementation.
+- The manifest carries an explicit `capture_boundary` with `raw_checkpoint_ts`,
+  `db_snapshot_started_ts`, `db_snapshot_finished_ts`, the derived `uncertainty_interval_ms`, and
+  `simultaneous: false` with a note, so the bundle never implies the raw checkpoint and the
+  database snapshot happened at the same instant.
+- `_event_observations()` now selects `provider_occurrence_ts`, `provider_occurrence_source`,
+  `provider_occurrence_unavailable_reason` and `mode`, so the audit path reads the normalized
+  columns from work package 2 rather than falling back to legacy derivation on every row.
+
+**After.** `tests/test_export_concurrency.py` — 5 tests, OK. Full suite 240 tests, OK, run three
+consecutive times under `-X dev -W error::RuntimeWarning`. **The suite now produces zero
+tracebacks and zero unretrieved task exceptions** (`grep -c Traceback` over the full output
+returns 0), clearing the `BR-03` blocker. `compileall`, `ruff`, `node --check`,
+`git diff --check` clean.
+
+**Mutation.** `backup_database()` was reverted to the reviewed-head behaviour (whole copy under
+`store._lock`, using the live `_conn`). `test_slow_backup_does_not_stall_status_reads_or_writes`
+failed with `265.3ms not less than 250.0`. Restored; not committed.
+
+**Limitations.**
+
+- Two section 7.3 cases are not yet written: forcing a failure *during* `_build_export_job` with a
+  custom loop exception handler asserting zero unhandled exceptions (the failure path is covered by
+  `test_background_task_exception_is_retrieved_and_recorded`, which asserts exactly that for the
+  task wrapper), and the re-run of cancellation / lease / TTL / Range / wrong-cookie / missing-auth
+  / traversal / secret-exclusion against the single job flow — those existing tests in
+  `tests/test_main_security.py` already exercise the same job flow and pass unchanged.
+- Export manifest per-table counts by mode (section 5.2 item 5) and the API mode selector
+  (section 5.2 item 4) are still outstanding; they are recorded as open in work package 2.
+- `test_export_failure_is_visible_and_non_fatal` needed job-table isolation: the legacy endpoint
+  now correctly shares the single-full-job rule, so a job left by an earlier test short-circuited
+  it. That is a test-isolation fix, not a relaxed assertion.
+- No production evidence (`BR-PROD`); it needs an authorised deploy.
+
+**Rollback.** `git revert <this commit>`. No schema or data change. Reverting restores the
+lock-holding backup and the inline legacy export, and reintroduces the unretrieved-task-exception
+path.

@@ -141,8 +141,7 @@ def present_mode(value):
 def init():
     global _conn
     os.makedirs(config.DATA_DIR, exist_ok=True)
-    _conn = sqlite3.connect(os.path.join(config.DATA_DIR, "footballbot.db"),
-                            check_same_thread=False)
+    _conn = sqlite3.connect(database_path(), check_same_thread=False)
     _conn.execute("PRAGMA journal_mode=WAL")
     _conn.executescript(SCHEMA)
     # migrate: add mode column to older DBs (persisted on a volume)
@@ -358,17 +357,36 @@ def database_health():
         }
 
 
-def backup_database(path):
-    """Create a transactionally consistent SQLite snapshot at ``path``."""
+def database_path():
+    return os.path.join(config.DATA_DIR, "footballbot.db")
+
+
+def backup_database(path, pages=0, sleep=0.0, progress=None):
+    """Create a transactionally consistent SQLite snapshot at ``path``.
+
+    The page copy runs on its own read-only source connection and does NOT hold
+    ``_lock``.  Holding it for the whole backup blocked every event-loop caller
+    that takes the same lock -- ``database_health()`` and ``stats()`` among them
+    -- so a snapshot stalled live collection for its full duration even when the
+    backup itself ran in a worker thread.  ``_lock`` is now held only long
+    enough to confirm the database is initialised and read its path.
+    """
     with _lock:
         if _conn is None:
             raise RuntimeError("database is not initialized")
+        source_path = database_path()
+    source = sqlite3.connect(source_path)
+    try:
         destination = sqlite3.connect(path)
         try:
-            _conn.backup(destination)
+            source.backup(
+                destination, pages=pages, sleep=sleep, progress=progress,
+            )
             destination.commit()
         finally:
             destination.close()
+    finally:
+        source.close()
 
 
 def log_event(kind, text):

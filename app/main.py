@@ -38,6 +38,42 @@ EXPORT_JOB_TTL_S = 3600
 _RANGE_SPEC = re.compile(r"bytes=(\d*)-(\d*)\Z")
 
 
+def _record_export_fault(exc):
+    """Surface a background export failure on the System panel."""
+    if engine is not None:
+        engine._record_error("study_export", exc)
+
+
+def _track_export_task(task, job_id=None, record=None):
+    """Hold a strong reference and guarantee the exception is retrieved.
+
+    `add_done_callback(_export_tasks.discard)` dropped the reference without
+    ever calling `task.exception()`, so a failed export was reported as
+    "Task exception was never retrieved" while the process (and the test suite)
+    carried on reporting success.
+    """
+    _export_tasks.add(task)
+    report = record if record is not None else _record_export_fault
+
+    def _finished(done):
+        _export_tasks.discard(done)
+        if done.cancelled():
+            return
+        exc = done.exception()
+        if exc is None:
+            return
+        if job_id is not None and _lookup_job(job_id) is not None:
+            _update_job(
+                job_id, status="error",
+                error="Study export preparation failed.",
+                error_code="TASK_FAILED",
+            )
+        report(exc)
+
+    task.add_done_callback(_finished)
+    return task
+
+
 def require_admin(x_admin_token: str | None = Header(default=None)):
     if not config.ADMIN_TOKEN:
         raise HTTPException(status_code=503, detail="ADMIN_TOKEN is not configured")
@@ -59,8 +95,14 @@ async def lifespan(_app):
         pump_task.cancel()
         with suppress(asyncio.CancelledError):
             await pump_task
-        for task in tuple(_export_tasks):
+        pending = tuple(_export_tasks)
+        for task in pending:
             task.cancel()
+        if pending:
+            # Awaiting with return_exceptions retrieves every result, so a
+            # cancelled or failed export cannot surface later as an unobserved
+            # task exception during interpreter shutdown.
+            await asyncio.gather(*pending, return_exceptions=True)
         with suppress(OSError):
             engine.recorder.close()
         await engine.client.close()
@@ -147,7 +189,9 @@ def _event_observations(signals):
                     last_observed_ts, canonical_type, canonical_side, fingerprint,
                     provider_clock, provider_minute, provider_stoppage,
                     normalized_event, raw_payload, response_ms,
-                    previous_poll_ts, previous_fingerprint
+                    previous_poll_ts, previous_fingerprint,
+                    provider_occurrence_ts, provider_occurrence_source,
+                    provider_occurrence_unavailable_reason, mode
                FROM provider_match_events
               WHERE event IN ({marks}) AND first_observed_ts BETWEEN ? AND ?
               ORDER BY first_observed_ts""",
@@ -646,7 +690,8 @@ def _new_export_job(scope, raw_paths):
     }
 
 
-async def _build_export_job(job_id, mode, raw_paths, snapshot_path, scope):
+async def _build_export_job(job_id, mode, raw_paths, snapshot_path, scope,
+                            boundary=None):
     job = _lookup_job(job_id)
     if job is None:
         _remove_export(snapshot_path)
@@ -669,7 +714,7 @@ async def _build_export_job(job_id, mode, raw_paths, snapshot_path, scope):
     try:
         path, _manifest = await asyncio.to_thread(
             exporter.build_study_bundle, None, mode, raw_paths, snapshot_path,
-            scope == "full", progress, cancel_check, scope,
+            scope == "full", progress, cancel_check, scope, boundary,
         )
     except exporter.ExportCancelled:
         current = _lookup_job(job_id)
@@ -717,6 +762,8 @@ async def prepare_study_export(scope: str = "audit"):
         if existing is not None:
             response = JSONResponse(_public_export_job(existing), status_code=202)
             return _set_export_cookie(response, existing)
+    boundary = {}
+
     def _prepare_inputs():
         """Recorder rotation, path enumeration, SQLite backup, and the per-file
         stat walk in _new_export_job are all blocking filesystem work.  Running
@@ -724,8 +771,11 @@ async def prepare_study_export(scope: str = "audit"):
         was even returned, so live collection paused while a download was
         requested."""
         engine.recorder.checkpoint_for_export()
+        boundary["raw_checkpoint_ts"] = time.time()
         raw_paths = exporter.raw_feed_paths()
+        boundary["db_snapshot_started_ts"] = time.time()
         snapshot_path = exporter.prepare_database_snapshot()
+        boundary["db_snapshot_finished_ts"] = time.time()
         return raw_paths, snapshot_path, _new_export_job(scope, raw_paths)
 
     try:
@@ -737,11 +787,12 @@ async def prepare_study_export(scope: str = "audit"):
             detail="Study export failed; see System status for the recorded fault.",
         ) from exc
     _register_job(job)
-    task = asyncio.create_task(_build_export_job(
-        job["job_id"], engine.mode, raw_paths, snapshot_path, scope,
-    ))
-    _export_tasks.add(task)
-    task.add_done_callback(_export_tasks.discard)
+    _track_export_task(
+        asyncio.create_task(_build_export_job(
+            job["job_id"], engine.mode, raw_paths, snapshot_path, scope, boundary,
+        )),
+        job_id=job["job_id"],
+    )
     response = JSONResponse(_public_export_job(job), status_code=202)
     return _set_export_cookie(response, job)
 
@@ -862,33 +913,20 @@ async def download_raw_segment(
     )
 
 
-@app.get("/api/export", dependencies=[Depends(require_admin)])
+@app.get("/api/export", dependencies=[Depends(require_admin)], status_code=202)
 async def export_study_data():
-    """Download a consistent paper-study snapshot without exposing credentials."""
-    try:
-        # Finalize the active gzip before selecting immutable raw segments. New
-        # frames open a fresh active file, which belongs to the next export.
-        engine.recorder.checkpoint_for_export()
-        raw_paths = exporter.raw_feed_paths()
-        # This synchronous backup runs before yielding the event loop, so the
-        # database and selected raw files share one explicit capture boundary.
-        snapshot_path = exporter.prepare_database_snapshot()
-        path, _manifest = await asyncio.to_thread(
-            exporter.build_study_bundle, None, engine.mode, raw_paths, snapshot_path,
-            True, None, None, "full",
-        )
-    except Exception as exc:  # noqa: BLE001 - keep collection alive and expose the fault
-        engine._record_error("study_export", exc)
-        raise HTTPException(
-            status_code=500,
-            detail="Study export failed; see System status for the recorded fault.",
-        ) from exc
-    return FileResponse(
-        path,
-        media_type="application/zip",
-        filename=os.path.basename(path),
-        background=BackgroundTask(_remove_export, path),
-    )
+    """Deprecated alias for the asynchronous full-export job.
+
+    This used to checkpoint the recorder and snapshot SQLite inline, on the
+    event loop, before returning anything -- so requesting a download paused
+    live collection for the whole snapshot.  It now starts the same job as
+    `POST /api/export/prepare` and returns the 202 descriptor; there is only one
+    export implementation.
+    """
+    response = await prepare_study_export(scope="full")
+    response.headers["Deprecation"] = "true"
+    response.headers["Link"] = '</api/export/prepare>; rel="successor-version"'
+    return response
 
 
 @app.post("/api/kill", dependencies=[Depends(require_admin)])

@@ -565,3 +565,71 @@ $ match_signal_event(signal, [root-occurence_ts row])
 Traceback (most recent call last):
   File "<stdin>", line 27, in <module>
 AssertionError: FAIL: a real root occurence_ts reports null occurrence time (got None); only details.last_play.occurence_ts is recognised
+
+==================================================================
+# BR-00 baseline red — work package 3 (BR-EXPORT, section 7.1)
+# Run at: f3d3de0d27001b17556b10863973aa8b512f2fdc + backup_database(pages,sleep) pass-through only
+# The store lock is still held for the whole copy, as at the reviewed head.
+# Date (UTC): 2026-09-01T20:53:06Z
+
+$ .venv/bin/python -m unittest tests.test_export_concurrency.BackupContentionTests
+
+.F.
+======================================================================
+FAIL: test_slow_backup_does_not_stall_status_reads_or_writes (tests.test_export_concurrency.BackupContentionTests.test_slow_backup_does_not_stall_status_reads_or_writes)
+A page-by-page backup must not own the store lock while copying.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/unittest/async_case.py", line 90, in _callTestMethod
+    if self._callMaybeAsync(method) is not None:
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/unittest/async_case.py", line 112, in _callMaybeAsync
+    return self._asyncioRunner.run(
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/asyncio/base_events.py", line 654, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "/home/user/Football-Bot/tests/test_export_concurrency.py", line 77, in test_slow_backup_does_not_stall_status_reads_or_writes
+    self.assertGreater(count, 0, f"no {name} operation completed during backup")
+AssertionError: 0 not greater than 0 : no status operation completed during backup
+
+----------------------------------------------------------------------
+Ran 3 tests in 4.045s
+
+FAILED (failures=1)
+
+# Same tests with the reviewed-head lock behaviour restored (store._lock held
+# for the entire page copy), proving the regression is behavioral:
+
+Executing <Task pending name='Task-2' coro=<BackupContentionTests.test_backup_uses_a_dedicated_connection_not_the_live_one() running at /home/user/Football-Bot/tests/test_export_concurrency.py:117> cb=[_run_until_complete_cb() at /usr/lib/python3.11/asyncio/base_events.py:181] created at /usr/lib/python3.11/asyncio/runners.py:100> took 0.270 seconds
+.Executing <Task pending name='Task-8' coro=<BackupContentionTests.test_slow_backup_does_not_stall_status_reads_or_writes() running at /home/user/Football-Bot/tests/test_export_concurrency.py:78> cb=[_run_until_complete_cb() at /usr/lib/python3.11/asyncio/base_events.py:181] created at /usr/lib/python3.11/asyncio/runners.py:100> took 0.267 seconds
+FExecuting <Task pending name='Task-14' coro=<BackupContentionTests.test_write_committed_during_backup_survives_and_is_not_lost() running at /home/user/Football-Bot/tests/test_export_concurrency.py:102> wait_for=<Task pending name='Task-15' coro=<to_thread() running at /usr/lib/python3.11/asyncio/threads.py:25> wait_for=<Future pending cb=[_chain_future.<locals>._call_check_cancel() at /usr/lib/python3.11/asyncio/futures.py:387, Task.task_wakeup()] created at /usr/lib/python3.11/asyncio/base_events.py:428> cb=[Task.task_wakeup()] created at /usr/lib/python3.11/asyncio/tasks.py:680> cb=[_run_until_complete_cb() at /usr/lib/python3.11/asyncio/base_events.py:181] created at /usr/lib/python3.11/asyncio/runners.py:100> took 0.268 seconds
+.
+======================================================================
+FAIL: test_slow_backup_does_not_stall_status_reads_or_writes (tests.test_export_concurrency.BackupContentionTests.test_slow_backup_does_not_stall_status_reads_or_writes)
+A page-by-page backup must not own the store lock while copying.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/usr/lib/python3.11/unittest/async_case.py", line 90, in _callTestMethod
+    if self._callMaybeAsync(method) is not None:
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/unittest/async_case.py", line 112, in _callMaybeAsync
+    return self._asyncioRunner.run(
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.11/asyncio/base_events.py", line 654, in run_until_complete
+    return future.result()
+           ^^^^^^^^^^^^^^^
+  File "/home/user/Football-Bot/tests/test_export_concurrency.py", line 85, in test_slow_backup_does_not_stall_status_reads_or_writes
+    self.assertLess(
+AssertionError: 265.2991590000511 not less than 250.0 : status read blocked 265.3ms behind the backup lock
+
+----------------------------------------------------------------------
+Ran 3 tests in 4.855s
+
+FAILED (failures=1)

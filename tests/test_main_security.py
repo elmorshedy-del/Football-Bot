@@ -36,6 +36,19 @@ class AdminControlTests(unittest.TestCase):
 
 class ExportFailureTests(unittest.IsolatedAsyncioTestCase):
     async def test_export_failure_is_visible_and_non_fatal(self):
+        # The legacy endpoint now shares the single-full-job rule with
+        # /api/export/prepare, so an active full job left by another test would
+        # short-circuit this one before preparation is ever attempted.
+        saved_jobs = dict(main._export_jobs)
+
+        def _restore_jobs():
+            main._export_jobs.clear()
+            main._export_jobs.update(saved_jobs)
+
+        self.addCleanup(_restore_jobs)
+        main._export_jobs.clear()
+        self.enterContext(patch.object(main, "_export_job", None))
+
         recorder = Mock()
         record_error = Mock()
         fake_engine = SimpleNamespace(

@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 import sqlite3
 import tempfile
+import time
 import zipfile
 
 from . import config, store
@@ -105,14 +106,20 @@ def _emit_progress(progress, **payload):
         progress(payload)
 
 
-def prepare_database_snapshot():
-    """Synchronously freeze SQLite at the same boundary as selected raw segments."""
+def prepare_database_snapshot(boundary=None):
+    """Freeze SQLite and record when the copy started and finished.
+
+    The raw-segment checkpoint and the database snapshot do not happen at the
+    same instant.  Recording both edges lets the manifest state the real
+    uncertainty interval instead of implying simultaneity.
+    """
     exports_dir = Path(config.DATA_DIR) / "exports"
     exports_dir.mkdir(parents=True, exist_ok=True)
     fd, snapshot_path = tempfile.mkstemp(
         prefix="study-snapshot-", suffix=".db", dir=exports_dir,
     )
     os.close(fd)
+    started = time.time()
     try:
         store.backup_database(snapshot_path)
     except Exception:
@@ -121,6 +128,10 @@ def prepare_database_snapshot():
         except OSError:
             pass
         raise
+    finished = time.time()
+    if boundary is not None:
+        boundary["db_snapshot_started_ts"] = started
+        boundary["db_snapshot_finished_ts"] = finished
     return snapshot_path
 
 
@@ -190,8 +201,34 @@ def _copy_raw_stored(archive, source_path, arcname, progress, cancel_check,
     return digest.hexdigest(), copied
 
 
+def _capture_boundary(boundary):
+    """Normalize the recorded capture edges into manifest form."""
+    boundary = dict(boundary or {})
+    checkpoint = boundary.get("raw_checkpoint_ts")
+    started = boundary.get("db_snapshot_started_ts")
+    finished = boundary.get("db_snapshot_finished_ts")
+    edges = [value for value in (checkpoint, started, finished)
+             if isinstance(value, (int, float))]
+    uncertainty_ms = (
+        round((max(edges) - min(edges)) * 1000.0, 3) if len(edges) > 1 else None
+    )
+    return {
+        "raw_checkpoint_ts": checkpoint,
+        "db_snapshot_started_ts": started,
+        "db_snapshot_finished_ts": finished,
+        "uncertainty_interval_ms": uncertainty_ms,
+        "simultaneous": False,
+        "note": (
+            "The raw checkpoint and the database snapshot are separate instants. "
+            "Observations recorded between them may appear in one and not the "
+            "other; treat the interval as capture uncertainty."
+        ),
+    }
+
+
 def build_study_bundle(output_path=None, mode=None, raw_paths=None, snapshot_path=None,
-                       include_raw=True, progress=None, cancel_check=None, scope="full"):
+                       include_raw=True, progress=None, cancel_check=None, scope="full",
+                       boundary=None):
     """Return ``(zip_path, manifest)`` for a consistent study snapshot.
 
     ``scope="audit"`` / ``include_raw=False`` builds the audit product: tables
@@ -246,6 +283,10 @@ def build_study_bundle(output_path=None, mode=None, raw_paths=None, snapshot_pat
                 "include_raw": include_raw,
                 "paper_only": True,
                 "guarantee": "none",
+                # Explicit capture boundary. The raw checkpoint and the database
+                # snapshot are separate instants; anything that changed between
+                # them is inside the stated uncertainty interval.
+                "capture_boundary": _capture_boundary(boundary),
                 "configuration": non_secret_config(),
                 "tables": {},
                 "raw_feed": [],
