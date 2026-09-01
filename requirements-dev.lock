@@ -1,2 +1,7 @@
 -r requirements.lock
 ruff==0.16.5
+# Browser-interaction tests (handoff section 8.5).  The Chromium binary itself
+# is provided by the environment; tests skip, never silently pass, without it.
+greenlet==3.5.5
+playwright==1.62.0
+pyee==13.0.1

@@ -373,11 +373,30 @@ function tradeHighBlock(trade) {
   return `<div class="trade-high"><div><span>Max executable bid</span><strong>${cents(high)}</strong></div><div><span>MFE from entry</span><strong>${finite(mfeNet) ? cents(mfeNet) : "Not observed"}</strong></div><div><span>UTC time of high</span><strong>${escapeHtml(fullDate(highTs))}</strong></div><div><span>After entry</span><strong>${finite(secondsAfter) ? duration(secondsAfter) : "not derived"}</strong></div></div>`;
 }
 const pathCache = new Map();   // trade id -> samples, filled on demand
+// The button carries a string id and trade.id is a number, so the cache was
+// written under one key and read under another: a successful fetch rendered
+// nothing at all. Every access normalizes the key.
+const pathKey = id => String(id);
 async function loadTradePath(tradeId) {
-  if (pathCache.has(tradeId)) return pathCache.get(tradeId);
+  if (pathCache.has(pathKey(tradeId))) return pathCache.get(pathKey(tradeId));
   const payload = await apiJson(`/api/trades/${encodeURIComponent(tradeId)}/path`);
-  pathCache.set(tradeId, payload.samples || []);
-  return pathCache.get(tradeId);
+  pathCache.set(pathKey(tradeId), payload.samples || []);
+  return pathCache.get(pathKey(tradeId));
+}
+// A quote outage is a break in availability, not a straight line between the
+// prices either side of it. Each run of priced samples becomes its own subpath.
+function segmentsFromSamples(samples) {
+  const segments = [];
+  let current = null;
+  for (const row of samples || []) {
+    if (finite(row.bid)) {
+      if (!current) { current = []; segments.push(current); }
+      current.push(row);
+    } else {
+      current = null;
+    }
+  }
+  return segments;
 }
 function pathSparkline(trade) {
   // The path is what a scalar high cannot show: whether the peak was a spike
@@ -385,7 +404,7 @@ function pathSparkline(trade) {
   // endpoint carries only the summary; samples arrive from the per-trade
   // endpoint when the reader asks for them.
   const summary = trade.bid_path_summary;
-  const samples = pathCache.get(trade.id) || [];
+  const samples = pathCache.get(pathKey(trade.id)) || [];
   if (!summary) return "";
   if (samples.length < 2) {
     const reachablePending = finite(summary.peak_exec_px)
@@ -393,7 +412,8 @@ function pathSparkline(trade) {
     return `<div class="bid-path"><div class="bid-path-head"><span>Executable bid path</span><strong>${integer(summary.samples)} quotes over ${escapeHtml(duration((summary.span_ms || 0) / 1000))}</strong></div><button class="text-button" type="button" data-load-path="${escapeHtml(String(trade.id))}">Show path</button><div class="bid-path-facts"><div><span>Peak held</span><strong>${escapeHtml(relativeMs(summary.ms_at_peak))}</strong></div><div><span>Fillable at peak</span><strong>${escapeHtml(reachablePending)}</strong></div><div><span>Round trip</span><strong>${cents(summary.path_travelled_c)}</strong></div></div></div>`;
   }
   const width = 320, height = 64, pad = 4;
-  const priced = samples.filter(row => finite(row.bid));
+  const segments = segmentsFromSamples(samples);
+  const priced = segments.flat();
   if (priced.length < 2) return "";
   const xs = priced.map(row => row.dt_ms), ys = priced.map(row => row.bid);
   const minX = Math.min(...xs), maxX = Math.max(...xs);
@@ -401,7 +421,14 @@ function pathSparkline(trade) {
   const spanX = maxX - minX || 1, spanY = maxY - minY || 1;
   const px = value => pad + (value - minX) / spanX * (width - pad * 2);
   const py = value => pad + (maxY - value) / spanY * (height - pad * 2);
-  const d = priced.map((row, index) => `${index ? "L" : "M"}${px(row.dt_ms).toFixed(1)},${py(row.bid).toFixed(1)}`).join(" ");
+  // One M...L... subpath per segment; never an L across an outage.
+  const d = segments.map(segment => segment.map((row, index) =>
+    `${index ? "L" : "M"}${px(row.dt_ms).toFixed(1)},${py(row.bid).toFixed(1)}`).join(" ")).join(" ");
+  const gapNote = finite(summary.gap_count) && summary.gap_count > 0
+    ? ` · ${integer(summary.gap_count)} gap${summary.gap_count === 1 ? "" : "s"} (${escapeHtml(relativeMs(summary.gap_duration_ms))} unquotable)`
+    : "";
+  const truncatedNote = summary.truncated
+    ? ` · truncated, ${integer(summary.dropped_samples)} dropped` : "";
   const entryY = py(trade.entry_px).toFixed(1);
   const peakX = px(summary.peak_dt_ms).toFixed(1), peakY = py(summary.peak_bid).toFixed(1);
   const reachable = finite(summary.peak_exec_px) && finite(summary.peak_bid)
@@ -410,7 +437,7 @@ function pathSparkline(trade) {
   const efficiency = finite(summary.path_efficiency)
     ? `${(summary.path_efficiency * 100).toFixed(0)}% direct`
     : "path efficiency unavailable";
-  return `<div class="bid-path"><div class="bid-path-head"><span>Executable bid path</span><strong>${integer(summary.samples)} quotes over ${escapeHtml(duration((summary.span_ms || 0) / 1000))}</strong></div><svg class="bid-path-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="Held-side executable bid from entry to exit"><line class="bid-path-entry" x1="${pad}" x2="${width - pad}" y1="${entryY}" y2="${entryY}"/><path class="bid-path-line" d="${d}"/><circle class="bid-path-peak" cx="${peakX}" cy="${peakY}" r="3.5"/></svg><div class="bid-path-facts"><div><span>Peak held</span><strong>${escapeHtml(relativeMs(summary.ms_at_peak))}</strong></div><div><span>Fillable at peak</span><strong>${escapeHtml(reachable)}</strong></div><div><span>Round trip</span><strong>${cents(summary.path_travelled_c)} · ${escapeHtml(efficiency)}</strong></div></div></div>`;
+  return `<div class="bid-path"><div class="bid-path-head"><span>Executable bid path</span><strong>${integer(summary.samples)} quotes over ${escapeHtml(duration((summary.span_ms || 0) / 1000))}${gapNote}${truncatedNote}</strong></div><svg class="bid-path-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="Held-side executable bid from entry to exit"><line class="bid-path-entry" x1="${pad}" x2="${width - pad}" y1="${entryY}" y2="${entryY}"/><path class="bid-path-line" d="${d}"/><circle class="bid-path-peak" cx="${peakX}" cy="${peakY}" r="3.5"/></svg><div class="bid-path-facts"><div><span>Peak held</span><strong>${escapeHtml(relativeMs(summary.ms_at_peak))}</strong></div><div><span>Fillable at peak</span><strong>${escapeHtml(reachable)}</strong></div><div><span>Round trip</span><strong>${cents(summary.path_travelled_c)} · ${escapeHtml(efficiency)}</strong></div></div></div>`;
 }
 function lossPath(trade) {
   // Losing trades expose entry → high → exit so the missed profit is legible.
@@ -1027,7 +1054,17 @@ document.addEventListener("click", event => {
   const tradeId = button.dataset.loadPath;
   button.disabled = true; button.textContent = "Loading path…";
   loadTradePath(tradeId).then(renderTrades)
-    .catch(error => { button.disabled = false; button.textContent = "Show path"; recordClientError("Trade path", error); });
+    .catch(error => {
+      // A failed fetch must never leave the button silently spinning.
+      button.disabled = false;
+      button.textContent = "Show path";
+      const failure = document.createElement("p");
+      failure.className = "path-error";
+      failure.setAttribute("role", "alert");
+      failure.textContent = `Could not load the path for trade ${tradeId}: ${error && error.message ? error.message : error}`;
+      button.insertAdjacentElement("afterend", failure);
+      recordClientError("Trade path", error);
+    });
 });
 byId("export-cancel-button")?.addEventListener("click", () => cancelActiveExport().catch(error => recordClientError("Study export cancel", error)));
 byId("market-search").addEventListener("input", renderMatches);

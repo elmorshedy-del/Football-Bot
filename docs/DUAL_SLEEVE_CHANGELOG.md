@@ -1010,3 +1010,76 @@ failed with `265.3ms not less than 250.0`. Restored; not committed.
 **Rollback.** `git revert <this commit>`. No schema or data change. Reverting restores the
 lock-holding backup and the inline legacy export, and reintroduces the unretrieved-task-exception
 path.
+
+## PR 12 blocker resolution — work package 4: gap-aware paths and a working chart (`BR-PATH`)
+
+Implements sections 8.3 and 8.4 of `docs/PR12_BLOCKER_RESOLUTION_HANDOFF.md`, plus the schema and
+cap parts of 8.2. Section 8.2's transactional-close ownership contract is **not** complete; see
+Limitations.
+
+**Before (`BR-00`).** Baseline appended to
+`docs/evidence/pr12/baseline-cd4d36e/baseline-red-tests.txt`. For the section 8.3 fixture
+`90@0, gap@1000, 70@2000` the summary reported `path_travelled_c: 22.0` and
+`path_efficiency: 0.8182` on a path whose only two priced points sit either side of an outage, and
+had no `segments`, `gap_count`, `gap_duration_ms`, `samples_total`, `samples_priced`,
+`unknown_gap_duration_ms`, `truncated` or `dropped_samples` keys at all (`KeyError: 'segments'`).
+`_record_exec_terminal()` incremented past the cap unconditionally. The terminal row carried no
+`availability` label (`KeyError: 'availability'`).
+
+**Change.** Files: `app/store.py`, `app/paper.py`, `static/app.js`, `requirements-dev.lock`.
+
+- `_path_segments()` splits a path at every unpriced observation and records, per segment, the dt
+  at which availability ended, and per gap, the dt a quote resumed. `bid_path_summary()` joins only
+  consecutive priced observations **inside the same segment**. Time from a priced observation to
+  the following gap-start counts as known availability; nothing beyond it does. For the section 8.3
+  fixture the result is now exactly `segments: 2, gap_count: 1, gap_duration_ms: 1000,
+  ms_at_peak: 1000, path_travelled_c: 0, path_efficiency: null`.
+- The summary returns every field section 8.3 lists, including `unknown_gap_duration_ms` for an
+  outage that never resumed, and `truncated` / `dropped_samples` so truncation is never silent.
+- `sample_seq`, `availability` and `terminal` are added idempotently to `bid_path_samples`, with
+  partial unique indexes on `(trade_id, kind, sample_seq)` and `(signal_id, kind, sample_seq)` that
+  apply only where `sample_seq` is not null, so legacy rows are untouched and a retried flush is
+  idempotent (`INSERT OR IGNORE`).
+- The cap reserves one slot: at most 3,999 non-terminal rows are recorded, so `samples_total` never
+  exceeds 4,000 and the terminal row is always inside the read window. The terminal row is written
+  once, labelled `availability="terminal"`, `terminal=1`, and keeps `bid_size`/`exec_px` null so an
+  executed exit price is never presented as an observed book quote.
+- Frontend: `pathKey()` normalizes every `pathCache` access to a string, fixing the defect where the
+  button's string id wrote the cache and the numeric `trade.id` read it, so a successful fetch
+  rendered nothing. `segmentsFromSamples()` produces one `M...L...` subpath per priced segment, so
+  the chart never draws an `L` across an outage. Gap count/duration and truncation are shown in the
+  chart header. A failed fetch now inserts a visible `role="alert"` message instead of silently
+  restoring the button.
+
+**After.** `tests/test_bid_path.py` — 27 tests, OK. `tests/test_frontend_path_browser.py` — 3 tests
+in real headless Chromium 141, OK. Full suite 254 tests, OK. `compileall`, `ruff`,
+`node --check`, `git diff --check` clean. `playwright==1.62.0` (with `greenlet`, `pyee`) pinned in
+`requirements-dev.lock`; the Chromium binary comes from the environment and the browser tests
+**skip rather than pass** when it is absent.
+
+**Mutation.** The two frontend defects were reintroduced (numeric cache key; one flat `d` across
+all priced samples). The browser tests failed with
+`no chart rendered for a numeric trade id`, a cross-gap bridge error, and
+`the outage is not disclosed`. Restored; not committed.
+
+**Limitations — section 8.2 is incomplete and this work package does not close `BR-PATH`.**
+
+- The transactional final-close contract is **not** implemented. `record_paper_exit()` and
+  `close_trade()` do not yet persist remaining buffered rows, the terminal row, the summary and the
+  final fill/progress in one store transaction, and a rollback does not yet keep the position owned
+  for retry. `_flush_signal_path(self._signal_paths.popleft())` still pops before persisting, so a
+  failed write still leaves rows on an orphaned watch. There is no durable
+  `forward_path_finalized` flag, no `signal_path_persistence_failed` health fault, and no startup
+  rebuild of unfinalized watches or `path_incomplete_reason`.
+- Consequently these section 8.5 tests are **not** written and must not be counted as passing:
+  `test_final_trade_path_failure_keeps_position_then_retries_exactly_once`,
+  `test_final_signal_path_failure_keeps_watch_then_retries_exactly_once`,
+  `test_uncommitted_final_close_restores_open_trade_after_restart`, and
+  `test_trade_and_signal_list_endpoints_do_not_query_paths_per_row`.
+- The 360 px mobile layout checks in section 8.4 are not verified; they need rendered evidence
+  (`BR-PROD`).
+- Signal-forward paths do not yet record gap rows; only position paths do.
+
+**Rollback.** `git revert <this commit>`. The migration only adds nullable columns and two partial
+indexes; reverting leaves them in place, unread and non-destructive. Summaries persisted under the
+new shape remain readable, but a reverted UI would show the pre-gap fields only.

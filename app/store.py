@@ -256,6 +256,28 @@ def init():
            CREATE INDEX IF NOT EXISTS idx_bid_path_kind
              ON bid_path_samples(kind, anchor_ts);"""
     )
+    # Availability and sequence metadata. Nullable for backward compatibility:
+    # legacy rows keep a null sample_seq and are left untouched by the partial
+    # unique indexes below, which make new rows exactly-once under retry.
+    for column, definition in (
+        ("sample_seq", "INTEGER"),
+        ("availability", "TEXT"),
+        ("terminal", "INTEGER"),
+    ):
+        try:
+            _conn.execute(
+                f"ALTER TABLE bid_path_samples ADD COLUMN {column} {definition}"
+            )
+        except sqlite3.OperationalError:
+            pass  # already exists
+    _conn.executescript(
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_bid_path_trade_seq
+             ON bid_path_samples(trade_id, kind, sample_seq)
+           WHERE trade_id IS NOT NULL AND sample_seq IS NOT NULL;
+           CREATE UNIQUE INDEX IF NOT EXISTS idx_bid_path_signal_seq
+             ON bid_path_samples(signal_id, kind, sample_seq)
+           WHERE signal_id IS NOT NULL AND sample_seq IS NOT NULL;"""
+    )
     _conn.executescript(
         """CREATE TABLE IF NOT EXISTS match_clock_observations(
              id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -510,15 +532,19 @@ def insert_bid_path(rows):
             row.get("strategy"), row.get("anchor_ts"), row.get("dt_ms"),
             row.get("bid"), row.get("bid_size"), row.get("exec_px"),
             row.get("qty"), _mode,
+            row.get("sample_seq"),
+            row.get("availability") or ("quote" if _is_priced(row.get("bid")) else "gap"),
+            1 if row.get("terminal") else 0,
         )
         for row in rows
     ]
     with _lock:
         _conn.executemany(
-            """INSERT INTO bid_path_samples(
+            """INSERT OR IGNORE INTO bid_path_samples(
                    kind,trade_id,signal_id,event,market,side,strategy,
-                   anchor_ts,dt_ms,bid,bid_size,exec_px,qty,mode)
-                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   anchor_ts,dt_ms,bid,bid_size,exec_px,qty,mode,
+                   sample_seq,availability,terminal)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             payload,
         )
         _conn.commit()
@@ -542,7 +568,8 @@ def set_signal_path_summary(signal_id, summary):
 
 def bid_path_for_trade(trade_id, limit=BID_PATH_MAX_SAMPLES):
     return q(
-        """SELECT dt_ms,bid,bid_size,exec_px,qty FROM bid_path_samples
+        """SELECT dt_ms,bid,bid_size,exec_px,qty,availability,terminal,sample_seq
+             FROM bid_path_samples
              WHERE trade_id=? ORDER BY dt_ms LIMIT ?""",
         (trade_id, limit),
     )
@@ -550,38 +577,101 @@ def bid_path_for_trade(trade_id, limit=BID_PATH_MAX_SAMPLES):
 
 def bid_path_for_signal(signal_id, limit=BID_PATH_MAX_SAMPLES):
     return q(
-        """SELECT dt_ms,bid,bid_size,exec_px,qty FROM bid_path_samples
+        """SELECT dt_ms,bid,bid_size,exec_px,qty,availability,terminal,sample_seq
+             FROM bid_path_samples
              WHERE signal_id=? AND kind='decline' ORDER BY dt_ms LIMIT ?""",
         (signal_id, limit),
     )
 
 
-def bid_path_summary(samples):
-    """Derive the scalars the UI and study need from a stored path."""
-    points = [
-        row for row in (samples or [])
-        if isinstance(row.get("bid"), (int, float))
-    ]
+def _is_priced(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _path_segments(rows):
+    """Split a path into priced segments separated by quote outages.
+
+    Returns ``(segments, gaps)`` where each segment carries its priced points
+    and the dt at which its availability ended, and each gap carries the dt it
+    started and the dt a quote resumed (None when it never did).
+    """
+    segments, gaps, current = [], [], None
+    for row in rows:
+        dt = row.get("dt_ms")
+        if _is_priced(row.get("bid")):
+            if current is None:
+                current = {"points": [], "close_dt": None}
+                segments.append(current)
+            current["points"].append(row)
+            if gaps and gaps[-1]["end"] is None:
+                gaps[-1]["end"] = dt
+        else:
+            if current is not None:
+                current["close_dt"] = dt
+                current = None
+            # Consecutive unpriced observations are one outage, not many.
+            if not gaps or gaps[-1]["end"] is not None:
+                gaps.append({"start": dt, "end": None})
+    return segments, gaps
+
+
+def bid_path_summary(samples, truncated=False, dropped_samples=0):
+    """Derive the scalars the UI and study need from a stored path.
+
+    Calculations join only consecutive priced observations inside the same
+    segment.  Filtering the unpriced rows out and connecting what remained drew
+    one straight line across a quote outage: a 90c bid that stopped being
+    available at 1000ms was reported as held until the next quote arrived, and
+    the jump across the outage was counted as tradeable travel.
+    """
+    rows = list(samples or [])
+    if not rows:
+        return None
+    segments, gaps = _path_segments(rows)
+    points = [row for segment in segments for row in segment["points"]]
     if not points:
         return None
+
     bids = [row["bid"] for row in points]
-    peak = max(bids)
-    trough = min(bids)
+    peak, trough = max(bids), min(bids)
     peak_row = next(row for row in points if row["bid"] == peak)
     trough_row = next(row for row in points if row["bid"] == trough)
+
     # Time the held side spent at or above its own peak is the answer to
-    # "could that high actually have been filled".
-    at_peak_ms = sum(
-        (right["dt_ms"] - left["dt_ms"])
-        for left, right in zip(points, points[1:])
-        if left["bid"] >= peak
+    # "could that high actually have been filled".  Availability ends at the
+    # gap that closes the segment, so nothing beyond that boundary counts.
+    at_peak_ms = 0.0
+    travelled = 0.0
+    for segment in segments:
+        segment_points = segment["points"]
+        for left, right in zip(segment_points, segment_points[1:]):
+            travelled += abs(right["bid"] - left["bid"])
+            if left["bid"] >= peak:
+                at_peak_ms += right["dt_ms"] - left["dt_ms"]
+        last = segment_points[-1]
+        if segment["close_dt"] is not None and last["bid"] >= peak:
+            at_peak_ms += segment["close_dt"] - last["dt_ms"]
+
+    gap_duration_ms = sum(
+        gap["end"] - gap["start"] for gap in gaps if gap["end"] is not None
     )
-    travelled = sum(
-        abs(right["bid"] - left["bid"]) for left, right in zip(points, points[1:])
+    # An outage the path never came back from has no measurable end; report the
+    # observed span separately rather than folding it into measured downtime.
+    final_dt = rows[-1].get("dt_ms")
+    unknown_gap_duration_ms = sum(
+        max(0.0, final_dt - gap["start"])
+        for gap in gaps
+        if gap["end"] is None and _is_priced(final_dt) and _is_priced(gap["start"])
     )
     displacement = abs(points[-1]["bid"] - points[0]["bid"])
     return {
         "samples": len(points),
+        "samples_total": len(rows),
+        "samples_priced": len(points),
+        "segments": len(segments),
+        "gap_count": len(gaps),
+        "gap_duration_ms": round(gap_duration_ms, 1),
+        "unknown_gap_duration_ms": round(unknown_gap_duration_ms, 1),
         "first_bid": points[0]["bid"],
         "last_bid": points[-1]["bid"],
         "peak_bid": peak,
@@ -594,8 +684,11 @@ def bid_path_summary(samples):
         "path_travelled_c": round(travelled, 2),
         "displacement_c": round(displacement, 2),
         # 1.0 = straight line, near 0 = chopped back and forth for nothing.
+        # Undefined rather than 1.0 when no intra-segment travel was observed.
         "path_efficiency": round(displacement / travelled, 4) if travelled > 0 else None,
-        "span_ms": round(points[-1]["dt_ms"] - points[0]["dt_ms"], 1),
+        "span_ms": round(rows[-1]["dt_ms"] - rows[0]["dt_ms"], 1),
+        "truncated": bool(truncated),
+        "dropped_samples": int(dropped_samples or 0),
     }
 
 

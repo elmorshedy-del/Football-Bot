@@ -469,7 +469,8 @@ class PaperDesk:
         if signature == pos.exec_path_last:
             return
         pos.exec_path_last = signature
-        if pos.exec_path_total >= store.BID_PATH_MAX_SAMPLES:
+        # One slot is reserved so the terminal row always fits inside the cap.
+        if pos.exec_path_total >= store.BID_PATH_MAX_SAMPLES - 1:
             pos.exec_path_dropped += 1
             return
         pos.exec_path_total += 1
@@ -479,6 +480,8 @@ class PaperDesk:
             "strategy": pos.strategy, "anchor_ts": pos.entry_ts,
             "dt_ms": round((now - pos.entry_ts) * 1000.0, 1),
             "bid": bid, "bid_size": bid_size, "exec_px": exec_px, "qty": qty,
+            "sample_seq": pos.exec_path_total, "availability": "quote",
+            "terminal": 0,
         })
         # Bound how much a crash can lose without paying a commit per quote.
         if len(pos.exec_path) >= BID_PATH_FLUSH_EVERY:
@@ -497,7 +500,7 @@ class PaperDesk:
         if signature == pos.exec_path_last:
             return
         pos.exec_path_last = signature
-        if pos.exec_path_total >= store.BID_PATH_MAX_SAMPLES:
+        if pos.exec_path_total >= store.BID_PATH_MAX_SAMPLES - 1:
             pos.exec_path_dropped += 1
             return
         pos.exec_path_total += 1
@@ -507,6 +510,8 @@ class PaperDesk:
             "strategy": pos.strategy, "anchor_ts": pos.entry_ts,
             "dt_ms": round((now - pos.entry_ts) * 1000.0, 1),
             "bid": None, "bid_size": None, "exec_px": None, "qty": pos.remaining,
+            "sample_seq": pos.exec_path_total, "availability": "gap",
+            "terminal": 0,
         })
 
     def _record_exec_terminal(self, pos, exit_px, now):
@@ -515,14 +520,21 @@ class PaperDesk:
         Without a terminal sample the final segment had no duration and
         time-at-peak was understated whenever the peak was the last quote.
         """
+        if getattr(pos, "exec_path_terminal_written", False):
+            return
+        pos.exec_path_terminal_written = True
         pos.exec_path_total += 1
         pos.exec_path.append({
             "kind": "position", "trade_id": pos.tid, "signal_id": pos.signal_id,
             "event": pos.event, "market": pos.market, "side": pos.side,
             "strategy": pos.strategy, "anchor_ts": pos.entry_ts,
             "dt_ms": round((now - pos.entry_ts) * 1000.0, 1),
+            # The executed exit price is not an observed book quote; bid_size
+            # and exec_px stay null so the two stay semantically distinct.
             "bid": exit_px, "bid_size": None, "exec_px": None,
             "qty": pos.remaining,
+            "sample_seq": pos.exec_path_total, "availability": "terminal",
+            "terminal": 1,
         })
 
     def _flush_exec_path(self, pos, final=False):
@@ -548,7 +560,11 @@ class PaperDesk:
         if final:
             try:
                 samples = store.bid_path_for_trade(pos.tid)
-                store.set_trade_path_summary(pos.tid, store.bid_path_summary(samples))
+                store.set_trade_path_summary(pos.tid, store.bid_path_summary(
+                    samples,
+                    truncated=bool(pos.exec_path_dropped),
+                    dropped_samples=pos.exec_path_dropped,
+                ))
             except Exception as exc:
                 self._report_error("bid_path_summary", exc)
         if final and pos.exec_path_dropped:

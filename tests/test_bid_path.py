@@ -260,5 +260,189 @@ class ArchitectBlockerFourTests(unittest.TestCase):
         self.assertIn('"/api/signals/{signal_id}/path"', source)
 
 
+class GapAwareSummaryTests(unittest.TestCase):
+    """Handoff section 8.3: a quote outage is not a straight line."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        patcher = patch("app.store.config.DATA_DIR", self.dir.name)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        store._conn = None
+        store.init()
+
+    def row(self, dt_ms, bid, availability="quote", terminal=0, size=10.0,
+            exec_px=None):
+        return {
+            "dt_ms": dt_ms, "bid": bid, "bid_size": size, "exec_px": exec_px,
+            "qty": 10.0, "availability": availability, "terminal": terminal,
+        }
+
+    def test_gap_summary_never_bridges_unavailable_quotes(self):
+        """The exact fixture and required result from section 8.3."""
+        summary = store.bid_path_summary([
+            self.row(0.0, 90.0),
+            self.row(1000.0, None, availability="gap"),
+            self.row(2000.0, 70.0),
+        ])
+
+        self.assertEqual(summary["segments"], 2)
+        self.assertEqual(summary["gap_count"], 1)
+        self.assertEqual(summary["gap_duration_ms"], 1000)
+        self.assertEqual(summary["ms_at_peak"], 1000)
+        self.assertEqual(summary["path_travelled_c"], 0)
+        self.assertIsNone(summary["path_efficiency"])
+
+    def test_summary_exposes_every_required_field(self):
+        summary = store.bid_path_summary([
+            self.row(0.0, 90.0), self.row(500.0, 80.0),
+            self.row(1000.0, None, availability="gap"),
+            self.row(2000.0, 70.0),
+            self.row(2500.0, 72.0, availability="terminal", terminal=1),
+        ])
+        for field in (
+            "samples_total", "samples_priced", "segments", "gap_count",
+            "gap_duration_ms", "unknown_gap_duration_ms", "first_bid", "last_bid",
+            "peak_bid", "peak_dt_ms", "peak_bid_size", "peak_exec_px", "ms_at_peak",
+            "trough_bid", "trough_dt_ms", "path_travelled_c", "displacement_c",
+            "path_efficiency", "span_ms", "truncated", "dropped_samples",
+        ):
+            with self.subTest(field=field):
+                self.assertIn(field, summary)
+        self.assertEqual(summary["samples_total"], 5)
+        self.assertEqual(summary["samples_priced"], 4)
+
+    def test_travel_accumulates_only_inside_a_segment(self):
+        summary = store.bid_path_summary([
+            self.row(0.0, 50.0), self.row(100.0, 60.0), self.row(200.0, 55.0),
+            self.row(300.0, None, availability="gap"),
+            self.row(400.0, 90.0), self.row(500.0, 80.0),
+        ])
+        # 10 + 5 inside segment one, 10 inside segment two; the 55 -> 90 jump
+        # across the outage is not travel that could have been traded.
+        self.assertEqual(summary["path_travelled_c"], 25.0)
+        self.assertEqual(summary["segments"], 2)
+        self.assertEqual(summary["gap_count"], 1)
+
+    def test_a_resumed_quote_starts_a_new_segment(self):
+        summary = store.bid_path_summary([
+            self.row(0.0, 90.0),
+            self.row(100.0, None, availability="gap"),
+            self.row(200.0, 90.0),
+            self.row(300.0, None, availability="gap"),
+            self.row(400.0, 90.0),
+        ])
+        self.assertEqual(summary["segments"], 3)
+        self.assertEqual(summary["gap_count"], 2)
+        self.assertEqual(summary["gap_duration_ms"], 200)
+
+    def test_unpriced_only_path_has_no_summary(self):
+        self.assertIsNone(store.bid_path_summary([
+            self.row(0.0, None, availability="gap"),
+        ]))
+
+    def test_truncation_is_reported_not_silent(self):
+        summary = store.bid_path_summary(
+            [self.row(float(i), 50.0 + (i % 5)) for i in range(10)],
+            truncated=True, dropped_samples=17,
+        )
+        self.assertTrue(summary["truncated"])
+        self.assertEqual(summary["dropped_samples"], 17)
+
+
+class PathCapTests(unittest.TestCase):
+    """Handoff section 8.3: the cap includes the terminal row."""
+
+    def setUp(self):
+        self.dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.dir.cleanup)
+        patcher = patch("app.store.config.DATA_DIR", self.dir.name)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        store._conn = None
+        store.init()
+
+    def test_path_cap_is_4000_including_one_terminal_row(self):
+        from app import paper
+        desk, pos = _desk(), _position(remaining=1.0)
+        written = []
+        with patch("app.store.insert_bid_path", side_effect=written.extend):
+            for tick in range(store.BID_PATH_MAX_SAMPLES + 250):
+                desk._record_exec_path(
+                    pos, _book(yes_levels=((1 + tick % 99, 10),)),
+                    float(1 + tick % 99), float(tick),
+                )
+            desk._record_exec_terminal(pos, 55.0, 99999.0)
+            desk._flush_exec_path(pos)
+
+        self.assertLessEqual(
+            pos.exec_path_total, store.BID_PATH_MAX_SAMPLES,
+            "samples_total must never exceed the cap",
+        )
+        terminal_rows = [row for row in written if row.get("terminal")]
+        self.assertEqual(len(terminal_rows), 1, "exactly one terminal row is required")
+        self.assertLessEqual(len(written), store.BID_PATH_MAX_SAMPLES)
+        self.assertGreater(pos.exec_path_dropped, 0, "truncation must be reported")
+
+    def test_terminal_row_is_labelled_and_not_a_book_quote(self):
+        from app import paper
+        desk, pos = _desk(), _position(remaining=1.0)
+        desk._record_exec_path(pos, _book(yes_levels=((50, 10),)), 50.0, 1.0)
+        desk._record_exec_terminal(pos, 55.0, 2.0)
+
+        terminal = pos.exec_path[-1]
+        self.assertEqual(terminal["availability"], "terminal")
+        self.assertEqual(terminal["terminal"], 1)
+        self.assertIsNone(
+            terminal["bid_size"],
+            "an executed exit price must not be presented as an observed book quote",
+        )
+
+    def test_a_no_ladder_observation_records_one_gap_and_does_not_flood(self):
+        from app import paper
+        desk, pos = _desk(), _position(remaining=1.0)
+        desk._record_exec_path(pos, _book(yes_levels=((50, 10),)), 50.0, 1.0)
+        for tick in range(5):
+            desk._record_exec_gap(pos, 2.0 + tick)
+
+        gaps = [row for row in pos.exec_path if row.get("availability") == "gap"]
+        self.assertEqual(len(gaps), 1, "repeated no-ladder observations must not flood")
+
+        desk._record_exec_path(pos, _book(yes_levels=((60, 10),)), 60.0, 9.0)
+        resumed = [row for row in pos.exec_path if row.get("availability") == "quote"]
+        self.assertEqual(len(resumed), 2, "a resumed quote starts a new segment")
+
+
+class FrontendPathCacheTests(unittest.TestCase):
+    """Handoff section 8.4: clicking Show path must render or show an error."""
+
+    def setUp(self):
+        self.js = (ROOT / "static" / "app.js").read_text()
+
+    def test_cache_keys_are_normalized_to_strings(self):
+        """A string DOM id stored, then read with a numeric trade.id, missed."""
+        for call in ("pathCache.has(", "pathCache.get(", "pathCache.set("):
+            index = 0
+            while True:
+                index = self.js.find(call, index)
+                if index == -1:
+                    break
+                argument = self.js[index + len(call):index + len(call) + 40]
+                self.assertTrue(
+                    argument.startswith("String(") or argument.startswith("pathKey("),
+                    f"{call}{argument.split(')')[0]}) is not key-normalized",
+                )
+                index += len(call)
+
+    def test_chart_starts_a_new_subpath_at_every_gap(self):
+        self.assertIn("segmentsFromSamples", self.js)
+        self.assertNotIn(
+            'const priced = samples.filter(row => finite(row.bid));\n  if (priced.length < 2) return "";\n  const xs = priced.map',
+            self.js,
+            "the chart still flattens every priced sample into one line",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
