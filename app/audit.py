@@ -14,6 +14,7 @@ from .match_events import (
     association_class,
     event_consistency,
     normalize_match_event,
+    provider_occurrence,
 )
 
 
@@ -167,6 +168,8 @@ def match_signal_event(signal, observations, window_s=None):
         "provider_poll_uncertainty_ms": None,
         "provider_response_ms": None,
         "provider_occurrence_ts": None,
+        "provider_occurrence_source": None,
+        "provider_occurrence_unavailable_reason": None,
         "occurrence_minus_signal_ms": None,
         "association": "unmatched",
         "event_association": "no_nearby_same_match_event",
@@ -205,9 +208,22 @@ def match_signal_event(signal, observations, window_s=None):
     # uncertainty.
     detail = json_object(row.get("detail"))
     raw_provider = detail.get("live_data") or json_object(row.get("raw_payload")) or {}
-    provider_details = raw_provider.get("details") or {}
-    last_play = provider_details.get("last_play") or {}
-    occurrence_ts = last_play.get("occurence_ts") if isinstance(last_play, dict) else None
+    # Prefer the normalized column written at canonicalization.  Rows persisted
+    # before that column existed are derived from their preserved raw payload
+    # using the same fixed precedence, and labelled as such -- absence stays
+    # null with an explicit reason rather than borrowing a receipt time.
+    occurrence_ts = row.get("provider_occurrence_ts")
+    occurrence_source = row.get("provider_occurrence_source")
+    occurrence_reason = row.get("provider_occurrence_unavailable_reason")
+    if occurrence_ts is None and occurrence_source is None:
+        derived_ts, derived_source, derived_reason = provider_occurrence(raw_provider)
+        occurrence_ts = derived_ts
+        occurrence_source = (
+            f"legacy_raw_derived:{derived_source}" if derived_source else None
+        )
+        occurrence_reason = occurrence_reason or derived_reason
+    if occurrence_ts is not None:
+        occurrence_reason = None
     occurrence_delta_ms = (
         round((occurrence_ts - signal_ts) * 1000.0, 3)
         if isinstance(occurrence_ts, (int, float)) else None
@@ -238,6 +254,8 @@ def match_signal_event(signal, observations, window_s=None):
         ),
         "provider_response_ms": row.get("response_ms"),
         "provider_occurrence_ts": occurrence_ts,
+        "provider_occurrence_source": occurrence_source,
+        "provider_occurrence_unavailable_reason": occurrence_reason,
         "occurrence_minus_signal_ms": occurrence_delta_ms,
         "raw_provider_payload": raw_provider,
     })

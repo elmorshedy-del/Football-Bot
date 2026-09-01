@@ -8,6 +8,7 @@ import time
 
 from . import config
 from . import match_clock
+from . import match_events
 from .match_events import normalize_match_event
 
 _lock = threading.Lock()
@@ -104,12 +105,37 @@ CREATE TABLE IF NOT EXISTS provider_match_events(
   raw_payload TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_provider_events_event_ts
   ON provider_match_events(event, observed_ts);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_events_fingerprint
-  ON provider_match_events(event, fingerprint);
+-- The mode-scoped unique fingerprint index is created in init() after the
+-- `mode` column migration has run, since it references that column.
 """
 
 
 _mode = "demo"
+
+# Rows written before capture modes existed carry a NULL mode.  Their
+# provenance is unknown, not disposable: they are preserved and presented under
+# this label, and never silently counted as live.
+LEGACY_MODE = "legacy_unknown"
+
+
+def mode_clause(alias="", selector=None):
+    """Return (sql, params) scoping a query to one capture mode.
+
+    `selector` defaults to the active mode.  "all" disables scoping; the
+    legacy label maps to SQL NULL, which is never included in live.
+    """
+    prefix = f"{alias}." if alias else ""
+    selector = _mode if selector is None else selector
+    if selector == "all":
+        return "", ()
+    if selector == LEGACY_MODE:
+        return f" AND {prefix}mode IS NULL", ()
+    return f" AND {prefix}mode=?", (selector,)
+
+
+def present_mode(value):
+    """Label a stored mode for the API/export semantic layer."""
+    return value if value else LEGACY_MODE
 
 
 def init():
@@ -121,7 +147,8 @@ def init():
     _conn.executescript(SCHEMA)
     # migrate: add mode column to older DBs (persisted on a volume)
     for tbl in ("signals", "trades", "match_clock_observations",
-                "provider_match_events", "goal_latency_observations"):
+                "provider_match_events", "goal_latency_observations",
+                "latency", "paper_fills"):
         try:
             _conn.execute(f"ALTER TABLE {tbl} ADD COLUMN mode TEXT")
         except sqlite3.OperationalError:
@@ -174,11 +201,38 @@ def init():
             )
         except sqlite3.OperationalError:
             pass
+    # Normalized provider occurrence. The raw payload is preserved untouched;
+    # these columns record what was resolved from it, from where, and why not.
+    for column, definition in (
+        ("provider_occurrence_ts", "REAL"),
+        ("provider_occurrence_source", "TEXT"),
+        ("provider_occurrence_unavailable_reason", "TEXT"),
+    ):
+        try:
+            _conn.execute(
+                f"ALTER TABLE provider_match_events ADD COLUMN {column} {definition}"
+            )
+        except sqlite3.OperationalError:
+            pass
     for column in ("match_clock_snapshot", "forward_path_summary"):
         try:
             _conn.execute(f"ALTER TABLE signals ADD COLUMN {column} TEXT")
         except sqlite3.OperationalError:
             pass
+    # Provider duplicate identity is mode-scoped.  The old (event,fingerprint)
+    # unique index made a live observation collide with a demo one and silently
+    # refresh it instead of recording it.  Replacing the index deletes no row
+    # and rewrites no mode; the new index is strictly more permissive, so it
+    # cannot fail against data the old one already accepted.
+    try:
+        _conn.execute("DROP INDEX IF EXISTS idx_provider_events_fingerprint")
+        _conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_events_fingerprint_mode
+                 ON provider_match_events(
+                     event, fingerprint, COALESCE(mode, 'legacy_unknown'))"""
+        )
+    except sqlite3.OperationalError:
+        pass
     _conn.executescript(
         """CREATE TABLE IF NOT EXISTS bid_path_samples(
              id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -243,8 +297,9 @@ def init():
              raw_payload TEXT NOT NULL);
            CREATE INDEX IF NOT EXISTS idx_provider_events_event_ts
              ON provider_match_events(event, observed_ts);
-           CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_events_fingerprint
-             ON provider_match_events(event, fingerprint);"""
+           CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_events_fingerprint_mode
+             ON provider_match_events(
+                 event, fingerprint, COALESCE(mode, 'legacy_unknown'));"""
     )
     _conn.commit()
 
@@ -255,19 +310,19 @@ def set_mode(m):
 
 
 def purge_non_live():
-    """On a live boot, drop demo/legacy rows so live stats start clean.
-    Live rows (mode='live') are preserved across redeploys; only demo/NULL go."""
+    """Clear the operator event log on a live boot.
+
+    This used to DELETE every non-live row from the study tables so live stats
+    would start clean.  That destroyed demo and legacy evidence permanently,
+    and deleted newly written null-mode rows on the next restart.  Isolation is
+    now a query concern: every study read scopes to a capture mode (see
+    `mode_clause`), so no observation has to be deleted to keep live clean.
+
+    Only the operator event log and firehose-era junk signals -- rows that
+    reference no registered market and are not study evidence -- are removed.
+    """
     with _lock:
-        for tbl in ("signals", "trades", "bid_path_samples",
-                    "match_clock_observations", "provider_match_events",
-                    "goal_latency_observations"):
-            try:
-                _conn.execute(
-                    f"DELETE FROM {tbl} WHERE mode IS NULL OR mode!='live'"
-                )
-            except sqlite3.OperationalError:
-                pass  # table or column absent on an older volume
-        # drop firehose-era junk: signals on markets we never registered
+        # Firehose-era junk: signals on markets that were never registered.
         _conn.execute("DELETE FROM signals WHERE event='?'")
         _conn.execute("DELETE FROM eventlog")
         _conn.commit()
@@ -351,7 +406,8 @@ def add_latency(kind, ms):
     )
     stored_kind = kind if valid else f"{kind}_invalid"
     stored_ms = float(ms) if isinstance(ms, (int, float)) and not isinstance(ms, bool) else None
-    ex("INSERT INTO latency(ts,kind,ms) VALUES(?,?,?)", (now, stored_kind, stored_ms))
+    ex("INSERT INTO latency(ts,kind,ms,mode) VALUES(?,?,?,?)",
+       (now, stored_kind, stored_ms, _mode))
 
 
 def _percentile(values, p):
@@ -361,18 +417,25 @@ def _percentile(values, p):
     return values[min(len(values) - 1, int(p * len(values)))]
 
 
-def latency_kind_summary(kind, limit=500, now=None, threshold_ms=None):
+def latency_kind_summary(kind, limit=500, now=None, threshold_ms=None, mode=None):
+    """Summarise one latency kind for a capture mode (active mode by default).
+
+    Readiness must not mix demo or legacy samples into a live judgement: a demo
+    replay writes wildly different timings, and a legacy sample has unknown
+    provenance.
+    """
     now = time.time() if now is None else now
     aliases = LATENCY_KIND_ALIASES.get(kind, (kind,))
     marks = ",".join("?" for _ in aliases)
+    scope, scope_args = mode_clause(selector=mode)
     rows = q(
-        f"""SELECT ts, ms FROM latency WHERE kind IN ({marks})
+        f"""SELECT ts, ms FROM latency WHERE kind IN ({marks}){scope}
              ORDER BY ts DESC LIMIT ?""",
-        (*aliases, limit),
+        (*aliases, *scope_args, limit),
     )
     invalid = q(
-        f"""SELECT COUNT(*) AS n FROM latency WHERE kind=?""",
-        (f"{kind}_invalid",),
+        f"""SELECT COUNT(*) AS n FROM latency WHERE kind=?{scope}""",
+        (f"{kind}_invalid", *scope_args),
     )[0]["n"]
     values = [row["ms"] for row in rows if isinstance(row.get("ms"), (int, float))]
     latest_ts = rows[0]["ts"] if rows else None
@@ -403,8 +466,11 @@ def latency_kind_summary(kind, limit=500, now=None, threshold_ms=None):
     }
 
 
-def latency_readiness(limit=500, now=None):
-    return {kind: latency_kind_summary(kind, limit=limit, now=now) for kind in LATENCY_KINDS}
+def latency_readiness(limit=500, now=None, mode=None):
+    return {
+        kind: latency_kind_summary(kind, limit=limit, now=now, mode=mode)
+        for kind in LATENCY_KINDS
+    }
 
 
 BID_PATH_MAX_SAMPLES = 4000
@@ -547,8 +613,8 @@ def insert_goal_latency(row):
                observed_ts,event,milestone_id,change_kind,live_type,
                score_before,score_after,previous_poll_ts,poll_started_ts,response_ms,
                last_book_change_ts,last_book_lead_ms,last_trade_ts,last_trade_lead_ms,
-               canonical_type,canonical_side,normalized_event,detail)
-             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               canonical_type,canonical_side,normalized_event,detail,mode)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             row["observed_ts"], row["event"], row["milestone_id"],
             row["change_kind"], row.get("live_type"),
@@ -560,6 +626,7 @@ def insert_goal_latency(row):
             normalized["canonical_type"], normalized["side"],
             json.dumps(normalized, separators=(",", ":")),
             json.dumps(row.get("detail") or {}, separators=(",", ":")),
+            _mode,
         ),
     )
     return cur.lastrowid
@@ -600,10 +667,17 @@ def latest_match_clock(event):
 
 def upsert_provider_event(row):
     """Insert a new fingerprint or refresh last_observed_ts. History stays append-only."""
+    occurrence_ts, occurrence_source, occurrence_reason = (
+        match_events.provider_occurrence(row.get("raw_payload"))
+    )
+    # Duplicate identity is mode-scoped: the same provider fingerprint may be
+    # observed once in demo and once in live, and neither may overwrite the
+    # other's raw payload or mode.
+    scope, scope_args = mode_clause()
     existing = q(
-        """SELECT id, first_observed_ts, canonical_type FROM provider_match_events
-            WHERE event=? AND fingerprint=?""",
-        (row["event"], row["fingerprint"]),
+        "SELECT id, first_observed_ts, canonical_type FROM provider_match_events"
+        f" WHERE event=? AND fingerprint=?{scope}",
+        (row["event"], row["fingerprint"], *scope_args),
     )
     if existing:
         ex(
@@ -621,8 +695,10 @@ def upsert_provider_event(row):
                observed_ts,first_observed_ts,last_observed_ts,poll_started_ts,previous_poll_ts,
                response_ms,event,milestone_id,fingerprint,previous_fingerprint,canonical_type,
                canonical_side,provider_period,provider_minute,provider_stoppage,provider_clock,
-               normalized_event,raw_payload)
-             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               normalized_event,raw_payload,mode,
+               provider_occurrence_ts,provider_occurrence_source,
+               provider_occurrence_unavailable_reason)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             row["observed_ts"], row["observed_ts"], row["observed_ts"],
             row["poll_started_ts"], row.get("previous_poll_ts"), row["response_ms"],
@@ -633,9 +709,36 @@ def upsert_provider_event(row):
             row.get("provider_clock"),
             json.dumps(row.get("normalized_event") or {}, separators=(",", ":")),
             json.dumps(row.get("raw_payload") or {}, separators=(",", ":")),
+            _mode,
+            occurrence_ts, occurrence_source, occurrence_reason,
         ),
     )
     return cur.lastrowid, True
+
+
+SUBSTANTIVE_REVISION_TYPES = (
+    "goal.observed", "penalty.scored",
+)
+
+
+def previous_substantive_fingerprint(event, mode=None):
+    """Newest persisted substantive event for this event and capture mode.
+
+    A correction usually arrives on a later poll than the goal it revises, and
+    a restart loses the in-memory link entirely.  Resolving it from durable
+    state keeps the revision chain intact across process death.  Corrections
+    are excluded so a correction never links to another correction, and the
+    lookup is mode- and event-scoped so it can never link across either.
+    """
+    scope, scope_args = mode_clause(selector=mode)
+    marks = ",".join("?" for _ in SUBSTANTIVE_REVISION_TYPES)
+    rows = q(
+        f"""SELECT fingerprint FROM provider_match_events
+             WHERE event=? AND canonical_type IN ({marks}){scope}
+             ORDER BY id DESC LIMIT 1""",
+        (event, *SUBSTANTIVE_REVISION_TYPES, *scope_args),
+    )
+    return rows[0]["fingerprint"] if rows else None
 
 
 def finish_goal_latency(row_id, first_book=None, first_trade=None):
@@ -696,11 +799,11 @@ def finish_paper_signal(signal_id, outcome, detail, latency_ms, order_arrival_ms
         try:
             _conn.execute("UPDATE signals SET outcome=?, detail=? WHERE id=?",
                           (outcome, json.dumps(detail or {}), signal_id))
-            _conn.execute("INSERT INTO latency(ts,kind,ms) VALUES(?,?,?)",
-                          (time.time(), "paper_entry_ms", latency_ms))
+            _conn.execute("INSERT INTO latency(ts,kind,ms,mode) VALUES(?,?,?,?)",
+                          (time.time(), "paper_entry_ms", latency_ms, _mode))
             if order_arrival_ms is not None:
-                _conn.execute("INSERT INTO latency(ts,kind,ms) VALUES(?,?,?)",
-                              (time.time(), "order_arrival_ms", order_arrival_ms))
+                _conn.execute("INSERT INTO latency(ts,kind,ms,mode) VALUES(?,?,?,?)",
+                              (time.time(), "order_arrival_ms", order_arrival_ms, _mode))
             _conn.commit()
         except Exception:
             _conn.rollback()
@@ -736,11 +839,11 @@ def open_paper_trade(t, detail, fill_levels, entry_fee, latency_ms, order_arriva
             trade_id = cur.lastrowid
             _conn.execute("UPDATE signals SET outcome='filled', detail=? WHERE id=?",
                           (json.dumps(detail or {}), t["signal_id"]))
-            _conn.execute("INSERT INTO latency(ts,kind,ms) VALUES(?,?,?)",
-                          (time.time(), "paper_entry_ms", latency_ms))
+            _conn.execute("INSERT INTO latency(ts,kind,ms,mode) VALUES(?,?,?,?)",
+                          (time.time(), "paper_entry_ms", latency_ms, _mode))
             if order_arrival_ms is not None:
-                _conn.execute("INSERT INTO latency(ts,kind,ms) VALUES(?,?,?)",
-                              (time.time(), "order_arrival_ms", order_arrival_ms))
+                _conn.execute("INSERT INTO latency(ts,kind,ms,mode) VALUES(?,?,?,?)",
+                              (time.time(), "order_arrival_ms", order_arrival_ms, _mode))
             for price, quantity, fee in fill_levels:
                 _conn.execute(
                     """INSERT INTO paper_fills(trade_id,signal_id,ts,leg,side,price,quantity,
@@ -777,8 +880,8 @@ def record_paper_exit(tid, signal_id, side, ts, reason, fill_levels, progress,
                        exit_qty=?, exit_vwap_num=? WHERE id=?""",
                 fields,
             )
-            _conn.execute("INSERT INTO latency(ts,kind,ms) VALUES(?,?,?)",
-                          (time.time(), "paper_exit_ms", latency_ms))
+            _conn.execute("INSERT INTO latency(ts,kind,ms,mode) VALUES(?,?,?,?)",
+                          (time.time(), "paper_exit_ms", latency_ms, _mode))
             if final is not None:
                 _conn.execute(
                     """UPDATE trades SET exit_ts=?, exit_px=?, exit_reason=?, gross=?, fees=?,
@@ -881,11 +984,11 @@ def _event_cluster_ci(closed):
     return ci
 
 
-def _latency_evidence():
-    summary = latency_kind_summary("order_arrival_ms")
+def _latency_evidence(mode=None):
+    summary = latency_kind_summary("order_arrival_ms", mode=mode)
     source = "order_arrival_ms"
     if summary["n"] == 0:
-        summary = latency_kind_summary("feed_ingress_ms")
+        summary = latency_kind_summary("feed_ingress_ms", mode=mode)
         source = "feed_ingress_ms" if summary["n"] else "order_arrival_ms"
     status = summary["state"]
     if status == "PASS":
@@ -970,14 +1073,24 @@ def _strategy_summary(closed, open_t, signals, latency_evidence):
     }
 
 
-def stats():
-    closed = q("SELECT * FROM trades WHERE status='closed'")
-    open_t = q("SELECT * FROM trades WHERE status='open'")
+def stats(mode=None):
+    """Aggregate the study for one capture mode (the active mode by default).
+
+    Isolation is enforced here rather than by deleting rows at startup, so demo
+    and legacy evidence stays on disk without ever entering live aggregates.
+    """
+    scope, scope_args = mode_clause(selector=mode)
+    trade_scope, trade_args = mode_clause("t", selector=mode)
+    signal_scope, signal_args = mode_clause("s", selector=mode)
+    closed = q(f"SELECT * FROM trades WHERE status='closed'{scope}", scope_args)
+    open_t = q(f"SELECT * FROM trades WHERE status='open'{scope}", scope_args)
     signal_rows = q(
-        """SELECT s.outcome,s.detail,t.strategy AS trade_strategy
-             FROM signals s LEFT JOIN trades t ON t.signal_id=s.id"""
+        "SELECT s.outcome,s.detail,t.strategy AS trade_strategy"
+        " FROM signals s LEFT JOIN trades t"
+        f" ON t.signal_id=s.id{trade_scope} WHERE 1=1{signal_scope}",
+        (*trade_args, *signal_args),
     )
-    latency_evidence = _latency_evidence()
+    latency_evidence = _latency_evidence(mode=mode)
     by_strategy = {
         "gate_a": {"closed": [], "open": [], "signals": []},
         "price_only_late_score": {"closed": [], "open": [], "signals": []},

@@ -313,3 +313,255 @@ AssertionError: 0 != 1 : expected exactly one coverage row for EV
 Ran 19 tests in 0.058s
 
 FAILED (failures=12, errors=10)
+
+==================================================================
+# BR-00 baseline red tests — work package 2 (BR-MODE / BR-EVENT)
+# Run at: c9f490ac1b3f8a694c65df088f74fae6a7bc8d90 (work package 1 applied; no BR-MODE code yet)
+# Date (UTC): 2026-09-01T20:44:52Z
+
+$ .venv/bin/python -m unittest tests.test_evidence_modes
+
+.FFFEFFFFFEFFFFFFFFFEFFFFF
+======================================================================
+ERROR: test_demo_then_live_restart_preserves_both_but_live_apis_exclude_demo (tests.test_evidence_modes.ModePreservationTests.test_demo_then_live_restart_preserves_both_but_live_apis_exclude_demo) (table='latency')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_evidence_modes.py", line 146, in test_demo_then_live_restart_preserves_both_but_live_apis_exclude_demo
+    modes = self.modes_in(table)
+            ^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/Football-Bot/tests/test_evidence_modes.py", line 93, in modes_in
+    row["mode"] for row in store.q(f"SELECT mode FROM {table} ORDER BY rowid")
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/Football-Bot/app/store.py", line 285, in q
+    cur = _conn.execute(sql, args)
+          ^^^^^^^^^^^^^^^^^^^^^^^^
+sqlite3.OperationalError: no such column: mode
+
+======================================================================
+ERROR: test_legacy_null_rows_survive_init_startup_and_two_restarts (tests.test_evidence_modes.ModePreservationTests.test_legacy_null_rows_survive_init_startup_and_two_restarts) (table='latency')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_evidence_modes.py", line 185, in test_legacy_null_rows_survive_init_startup_and_two_restarts
+    None, self.modes_in(table),
+          ^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/Football-Bot/tests/test_evidence_modes.py", line 93, in modes_in
+    row["mode"] for row in store.q(f"SELECT mode FROM {table} ORDER BY rowid")
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/Football-Bot/app/store.py", line 285, in q
+    cur = _conn.execute(sql, args)
+          ^^^^^^^^^^^^^^^^^^^^^^^^
+sqlite3.OperationalError: no such column: mode
+
+======================================================================
+ERROR: test_every_fresh_live_insert_writes_live_mode (tests.test_evidence_modes.ModeWriteTests.test_every_fresh_live_insert_writes_live_mode) (table='latency')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_evidence_modes.py", line 110, in test_every_fresh_live_insert_writes_live_mode
+    modes = self.modes_in(table)
+            ^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/Football-Bot/tests/test_evidence_modes.py", line 93, in modes_in
+    row["mode"] for row in store.q(f"SELECT mode FROM {table} ORDER BY rowid")
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/user/Football-Bot/app/store.py", line 285, in q
+    cur = _conn.execute(sql, args)
+          ^^^^^^^^^^^^^^^^^^^^^^^^
+sqlite3.OperationalError: no such column: mode
+
+======================================================================
+FAIL: test_mode_migration_is_idempotent_and_preserves_row_hashes (tests.test_evidence_modes.ModeMigrationTests.test_mode_migration_is_idempotent_and_preserves_row_hashes)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_evidence_modes.py", line 309, in test_mode_migration_is_idempotent_and_preserves_row_hashes
+    self.assertEqual(self.value_hash(), before_hash,
+AssertionError: '4b0545bbbe31a74252704606d2e81b58e2493f5ec8e226641d93229671de4776' != 'aed65780b746d5823de8b068a75bf4f457f767e8255eb583c1734f142cec754a'
+- 4b0545bbbe31a74252704606d2e81b58e2493f5ec8e226641d93229671de4776
++ aed65780b746d5823de8b068a75bf4f457f767e8255eb583c1734f142cec754a
+ : two migrations changed historical values
+
+======================================================================
+FAIL: test_demo_then_live_restart_preserves_both_but_live_apis_exclude_demo (tests.test_evidence_modes.ModePreservationTests.test_demo_then_live_restart_preserves_both_but_live_apis_exclude_demo) (table='signals')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_evidence_modes.py", line 147, in test_demo_then_live_restart_preserves_both_but_live_apis_exclude_demo
+    self.assertIn("demo", modes, f"{table} lost its demo history")
+AssertionError: 'demo' not found in ['live'] : signals lost its demo history
+
+======================================================================
+FAIL: test_demo_then_live_restart_preserves_both_but_live_apis_exclude_demo (tests.test_evidence_modes.ModePreservationTests.test_demo_then_live_restart_preserves_both_but_live_apis_exclude_demo) (table='trades')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_evidence_modes.py", line 147, in test_demo_then_live_restart_preserves_both_but_live_apis_exclude_demo
+    self.assertIn("demo", modes, f"{table} lost its demo history")
+AssertionError: 'demo' not found in ['live'] : trades lost its demo history
+
+======================================================================
+FAIL: test_demo_then_live_restart_preserves_both_but_live_apis_exclude_demo (tests.test_evidence_modes.ModePreservationTests.test_demo_then_live_restart_preserves_both_but_live_apis_exclude_demo) (table='bid_path_samples')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_evidence_modes.py", line 147, in test_demo_then_live_restart_preserves_both_but_live_apis_exclude_demo
+    self.assertIn("demo", modes, f"{table} lost its demo history")
+AssertionError: 'demo' not found in ['live'] : bid_path_samples lost its demo history
+
+======================================================================
+FAIL: test_demo_then_live_restart_preserves_both_but_live_apis_exclude_demo (tests.test_evidence_modes.ModePreservationTests.test_demo_then_live_restart_preserves_both_but_live_apis_exclude_demo) (table='match_clock_observations')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_evidence_modes.py", line 147, in test_demo_then_live_restart_preserves_both_but_live_apis_exclude_demo
+    self.assertIn("demo", modes, f"{table} lost its demo history")
+AssertionError: 'demo' not found in ['live'] : match_clock_observations lost its demo history
+
+======================================================================
+FAIL: test_demo_then_live_restart_preserves_both_but_live_apis_exclude_demo (tests.test_evidence_modes.ModePreservationTests.test_demo_then_live_restart_preserves_both_but_live_apis_exclude_demo) (table='provider_match_events')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_evidence_modes.py", line 147, in test_demo_then_live_restart_preserves_both_but_live_apis_exclude_demo
+    self.assertIn("demo", modes, f"{table} lost its demo history")
+AssertionError: 'demo' not found in [None] : provider_match_events lost its demo history
+
+======================================================================
+FAIL: test_demo_then_live_restart_preserves_both_but_live_apis_exclude_demo (tests.test_evidence_modes.ModePreservationTests.test_demo_then_live_restart_preserves_both_but_live_apis_exclude_demo) (table='goal_latency_observations')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_evidence_modes.py", line 147, in test_demo_then_live_restart_preserves_both_but_live_apis_exclude_demo
+    self.assertIn("demo", modes, f"{table} lost its demo history")
+AssertionError: 'demo' not found in [None] : goal_latency_observations lost its demo history
+
+======================================================================
+FAIL: test_legacy_null_rows_survive_init_startup_and_two_restarts (tests.test_evidence_modes.ModePreservationTests.test_legacy_null_rows_survive_init_startup_and_two_restarts) (table='signals')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_evidence_modes.py", line 180, in test_legacy_null_rows_survive_init_startup_and_two_restarts
+    self.assertGreaterEqual(
+AssertionError: 0 not greater than or equal to 1 : signals lost legacy null-mode history across two restarts
+
+======================================================================
+FAIL: test_legacy_null_rows_survive_init_startup_and_two_restarts (tests.test_evidence_modes.ModePreservationTests.test_legacy_null_rows_survive_init_startup_and_two_restarts) (table='match_clock_observations')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_evidence_modes.py", line 180, in test_legacy_null_rows_survive_init_startup_and_two_restarts
+    self.assertGreaterEqual(
+AssertionError: 0 not greater than or equal to 1 : match_clock_observations lost legacy null-mode history across two restarts
+
+======================================================================
+FAIL: test_provider_and_goal_rows_survive_two_live_restarts (tests.test_evidence_modes.ModePreservationTests.test_provider_and_goal_rows_survive_two_live_restarts) (table='provider_match_events')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_evidence_modes.py", line 200, in test_provider_and_goal_rows_survive_two_live_restarts
+    self.assertEqual(
+AssertionError: 0 != 1 : provider_match_events rows were deleted by a live restart
+
+======================================================================
+FAIL: test_provider_and_goal_rows_survive_two_live_restarts (tests.test_evidence_modes.ModePreservationTests.test_provider_and_goal_rows_survive_two_live_restarts) (table='goal_latency_observations')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_evidence_modes.py", line 200, in test_provider_and_goal_rows_survive_two_live_restarts
+    self.assertEqual(
+AssertionError: 0 != 1 : goal_latency_observations rows were deleted by a live restart
+
+======================================================================
+FAIL: test_purge_non_live_never_deletes_study_observations (tests.test_evidence_modes.ModePreservationTests.test_purge_non_live_never_deletes_study_observations) (table='signals')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_evidence_modes.py", line 216, in test_purge_non_live_never_deletes_study_observations
+    self.assertEqual(
+AssertionError: 0 != 1 : purge_non_live() deleted rows from signals
+
+======================================================================
+FAIL: test_purge_non_live_never_deletes_study_observations (tests.test_evidence_modes.ModePreservationTests.test_purge_non_live_never_deletes_study_observations) (table='trades')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_evidence_modes.py", line 216, in test_purge_non_live_never_deletes_study_observations
+    self.assertEqual(
+AssertionError: 0 != 1 : purge_non_live() deleted rows from trades
+
+======================================================================
+FAIL: test_purge_non_live_never_deletes_study_observations (tests.test_evidence_modes.ModePreservationTests.test_purge_non_live_never_deletes_study_observations) (table='bid_path_samples')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_evidence_modes.py", line 216, in test_purge_non_live_never_deletes_study_observations
+    self.assertEqual(
+AssertionError: 0 != 1 : purge_non_live() deleted rows from bid_path_samples
+
+======================================================================
+FAIL: test_purge_non_live_never_deletes_study_observations (tests.test_evidence_modes.ModePreservationTests.test_purge_non_live_never_deletes_study_observations) (table='match_clock_observations')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_evidence_modes.py", line 216, in test_purge_non_live_never_deletes_study_observations
+    self.assertEqual(
+AssertionError: 0 != 1 : purge_non_live() deleted rows from match_clock_observations
+
+======================================================================
+FAIL: test_purge_non_live_never_deletes_study_observations (tests.test_evidence_modes.ModePreservationTests.test_purge_non_live_never_deletes_study_observations) (table='provider_match_events')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_evidence_modes.py", line 216, in test_purge_non_live_never_deletes_study_observations
+    self.assertEqual(
+AssertionError: 0 != 1 : purge_non_live() deleted rows from provider_match_events
+
+======================================================================
+FAIL: test_purge_non_live_never_deletes_study_observations (tests.test_evidence_modes.ModePreservationTests.test_purge_non_live_never_deletes_study_observations) (table='goal_latency_observations')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_evidence_modes.py", line 216, in test_purge_non_live_never_deletes_study_observations
+    self.assertEqual(
+AssertionError: 0 != 1 : purge_non_live() deleted rows from goal_latency_observations
+
+======================================================================
+FAIL: test_every_fresh_live_insert_writes_live_mode (tests.test_evidence_modes.ModeWriteTests.test_every_fresh_live_insert_writes_live_mode) (table='provider_match_events')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_evidence_modes.py", line 112, in test_every_fresh_live_insert_writes_live_mode
+    self.assertTrue(
+AssertionError: False is not true : provider_match_events wrote [None] instead of live
+
+======================================================================
+FAIL: test_every_fresh_live_insert_writes_live_mode (tests.test_evidence_modes.ModeWriteTests.test_every_fresh_live_insert_writes_live_mode) (table='goal_latency_observations')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_evidence_modes.py", line 112, in test_every_fresh_live_insert_writes_live_mode
+    self.assertTrue(
+AssertionError: False is not true : goal_latency_observations wrote [None] instead of live
+
+======================================================================
+FAIL: test_live_latency_readiness_excludes_demo_and_legacy_samples (tests.test_evidence_modes.ModeWriteTests.test_live_latency_readiness_excludes_demo_and_legacy_samples)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_evidence_modes.py", line 130, in test_live_latency_readiness_excludes_demo_and_legacy_samples
+    self.assertEqual(summary["n"], 30, "live readiness must see only live samples")
+AssertionError: 61 != 30 : live readiness must see only live samples
+
+======================================================================
+FAIL: test_duplicate_refresh_preserves_original_mode_and_raw_payload (tests.test_evidence_modes.ProviderModeScopeTests.test_duplicate_refresh_preserves_original_mode_and_raw_payload)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_evidence_modes.py", line 274, in test_duplicate_refresh_preserves_original_mode_and_raw_payload
+    self.assertEqual(stored["mode"], "live")
+AssertionError: None != 'live'
+
+======================================================================
+FAIL: test_same_provider_fingerprint_can_exist_once_per_mode_without_overwrite (tests.test_evidence_modes.ProviderModeScopeTests.test_same_provider_fingerprint_can_exist_once_per_mode_without_overwrite)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_evidence_modes.py", line 246, in test_same_provider_fingerprint_can_exist_once_per_mode_without_overwrite
+    self.assertTrue(live_new, "the same fingerprint must be insertable per mode")
+AssertionError: False is not true : the same fingerprint must be insertable per mode
+
+----------------------------------------------------------------------
+Ran 10 tests in 0.358s
+
+FAILED (failures=22, errors=3)
+
+==================================================================
+# BR-00 baseline red — work package 2 (BR-EVENT, section 6.1)
+# Run at: c9f490ac1b3f8a694c65df088f74fae6a7bc8d90
+# Date (UTC): 2026-09-01T20:48:46Z
+
+$ match_signal_event(signal, [root-occurence_ts row])
+  provider_occurrence_ts                        = None
+  occurrence_minus_signal_ms                    = None
+  provider_occurrence_source                    = None
+  provider_occurrence_unavailable_reason        = None
+
+Traceback (most recent call last):
+  File "<stdin>", line 27, in <module>
+AssertionError: FAIL: a real root occurence_ts reports null occurrence time (got None); only details.last_play.occurence_ts is recognised

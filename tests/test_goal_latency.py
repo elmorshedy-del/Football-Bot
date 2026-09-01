@@ -86,6 +86,8 @@ class ObserverFlowTests(unittest.IsolatedAsyncioTestCase):
             patch("app.goal_latency.store.insert_goal_latency", return_value=7) as insert,
             patch("app.goal_latency.store.insert_match_clock", return_value=1),
             patch("app.goal_latency.store.upsert_provider_event", return_value=(1, True)),
+            patch("app.goal_latency.store.previous_substantive_fingerprint",
+                  return_value=None),
             patch("app.goal_latency.store.add_latency"),
             patch("app.goal_latency.store.log_event"),
         ):

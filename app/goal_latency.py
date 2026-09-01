@@ -134,6 +134,7 @@ class GoalLatencyObserver:
             self.last_poll_ts.pop(milestone_id, None)
             self.seen_fingerprints.pop(event, None)
             self.lifecycle_state.pop(event, None)
+            self.last_substantive_fingerprint.pop(event, None)
             self.clock_tracker.drop_event(event)
         for event in sorted(active - set(self.milestones)):
             if now - self.last_mapping_attempt.get(event, 0.0) < 30.0:
@@ -261,7 +262,15 @@ class GoalLatencyObserver:
         # A correction usually arrives on a LATER poll than the goal it
         # corrects.  Resetting this per poll meant every such correction was
         # stored with previous_fingerprint=null and the revision chain broke.
+        # In-memory state is preferred; after a restart it is empty, so the
+        # link is resolved from durable same-event, same-mode history instead.
         previous_fingerprint = self.last_substantive_fingerprint.get(event)
+        if previous_fingerprint is None:
+            previous_fingerprint = await asyncio.to_thread(
+                store.previous_substantive_fingerprint, event,
+            )
+            if previous_fingerprint is not None:
+                self.last_substantive_fingerprint[event] = previous_fingerprint
         for item in candidates:
             fingerprint = item["fingerprint"]
             if fingerprint in seen:

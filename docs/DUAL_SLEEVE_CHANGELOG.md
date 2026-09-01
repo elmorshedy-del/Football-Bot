@@ -853,3 +853,89 @@ reverted and is not committed.
 
 **Rollback.** `git revert <this commit>`. The migration only adds nullable columns; reverting the
 code leaves them in place, unread and non-destructive. No collected data is dropped.
+
+## PR 12 blocker resolution — work package 2: evidence modes and provider-event lineage (`BR-MODE`, `BR-EVENT`)
+
+Implements sections 5 and 6 of `docs/PR12_BLOCKER_RESOLUTION_HANDOFF.md`.
+
+**Before (`BR-00`).** Baseline output appended to
+`docs/evidence/pr12/baseline-cd4d36e/baseline-red-tests.txt`. `tests/test_evidence_modes.py`
+produced 20 red assertions:
+
+- `latency` had no `mode` column at all (`sqlite3.OperationalError: no such column: mode`).
+- `provider_match_events` and `goal_latency_observations` wrote `[None]` where `live` was required:
+  the migration added the column but neither insert set it.
+- `purge_non_live()` deleted every study observation on a live boot —
+  `purge_non_live() deleted rows from signals / trades / bid_path_samples /
+  match_clock_observations / provider_match_events / goal_latency_observations`, each `0 != 1`.
+- Demo history did not survive a live restart (`'demo' not found in ['live']`, six tables), and
+  legacy null-mode rows were destroyed (`0 not greater than or equal to 1`).
+- Two migrations changed the historical row hash.
+
+For `BR-EVENT`, a direct run of `match_signal_event()` against a real significant-event row
+carrying a root `occurence_ts` returned `provider_occurrence_ts = None`: only
+`details.last_play.occurence_ts` was recognised.
+
+**Change.** Files: `app/store.py`, `app/match_events.py`, `app/audit.py`, `app/goal_latency.py`.
+
+- `mode_clause(alias, selector)` and `present_mode()` centralise scoping. `legacy_unknown` maps to
+  SQL `mode IS NULL` and is never included in live; `"all"` disables scoping for audit callers.
+- `mode` is added idempotently to `latency` and `paper_fills` and written on every insert path,
+  including the transactional ones inside `open_paper_trade()`, `record_paper_exit()` and
+  `finish_paper_signal()`, plus `insert_goal_latency()` and `upsert_provider_event()`.
+- `purge_non_live()` no longer deletes study observations. Isolation moved to the query layer:
+  `stats()`, `latency_kind_summary()`, `latency_readiness()` and `_latency_evidence()` take a mode
+  selector defaulting to the active mode. Only the operator event log and firehose-era junk
+  signals (rows referencing no registered market) are still cleared.
+- Provider duplicate identity is mode-scoped: `idx_provider_events_fingerprint` is replaced by
+  `idx_provider_events_fingerprint_mode` over
+  `(event, fingerprint, COALESCE(mode,'legacy_unknown'))`. The new index is strictly more
+  permissive than the one it replaces, so it cannot fail against data the old one accepted; no row
+  is deleted and no mode rewritten. The index is created after the `mode` migration, since it
+  references that column.
+- `provider_occurrence(payload)` resolves occurrence time by the fixed precedence
+  `raw.occurence_ts` → `raw.occurrence_ts` → `raw.details.last_play.occurence_ts` →
+  `raw.details.last_play.occurrence_ts`, accepting only finite non-negative int/float and
+  rejecting booleans, NaN, infinities, strings, containers and negatives. It returns
+  `(ts, source, unavailable_reason)` and never substitutes a receipt time.
+- `provider_occurrence_ts`, `provider_occurrence_source` and
+  `provider_occurrence_unavailable_reason` are added idempotently and written at canonicalization.
+  `match_signal_event()` consumes the normalized column and falls back deterministically to the
+  preserved raw payload under the same precedence, labelled `legacy_raw_derived:<source>`.
+  Occurrence, source and reason are distinct fields in the audit output.
+- `store.previous_substantive_fingerprint(event, mode)` resolves the revision link from durable
+  history when the in-memory link is absent (as it always is after a restart). It is scoped to the
+  same event and the same mode and excludes corrections, so a correction can never link across
+  events or modes or to another correction. `_resolve_new_events()` now also clears
+  `last_substantive_fingerprint` when an event is dropped.
+
+**After.** `tests/test_evidence_modes.py` — 10 tests, OK. `tests/test_provider_event_audit.py` —
+OK, with the `inspect.getsource` assertion in `test_corrections_link_across_polls` replaced by
+runtime tests against real SQLite. Full suite 235 tests, OK, under
+`-X dev -W error::RuntimeWarning`. `compileall`, `ruff`, `node --check`, `git diff --check` clean.
+
+**Mutation.** Two, both reverted and not committed:
+
+1. `mode_clause()` forced to return no scoping — 3 failures:
+   `test_live_latency_readiness_excludes_demo_and_legacy_samples`,
+   `test_same_provider_fingerprint_can_exist_once_per_mode_without_overwrite`,
+   `test_lineage_lookup_is_mode_scoped`.
+2. `_finite_timestamp()` validation bypassed in `provider_occurrence()` — 10 failures across every
+   invalid shape in `test_invalid_timestamps_are_refused_not_coerced`.
+
+**Limitations.**
+
+- The API read endpoints in `app/main.py` (`/api/signals`, `/api/trades`, `/api/match-clocks`,
+  `/api/provider-events`, `/api/goal-latency`, `/api/latency`, equity) are not yet mode-scoped or
+  given an explicit mode selector; that is section 5.2 item 4 for the API layer and item 5 for the
+  export manifest, and lands with `BR-EXPORT`. Until then those endpoints show all modes.
+- `test_export_manifest_and_rows_reconcile_by_mode_with_no_orphan_fill` from section 5.3 is not
+  yet written: it depends on the export rework in `BR-EXPORT`.
+- The pre-existing unretrieved background-export task exception still prints during the suite.
+- No production evidence (`BR-PROD`); it needs an authorised deploy.
+
+**Rollback.** `git revert <this commit>`. The migration only adds nullable columns and replaces one
+unique index with a strictly more permissive one; reverting restores the previous index definition
+without deleting rows. Note that reverting also restores the destructive `purge_non_live()`, so any
+demo or legacy evidence collected in the meantime would be deleted on the next live boot — back up
+`footballbot.db` before reverting.

@@ -234,6 +234,61 @@ def canonical_provider_type(event_type, description=""):
     return "provider.unknown"
 
 
+PROVIDER_OCCURRENCE_PRECEDENCE = (
+    ("raw.occurence_ts", ("occurence_ts",)),
+    ("raw.occurrence_ts", ("occurrence_ts",)),
+    ("raw.details.last_play.occurence_ts", ("details", "last_play", "occurence_ts")),
+    ("raw.details.last_play.occurrence_ts", ("details", "last_play", "occurrence_ts")),
+)
+
+
+def _finite_timestamp(value):
+    """Accept only a finite, non-negative int/float provider timestamp."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value != value or value in (float("inf"), float("-inf")):
+        return None
+    if value < 0:
+        return None
+    return float(value)
+
+
+def _dig(payload, path):
+    node = payload
+    for key in path:
+        if not isinstance(node, dict):
+            return None
+        node = node.get(key)
+    return node
+
+
+def provider_occurrence(payload):
+    """Return (ts, source, unavailable_reason) for a provider event payload.
+
+    The provider misspells the key as `occurence_ts` and may carry it either on
+    the individual significant-event row or nested under the full payload's
+    `details.last_play`.  Precedence is fixed so the same payload always
+    resolves the same way.
+
+    Receipt time is never substituted: an absent or unusable value stays null
+    with an explicit reason, because a fabricated occurrence would read as
+    provider-timed causality that was never observed.
+    """
+    if not isinstance(payload, dict):
+        return None, None, "provider_field_absent"
+    seen_field = False
+    for source, path in PROVIDER_OCCURRENCE_PRECEDENCE:
+        raw = _dig(payload, path)
+        if raw is None:
+            continue
+        seen_field = True
+        value = _finite_timestamp(raw)
+        if value is not None:
+            return value, source, None
+    reason = "provider_field_invalid" if seen_field else "provider_field_absent"
+    return None, None, reason
+
+
 def event_fingerprint(side, row, last_play=False):
     payload = row if isinstance(row, dict) else {"value": row}
     material = {
