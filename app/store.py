@@ -7,6 +7,8 @@ import threading
 import time
 
 from . import config
+from . import match_clock
+from . import match_events
 from .match_events import normalize_match_event
 
 _lock = threading.Lock()
@@ -30,7 +32,8 @@ CREATE TABLE IF NOT EXISTS trades(
   book_at_entry TEXT, status TEXT DEFAULT 'open',
   remaining REAL, realized_gross REAL DEFAULT 0, accrued_fees REAL DEFAULT 0,
   exit_qty REAL DEFAULT 0, exit_vwap_num REAL DEFAULT 0,
-  fee_type TEXT, fee_multiplier REAL, strategy TEXT);
+  fee_type TEXT, fee_multiplier REAL, strategy TEXT,
+  max_executable_bid REAL, max_executable_bid_ts REAL, mfe_c REAL);
 CREATE TABLE IF NOT EXISTS paper_fills(
   id INTEGER PRIMARY KEY AUTOINCREMENT, trade_id INTEGER, signal_id INTEGER,
   ts REAL, leg TEXT, side TEXT, price REAL, quantity REAL, notional REAL,
@@ -63,25 +66,125 @@ CREATE TABLE IF NOT EXISTS goal_latency_observations(
   canonical_side TEXT,
   normalized_event TEXT,
   detail TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS match_clock_observations(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  observed_ts REAL NOT NULL,
+  poll_started_ts REAL NOT NULL,
+  previous_poll_ts REAL,
+  response_ms REAL NOT NULL,
+  event TEXT NOT NULL,
+  milestone_id TEXT NOT NULL,
+  provider_period TEXT,
+  provider_minute INTEGER,
+  provider_stoppage INTEGER,
+  provider_clock TEXT,
+  provider_status TEXT,
+  precision TEXT NOT NULL,
+  raw_context TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_match_clock_event_ts
+  ON match_clock_observations(event, observed_ts);
+CREATE TABLE IF NOT EXISTS provider_match_events(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  observed_ts REAL NOT NULL,
+  first_observed_ts REAL NOT NULL,
+  last_observed_ts REAL NOT NULL,
+  poll_started_ts REAL NOT NULL,
+  previous_poll_ts REAL,
+  response_ms REAL NOT NULL,
+  event TEXT NOT NULL,
+  milestone_id TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  previous_fingerprint TEXT,
+  canonical_type TEXT NOT NULL,
+  canonical_side TEXT,
+  provider_period TEXT,
+  provider_minute INTEGER,
+  provider_stoppage INTEGER,
+  provider_clock TEXT,
+  normalized_event TEXT NOT NULL,
+  raw_payload TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS idx_provider_events_event_ts
+  ON provider_match_events(event, observed_ts);
+-- The mode-scoped unique fingerprint index is created in init() after the
+-- `mode` column migration has run, since it references that column.
 """
 
 
 _mode = "demo"
 
+# Rows written before capture modes existed carry a NULL mode.  Their
+# provenance is unknown, not disposable: they are preserved and presented under
+# this label, and never silently counted as live.
+LEGACY_MODE = "legacy_unknown"
+
+
+def mode_clause(alias="", selector=None):
+    """Return (sql, params) scoping a query to one capture mode.
+
+    `selector` defaults to the active mode.  "all" disables scoping; the
+    legacy label maps to SQL NULL, which is never included in live.
+    """
+    prefix = f"{alias}." if alias else ""
+    selector = _mode if selector is None else selector
+    if selector == "all":
+        return "", ()
+    if selector == LEGACY_MODE:
+        return f" AND {prefix}mode IS NULL", ()
+    return f" AND {prefix}mode=?", (selector,)
+
+
+def present_mode(value):
+    """Label a stored mode for the API/export semantic layer."""
+    return value if value else LEGACY_MODE
+
+
+# The only selectors an API caller may name.  Anything else is refused rather
+# than silently widened, so a typo cannot quietly mix evidence modes.
+SAFE_MODE_SELECTORS = ("live", "demo", LEGACY_MODE, "all")
+
+
+def resolve_mode_selector(value=None):
+    """Validate a caller-supplied mode selector; default to the active mode."""
+    if value is None:
+        return _mode
+    selector = str(value).strip().lower()
+    if selector not in SAFE_MODE_SELECTORS:
+        raise ValueError(
+            f"unknown mode selector {value!r};"
+            f" expected one of {', '.join(SAFE_MODE_SELECTORS)}"
+        )
+    return selector
+
+
+def row_exists_in_mode(table, row_id, mode=None):
+    """True when `row_id` exists in `table` within the requested mode.
+
+    Path access is authorised through the parent row so a caller scoped to one
+    mode cannot fetch another mode's samples by guessing an id.
+    """
+    if table not in {"trades", "signals"}:
+        raise ValueError(f"unsupported parent table {table!r}")
+    scope, scope_args = mode_clause(selector=mode)
+    return bool(q(
+        f"SELECT 1 FROM {table} WHERE id=?{scope} LIMIT 1",
+        (row_id, *scope_args),
+    ))
+
 
 def init():
     global _conn
     os.makedirs(config.DATA_DIR, exist_ok=True)
-    _conn = sqlite3.connect(os.path.join(config.DATA_DIR, "footballbot.db"),
-                            check_same_thread=False)
+    _conn = sqlite3.connect(database_path(), check_same_thread=False)
     _conn.execute("PRAGMA journal_mode=WAL")
     _conn.executescript(SCHEMA)
     # migrate: add mode column to older DBs (persisted on a volume)
-    for tbl in ("signals", "trades"):
+    for tbl in ("signals", "trades", "match_clock_observations",
+                "provider_match_events", "goal_latency_observations",
+                "latency", "paper_fills"):
         try:
             _conn.execute(f"ALTER TABLE {tbl} ADD COLUMN mode TEXT")
         except sqlite3.OperationalError:
-            pass  # already exists
+            pass  # already exists, or the table is created later in init
     for column, definition in (
         ("remaining", "REAL"),
         ("realized_gross", "REAL DEFAULT 0"),
@@ -91,6 +194,10 @@ def init():
         ("fee_type", "TEXT"),
         ("fee_multiplier", "REAL"),
         ("strategy", "TEXT"),
+        ("max_executable_bid", "REAL"),
+        ("max_executable_bid_ts", "REAL"),
+        ("bid_path_summary", "TEXT"),
+        ("mfe_c", "REAL"),
     ):
         try:
             _conn.execute(f"ALTER TABLE trades ADD COLUMN {column} {definition}")
@@ -101,6 +208,20 @@ def init():
             _conn.execute(f"ALTER TABLE markets ADD COLUMN {column} TEXT")
         except sqlite3.OperationalError:
             pass
+    # Every new clock row records the exact source behind its stamp.  Legacy
+    # rows keep a null source and are presented as legacy_unknown; they are
+    # never relabeled as the current provider.
+    for column, definition in (
+        ("source", "TEXT"),
+        ("confirmed_ts", "REAL"),
+        ("confirmation_previous_poll_ts", "REAL"),
+    ):
+        try:
+            _conn.execute(
+                f"ALTER TABLE match_clock_observations ADD COLUMN {column} {definition}"
+            )
+        except sqlite3.OperationalError:
+            pass  # already exists
     for column, definition in (
         ("canonical_type", "TEXT"),
         ("canonical_side", "TEXT"),
@@ -112,6 +233,142 @@ def init():
             )
         except sqlite3.OperationalError:
             pass
+    # Normalized provider occurrence. The raw payload is preserved untouched;
+    # these columns record what was resolved from it, from where, and why not.
+    for column, definition in (
+        ("provider_occurrence_ts", "REAL"),
+        ("provider_occurrence_source", "TEXT"),
+        ("provider_occurrence_unavailable_reason", "TEXT"),
+    ):
+        try:
+            _conn.execute(
+                f"ALTER TABLE provider_match_events ADD COLUMN {column} {definition}"
+            )
+        except sqlite3.OperationalError:
+            pass
+    for column in ("match_clock_snapshot", "forward_path_summary",
+                   "path_incomplete_reason"):
+        try:
+            _conn.execute(f"ALTER TABLE signals ADD COLUMN {column} TEXT")
+        except sqlite3.OperationalError:
+            pass
+    # Durable finalization marker for a signal's forward path.  Without it a
+    # restart cannot tell a completed watch from one that died mid-window.
+    try:
+        _conn.execute("ALTER TABLE signals ADD COLUMN forward_path_finalized REAL")
+    except sqlite3.OperationalError:
+        pass
+    # Written in the same signal INSERT transaction when forward-path capture is
+    # enabled.  A started-but-unfinalized watch is recoverable even when the
+    # process died before its first quote row reached SQLite.
+    try:
+        _conn.execute("ALTER TABLE signals ADD COLUMN forward_path_started_ts REAL")
+    except sqlite3.OperationalError:
+        pass
+    # Provider duplicate identity is mode-scoped.  The old (event,fingerprint)
+    # unique index made a live observation collide with a demo one and silently
+    # refresh it instead of recording it.  Replacing the index deletes no row
+    # and rewrites no mode; the new index is strictly more permissive, so it
+    # cannot fail against data the old one already accepted.
+    try:
+        _conn.execute("DROP INDEX IF EXISTS idx_provider_events_fingerprint")
+        _conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_events_fingerprint_mode
+                 ON provider_match_events(
+                     event, fingerprint, COALESCE(mode, 'legacy_unknown'))"""
+        )
+    except sqlite3.OperationalError:
+        pass
+    _conn.executescript(
+        """CREATE TABLE IF NOT EXISTS bid_path_samples(
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             kind TEXT NOT NULL,
+             trade_id INTEGER,
+             signal_id INTEGER,
+             event TEXT,
+             market TEXT,
+             side TEXT,
+             strategy TEXT,
+             anchor_ts REAL NOT NULL,
+             dt_ms REAL NOT NULL,
+             bid REAL,
+             bid_size REAL,
+             exec_px REAL,
+             qty REAL,
+             mode TEXT);
+           CREATE INDEX IF NOT EXISTS idx_bid_path_trade
+             ON bid_path_samples(trade_id, dt_ms);
+           CREATE INDEX IF NOT EXISTS idx_bid_path_signal
+             ON bid_path_samples(signal_id, dt_ms);
+           CREATE INDEX IF NOT EXISTS idx_bid_path_kind
+             ON bid_path_samples(kind, anchor_ts);"""
+    )
+    # Availability and sequence metadata. Nullable for backward compatibility:
+    # legacy rows keep a null sample_seq and are left untouched by the partial
+    # unique indexes below, which make new rows exactly-once under retry.
+    for column, definition in (
+        ("sample_seq", "INTEGER"),
+        ("availability", "TEXT"),
+        ("terminal", "INTEGER"),
+    ):
+        try:
+            _conn.execute(
+                f"ALTER TABLE bid_path_samples ADD COLUMN {column} {definition}"
+            )
+        except sqlite3.OperationalError:
+            pass  # already exists
+    _conn.executescript(
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_bid_path_trade_seq
+             ON bid_path_samples(trade_id, kind, sample_seq)
+           WHERE trade_id IS NOT NULL AND sample_seq IS NOT NULL;
+           CREATE UNIQUE INDEX IF NOT EXISTS idx_bid_path_signal_seq
+             ON bid_path_samples(signal_id, kind, sample_seq)
+           WHERE signal_id IS NOT NULL AND sample_seq IS NOT NULL;"""
+    )
+    _conn.executescript(
+        """CREATE TABLE IF NOT EXISTS match_clock_observations(
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             observed_ts REAL NOT NULL,
+             poll_started_ts REAL NOT NULL,
+             previous_poll_ts REAL,
+             response_ms REAL NOT NULL,
+             event TEXT NOT NULL,
+             milestone_id TEXT NOT NULL,
+             provider_period TEXT,
+             provider_minute INTEGER,
+             provider_stoppage INTEGER,
+             provider_clock TEXT,
+             provider_status TEXT,
+             precision TEXT NOT NULL,
+             raw_context TEXT NOT NULL);
+           CREATE INDEX IF NOT EXISTS idx_match_clock_event_ts
+             ON match_clock_observations(event, observed_ts);
+           CREATE TABLE IF NOT EXISTS provider_match_events(
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             observed_ts REAL NOT NULL,
+             first_observed_ts REAL NOT NULL,
+             last_observed_ts REAL NOT NULL,
+             poll_started_ts REAL NOT NULL,
+             previous_poll_ts REAL,
+             response_ms REAL NOT NULL,
+             event TEXT NOT NULL,
+             milestone_id TEXT NOT NULL,
+             fingerprint TEXT NOT NULL,
+             previous_fingerprint TEXT,
+             canonical_type TEXT NOT NULL,
+             canonical_side TEXT,
+             provider_period TEXT,
+             provider_minute INTEGER,
+             provider_stoppage INTEGER,
+             provider_clock TEXT,
+             normalized_event TEXT NOT NULL,
+             raw_payload TEXT NOT NULL);
+           CREATE INDEX IF NOT EXISTS idx_provider_events_event_ts
+             ON provider_match_events(event, observed_ts);
+           CREATE UNIQUE INDEX IF NOT EXISTS idx_provider_events_fingerprint_mode
+             ON provider_match_events(
+                 event, fingerprint, COALESCE(mode, 'legacy_unknown'));"""
+    )
     _conn.commit()
 
 
@@ -121,12 +378,19 @@ def set_mode(m):
 
 
 def purge_non_live():
-    """On a live boot, drop demo/legacy rows so live stats start clean.
-    Live rows (mode='live') are preserved across redeploys; only demo/NULL go."""
+    """Clear the operator event log on a live boot.
+
+    This used to DELETE every non-live row from the study tables so live stats
+    would start clean.  That destroyed demo and legacy evidence permanently,
+    and deleted newly written null-mode rows on the next restart.  Isolation is
+    now a query concern: every study read scopes to a capture mode (see
+    `mode_clause`), so no observation has to be deleted to keep live clean.
+
+    Only the operator event log and firehose-era junk signals -- rows that
+    reference no registered market and are not study evidence -- are removed.
+    """
     with _lock:
-        for tbl in ("signals", "trades"):
-            _conn.execute(f"DELETE FROM {tbl} WHERE mode IS NULL OR mode!='live'")
-        # drop firehose-era junk: signals on markets we never registered
+        # Firehose-era junk: signals on markets that were never registered.
         _conn.execute("DELETE FROM signals WHERE event='?'")
         _conn.execute("DELETE FROM eventlog")
         _conn.commit()
@@ -162,25 +426,546 @@ def database_health():
         }
 
 
-def backup_database(path):
-    """Create a transactionally consistent SQLite snapshot at ``path``."""
+def database_path():
+    return os.path.join(config.DATA_DIR, "footballbot.db")
+
+
+def backup_database(path, pages=0, sleep=0.0, progress=None):
+    """Create a transactionally consistent SQLite snapshot at ``path``.
+
+    The page copy runs on its own read-only source connection and does NOT hold
+    ``_lock``.  Holding it for the whole backup blocked every event-loop caller
+    that takes the same lock -- ``database_health()`` and ``stats()`` among them
+    -- so a snapshot stalled live collection for its full duration even when the
+    backup itself ran in a worker thread.  ``_lock`` is now held only long
+    enough to confirm the database is initialised and read its path.
+    """
     with _lock:
         if _conn is None:
             raise RuntimeError("database is not initialized")
+        source_path = database_path()
+    source = sqlite3.connect(source_path)
+    try:
         destination = sqlite3.connect(path)
         try:
-            _conn.backup(destination)
+            source.backup(
+                destination, pages=pages, sleep=sleep, progress=progress,
+            )
             destination.commit()
         finally:
             destination.close()
+    finally:
+        source.close()
 
 
 def log_event(kind, text):
     ex("INSERT INTO eventlog(ts,kind,text) VALUES(?,?,?)", (time.time(), kind, text))
 
 
+LATENCY_KIND_CANONICAL = {
+    "feed_lag": "feed_ingress_ms",
+    "paper_entry": "paper_entry_ms",
+    "order_arrival": "order_arrival_ms",
+    "paper_exit": "paper_exit_ms",
+}
+LATENCY_KIND_ALIASES = {
+    "feed_ingress_ms": ("feed_ingress_ms", "feed_lag"),
+    "decision_ms": ("decision_ms",),
+    "paper_entry_ms": ("paper_entry_ms", "paper_entry"),
+    "order_arrival_ms": ("order_arrival_ms", "order_arrival"),
+    "paper_exit_ms": ("paper_exit_ms", "paper_exit"),
+    "match_response_ms": ("match_response_ms",),
+    "match_clock_age_ms": ("match_clock_age_ms",),
+    "scheduler_lag_ms": ("scheduler_lag_ms",),
+}
+LATENCY_KINDS = tuple(LATENCY_KIND_ALIASES)
+K4_THRESHOLD_MS = 250.0
+LATENCY_MIN_SAMPLES = 20
+LATENCY_STALE_AFTER_S = 300.0
+
+
 def add_latency(kind, ms):
-    ex("INSERT INTO latency(ts,kind,ms) VALUES(?,?,?)", (time.time(), kind, ms))
+    kind = LATENCY_KIND_CANONICAL.get(kind, kind)
+    now = time.time()
+    valid = (
+        isinstance(ms, (int, float)) and not isinstance(ms, bool)
+        and ms == ms and ms not in (float("inf"), float("-inf")) and ms >= 0
+    )
+    stored_kind = kind if valid else f"{kind}_invalid"
+    stored_ms = float(ms) if isinstance(ms, (int, float)) and not isinstance(ms, bool) else None
+    ex("INSERT INTO latency(ts,kind,ms,mode) VALUES(?,?,?,?)",
+       (now, stored_kind, stored_ms, _mode))
+
+
+def _percentile(values, p):
+    if not values:
+        return None
+    values = sorted(values)
+    return values[min(len(values) - 1, int(p * len(values)))]
+
+
+def latency_kind_summary(kind, limit=500, now=None, threshold_ms=None, mode=None):
+    """Summarise one latency kind for a capture mode (active mode by default).
+
+    Readiness must not mix demo or legacy samples into a live judgement: a demo
+    replay writes wildly different timings, and a legacy sample has unknown
+    provenance.
+    """
+    now = time.time() if now is None else now
+    aliases = LATENCY_KIND_ALIASES.get(kind, (kind,))
+    marks = ",".join("?" for _ in aliases)
+    scope, scope_args = mode_clause(selector=mode)
+    rows = q(
+        f"""SELECT ts, ms FROM latency WHERE kind IN ({marks}){scope}
+             ORDER BY ts DESC LIMIT ?""",
+        (*aliases, *scope_args, limit),
+    )
+    invalid = q(
+        f"""SELECT COUNT(*) AS n FROM latency WHERE kind=?{scope}""",
+        (f"{kind}_invalid", *scope_args),
+    )[0]["n"]
+    values = [row["ms"] for row in rows if isinstance(row.get("ms"), (int, float))]
+    latest_ts = rows[0]["ts"] if rows else None
+    age_s = (now - latest_ts) if latest_ts is not None else None
+    threshold = K4_THRESHOLD_MS if threshold_ms is None and kind == "order_arrival_ms" else threshold_ms
+    p95 = _percentile(values, 0.95)
+    if invalid and not values:
+        state = "INVALID"
+    elif not values or len(values) < LATENCY_MIN_SAMPLES:
+        state = "COLLECTING"
+    elif age_s is not None and age_s > LATENCY_STALE_AFTER_S:
+        state = "STALE"
+    elif threshold is not None and p95 is not None and p95 >= threshold:
+        state = "BREACH"
+    else:
+        state = "PASS"
+    return {
+        "kind": kind,
+        "n": len(values),
+        "p50": _percentile(values, 0.50),
+        "p95": p95,
+        "max": max(values) if values else None,
+        "invalid": invalid,
+        "latest_ts": latest_ts,
+        "age_s": round(age_s, 3) if age_s is not None else None,
+        "threshold_ms": threshold,
+        "state": state,
+    }
+
+
+def latency_readiness(limit=500, now=None, mode=None):
+    return {
+        kind: latency_kind_summary(kind, limit=limit, now=now, mode=mode)
+        for kind in LATENCY_KINDS
+    }
+
+
+BID_PATH_MAX_SAMPLES = 4000
+
+
+class PathSequenceConflict(RuntimeError):
+    """A path sequence key already exists with a different durable payload."""
+
+
+class PathSampleCapExceeded(RuntimeError):
+    """Writing this path would exceed the durable 4,000-row invariant."""
+
+
+def insert_bid_path(rows):
+    """Persist one buffered path atomically with strict retry validation.
+
+    A duplicate sequence key is accepted only when every persisted field is
+    identical to the durable row.  Conflicting payloads raise a stable error,
+    leave the caller's buffer owned, and never turn a short write into success.
+    The return value is the number of input rows proven durable (new or exact
+    idempotent retries).
+    """
+    if not rows:
+        return 0
+    with _lock:
+        try:
+            pending = _validated_new_path_payloads(rows)
+            _enforce_path_caps(pending)
+            if pending:
+                _conn.executemany(_BID_PATH_INSERT, pending)
+            _conn.commit()
+        except Exception:
+            _conn.rollback()
+            raise
+    return len(rows)
+
+
+_BID_PATH_INSERT = """INSERT INTO bid_path_samples(
+       kind,trade_id,signal_id,event,market,side,strategy,
+       anchor_ts,dt_ms,bid,bid_size,exec_px,qty,mode,
+       sample_seq,availability,terminal)
+     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+
+_BID_PATH_COLUMNS = (
+    "dt_ms,bid,bid_size,exec_px,qty,availability,terminal,sample_seq"
+)
+
+
+def _bid_path_payload(rows):
+    return [
+        (
+            row.get("kind"), row.get("trade_id"), row.get("signal_id"),
+            row.get("event"), row.get("market"), row.get("side"),
+            row.get("strategy"), row.get("anchor_ts"), row.get("dt_ms"),
+            row.get("bid"), row.get("bid_size"), row.get("exec_px"),
+            row.get("qty"), _mode,
+            row.get("sample_seq"),
+            row.get("availability") or ("quote" if _is_priced(row.get("bid")) else "gap"),
+            1 if row.get("terminal") else 0,
+        )
+        for row in rows
+    ]
+
+
+_BID_PATH_FIELD_NAMES = (
+    "kind", "trade_id", "signal_id", "event", "market", "side", "strategy",
+    "anchor_ts", "dt_ms", "bid", "bid_size", "exec_px", "qty", "mode",
+    "sample_seq", "availability", "terminal",
+)
+_BID_PATH_FIELD_SQL = ",".join(_BID_PATH_FIELD_NAMES)
+
+
+def _payload_map(payload):
+    return dict(zip(_BID_PATH_FIELD_NAMES, payload))
+
+
+def _path_sequence_key(payload):
+    row = _payload_map(payload)
+    seq = row.get("sample_seq")
+    if seq is None:
+        return None
+    if row.get("trade_id") is not None:
+        return ("trade_id", row["trade_id"], row.get("kind"), seq)
+    if row.get("signal_id") is not None:
+        return ("signal_id", row["signal_id"], row.get("kind"), seq)
+    return None
+
+
+def _durable_payload_for_key(key):
+    if key is None:
+        return None
+    owner_column, owner_id, kind, seq = key
+    cursor = _conn.execute(
+        f"SELECT {_BID_PATH_FIELD_SQL} FROM bid_path_samples "
+        f"WHERE {owner_column}=? AND kind=? AND sample_seq=? LIMIT 1",
+        (owner_id, kind, seq),
+    )
+    return cursor.fetchone()
+
+
+def _sequence_conflict(key):
+    owner_column, owner_id, kind, seq = key
+    return PathSequenceConflict(
+        f"path_sequence_conflict: {owner_column}={owner_id} kind={kind!r} "
+        f"sample_seq={seq}"
+    )
+
+
+def _validated_new_path_payloads(rows):
+    """Return only genuinely new rows after proving duplicate keys idempotent."""
+    pending = []
+    pending_by_key = {}
+    for payload in _bid_path_payload(rows or []):
+        key = _path_sequence_key(payload)
+        if key is None:
+            pending.append(payload)
+            continue
+        durable = _durable_payload_for_key(key)
+        if durable is not None:
+            if tuple(durable) != tuple(payload):
+                raise _sequence_conflict(key)
+            continue
+        prior = pending_by_key.get(key)
+        if prior is not None:
+            if tuple(prior) != tuple(payload):
+                raise _sequence_conflict(key)
+            continue
+        pending_by_key[key] = payload
+        pending.append(payload)
+    return pending
+
+
+def _enforce_path_caps(payloads):
+    """Reject a batch before INSERT when its durable owner would exceed the cap."""
+    grouped = {}
+    for payload in payloads:
+        row = _payload_map(payload)
+        if row.get("trade_id") is not None:
+            key = ("trade_id", row["trade_id"], None)
+        elif row.get("signal_id") is not None:
+            # Signal ids also appear on position rows.  A decline watch owns only
+            # its own kind, so position history cannot consume the watch's cap.
+            key = ("signal_id", row["signal_id"], row.get("kind"))
+        else:
+            continue
+        grouped[key] = grouped.get(key, 0) + 1
+    for (owner_column, owner_id, kind), incoming in grouped.items():
+        if kind is None:
+            current = _conn.execute(
+                f"SELECT COUNT(*) FROM bid_path_samples WHERE {owner_column}=?",
+                (owner_id,),
+            ).fetchone()[0]
+        else:
+            current = _conn.execute(
+                f"SELECT COUNT(*) FROM bid_path_samples WHERE {owner_column}=? AND kind=?",
+                (owner_id, kind),
+            ).fetchone()[0]
+        if current + incoming > BID_PATH_MAX_SAMPLES:
+            raise PathSampleCapExceeded(
+                f"path_sample_cap_exhausted: {owner_column}={owner_id} "
+                f"durable={current} incoming={incoming} cap={BID_PATH_MAX_SAMPLES}"
+            )
+
+
+def _read_rows(cursor):
+    columns = [column[0] for column in cursor.description]
+    return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+
+def _persist_path_in_transaction(rows, owner_column, owner_id, extra_where="",
+                                 truncated=False, dropped_samples=0):
+    """Write buffered path rows and derive the summary from what is persisted.
+
+    Must be called with ``_lock`` held and inside an open transaction.  The
+    summary is read back after the inserts so it always describes exactly the
+    rows on disk, never the caller's in-memory guess.
+    """
+    pending = _validated_new_path_payloads(rows or [])
+    for payload in pending:
+        if _payload_map(payload).get(owner_column) != owner_id:
+            raise ValueError(
+                f"path owner mismatch: expected {owner_column}={owner_id}"
+            )
+    _enforce_path_caps(pending)
+    if pending:
+        _conn.executemany(_BID_PATH_INSERT, pending)
+    samples = _read_rows(_conn.execute(
+        f"SELECT {_BID_PATH_COLUMNS} FROM bid_path_samples"
+        f" WHERE {owner_column}=?{extra_where} ORDER BY dt_ms LIMIT ?",
+        (owner_id, BID_PATH_MAX_SAMPLES),
+    ))
+    return bid_path_summary(
+        samples, truncated=truncated, dropped_samples=dropped_samples,
+    )
+
+
+def set_trade_path_summary(trade_id, summary):
+    """Persist the derived summary once, at close.
+
+    Recomputing it per dashboard refresh meant one path query per listed trade
+    and could return millions of sample rows for a single /api/trades call.
+    """
+    ex("UPDATE trades SET bid_path_summary=? WHERE id=?",
+       (json.dumps(summary, separators=(",", ":")) if summary else None, trade_id))
+
+
+def set_signal_path_summary(signal_id, summary):
+    ex("UPDATE signals SET forward_path_summary=? WHERE id=?",
+       (json.dumps(summary, separators=(",", ":")) if summary else None, signal_id))
+
+
+def finalize_signal_path(signal_id, path_rows=None, truncated=False,
+                         dropped_samples=0, incomplete_reason=None, now=None):
+    """Persist a watch's remaining rows, summary and finalized marker as one unit.
+
+    The caller must not release the watch until this returns.  Rows and summary
+    used to be separate commits with no durable marker at all, so a failure
+    between them left a half-written path that no restart could detect.
+    """
+    with _lock:
+        try:
+            summary = _persist_path_in_transaction(
+                path_rows, "signal_id", signal_id,
+                extra_where=" AND kind='decline'",
+                truncated=truncated, dropped_samples=dropped_samples,
+            )
+            _conn.execute(
+                """UPDATE signals SET forward_path_summary=?,
+                       forward_path_finalized=?, path_incomplete_reason=?
+                     WHERE id=?""",
+                (json.dumps(summary, separators=(",", ":")) if summary else None,
+                 time.time() if now is None else now,
+                 incomplete_reason, signal_id),
+            )
+            _conn.commit()
+            return summary
+        except Exception:
+            _conn.rollback()
+            raise
+
+
+def unfinalized_signal_paths():
+    """Forward watches that started durably but never recorded finalization."""
+    scope, scope_args = mode_clause("s")
+    return q(
+        "SELECT s.id, s.local_ts, s.market, s.event FROM signals s"
+        f" WHERE s.forward_path_started_ts IS NOT NULL "
+        f"AND s.forward_path_finalized IS NULL{scope} ORDER BY s.id",
+        scope_args,
+    )
+
+
+def bid_path_for_trade(trade_id, limit=BID_PATH_MAX_SAMPLES, mode=None):
+    scope, scope_args = mode_clause(selector=mode)
+    return q(
+        f"""SELECT dt_ms,bid,bid_size,exec_px,qty,availability,terminal,sample_seq
+             FROM bid_path_samples
+             WHERE trade_id=?{scope} ORDER BY dt_ms LIMIT ?""",
+        (trade_id, *scope_args, limit),
+    )
+
+
+def bid_path_for_signal(signal_id, limit=BID_PATH_MAX_SAMPLES, mode=None):
+    scope, scope_args = mode_clause(selector=mode)
+    return q(
+        f"""SELECT dt_ms,bid,bid_size,exec_px,qty,availability,terminal,sample_seq
+             FROM bid_path_samples
+             WHERE signal_id=? AND kind='decline'{scope} ORDER BY dt_ms LIMIT ?""",
+        (signal_id, *scope_args, limit),
+    )
+
+
+def _is_priced(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _path_segments(rows):
+    """Split a path into priced segments separated by quote outages.
+
+    Returns ``(segments, gaps)`` where each segment carries its priced points
+    and the dt at which its availability ended, and each gap carries the dt it
+    started and the dt a quote resumed (None when it never did).
+    """
+    segments, gaps, current = [], [], None
+    for row in rows:
+        dt = row.get("dt_ms")
+        if row.get("terminal") or row.get("availability") == "terminal":
+            # A terminal is an end timestamp, not a quote and not an outage.
+            # It closes the current availability segment without contributing
+            # price, travel, peak/trough, or samples_priced.
+            if current is not None:
+                current["close_dt"] = dt
+                current = None
+            continue
+        if _is_priced(row.get("bid")):
+            if current is None:
+                current = {"points": [], "close_dt": None}
+                segments.append(current)
+            current["points"].append(row)
+            if gaps and gaps[-1]["end"] is None:
+                gaps[-1]["end"] = dt
+        else:
+            if current is not None:
+                current["close_dt"] = dt
+                current = None
+            # Consecutive unpriced observations are one outage, not many.
+            if not gaps or gaps[-1]["end"] is not None:
+                gaps.append({"start": dt, "end": None})
+    return segments, gaps
+
+
+def bid_path_summary(samples, truncated=False, dropped_samples=0):
+    """Derive the scalars the UI and study need from a stored path.
+
+    Calculations join only consecutive priced observations inside the same
+    segment.  Filtering the unpriced rows out and connecting what remained drew
+    one straight line across a quote outage: a 90c bid that stopped being
+    available at 1000ms was reported as held until the next quote arrived, and
+    the jump across the outage was counted as tradeable travel.
+    """
+    rows = list(samples or [])
+    if not rows:
+        return None
+    segments, gaps = _path_segments(rows)
+    points = [row for segment in segments for row in segment["points"]]
+    if not points:
+        return None
+
+    bids = [row["bid"] for row in points]
+    peak, trough = max(bids), min(bids)
+    peak_row = next(row for row in points if row["bid"] == peak)
+    trough_row = next(row for row in points if row["bid"] == trough)
+
+    # Time the held side spent at or above its own peak is the answer to
+    # "could that high actually have been filled".  Availability ends at the
+    # gap that closes the segment, so nothing beyond that boundary counts.
+    at_peak_ms = 0.0
+    travelled = 0.0
+    for segment in segments:
+        segment_points = segment["points"]
+        for left, right in zip(segment_points, segment_points[1:]):
+            travelled += abs(right["bid"] - left["bid"])
+            if left["bid"] >= peak:
+                at_peak_ms += right["dt_ms"] - left["dt_ms"]
+        last = segment_points[-1]
+        if segment["close_dt"] is not None and last["bid"] >= peak:
+            at_peak_ms += segment["close_dt"] - last["dt_ms"]
+
+    gap_duration_ms = sum(
+        gap["end"] - gap["start"] for gap in gaps if gap["end"] is not None
+    )
+    # An outage the path never came back from has no measurable end; report the
+    # observed span separately rather than folding it into measured downtime.
+    final_dt = rows[-1].get("dt_ms")
+    unknown_gap_duration_ms = sum(
+        max(0.0, final_dt - gap["start"])
+        for gap in gaps
+        if gap["end"] is None and _is_priced(final_dt) and _is_priced(gap["start"])
+    )
+    displacement = abs(points[-1]["bid"] - points[0]["bid"])
+    return {
+        "samples": len(points),
+        "samples_total": len(rows),
+        "samples_priced": len(points),
+        "segments": len(segments),
+        "gap_count": len(gaps),
+        "gap_duration_ms": round(gap_duration_ms, 1),
+        "unknown_gap_duration_ms": round(unknown_gap_duration_ms, 1),
+        "first_bid": points[0]["bid"],
+        "last_bid": points[-1]["bid"],
+        "peak_bid": peak,
+        "peak_dt_ms": peak_row["dt_ms"],
+        "peak_bid_size": peak_row.get("bid_size"),
+        "peak_exec_px": peak_row.get("exec_px"),
+        "ms_at_peak": round(at_peak_ms, 1),
+        "trough_bid": trough,
+        "trough_dt_ms": trough_row["dt_ms"],
+        "path_travelled_c": round(travelled, 2),
+        "displacement_c": round(displacement, 2),
+        # 1.0 = straight line, near 0 = chopped back and forth for nothing.
+        # Undefined rather than 1.0 when no intra-segment travel was observed.
+        "path_efficiency": round(displacement / travelled, 4) if travelled > 0 else None,
+        "span_ms": round(rows[-1]["dt_ms"] - rows[0]["dt_ms"], 1),
+        "truncated": bool(truncated),
+        "dropped_samples": int(dropped_samples or 0),
+    }
+
+
+def update_trade_high(tid, bid, ts):
+    """Persist a new executable high only when it strictly exceeds the stored high."""
+    with _lock:
+        row = _conn.execute(
+            """SELECT max_executable_bid, entry_px FROM trades WHERE id=?""",
+            (tid,),
+        ).fetchone()
+        if row is None or bid is None:
+            return False
+        current, entry_px = row
+        if current is not None and bid <= current:
+            return False
+        mfe = max(0.0, float(bid) - float(entry_px or 0.0))
+        _conn.execute(
+            """UPDATE trades SET max_executable_bid=?, max_executable_bid_ts=?, mfe_c=?
+                WHERE id=?""",
+            (float(bid), float(ts), mfe, tid),
+        )
+        _conn.commit()
+        return True
 
 
 def insert_goal_latency(row):
@@ -193,8 +978,8 @@ def insert_goal_latency(row):
                observed_ts,event,milestone_id,change_kind,live_type,
                score_before,score_after,previous_poll_ts,poll_started_ts,response_ms,
                last_book_change_ts,last_book_lead_ms,last_trade_ts,last_trade_lead_ms,
-               canonical_type,canonical_side,normalized_event,detail)
-             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               canonical_type,canonical_side,normalized_event,detail,mode)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             row["observed_ts"], row["event"], row["milestone_id"],
             row["change_kind"], row.get("live_type"),
@@ -206,9 +991,119 @@ def insert_goal_latency(row):
             normalized["canonical_type"], normalized["side"],
             json.dumps(normalized, separators=(",", ":")),
             json.dumps(row.get("detail") or {}, separators=(",", ":")),
+            _mode,
         ),
     )
     return cur.lastrowid
+
+
+def insert_match_clock(row):
+    cur = ex(
+        """INSERT INTO match_clock_observations(
+               observed_ts,poll_started_ts,previous_poll_ts,response_ms,event,milestone_id,
+               provider_period,provider_minute,provider_stoppage,provider_clock,
+               provider_status,precision,raw_context,mode,source,confirmed_ts,
+               confirmation_previous_poll_ts)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            row["observed_ts"], row["poll_started_ts"], row.get("previous_poll_ts"),
+            row["response_ms"], row["event"], row["milestone_id"],
+            row.get("provider_period"), row.get("provider_minute"),
+            row.get("provider_stoppage"), row.get("provider_clock"),
+            row.get("provider_status"), row.get("precision") or "provider_minute_polled",
+            json.dumps(row.get("raw_context") or {}, separators=(",", ":")),
+            _mode,
+            row.get("source") or match_clock.CLOCK_SOURCE,
+            row.get("confirmed_ts"),
+            row.get("confirmation_previous_poll_ts"),
+        ),
+    )
+    return cur.lastrowid
+
+
+def latest_match_clock(event):
+    rows = q(
+        """SELECT * FROM match_clock_observations WHERE event=?
+            ORDER BY id DESC LIMIT 1""",
+        (event,),
+    )
+    return rows[0] if rows else None
+
+
+def upsert_provider_event(row):
+    """Insert a new fingerprint or refresh last_observed_ts. History stays append-only."""
+    occurrence_ts, occurrence_source, occurrence_reason = (
+        match_events.provider_occurrence(row.get("raw_payload"))
+    )
+    # Duplicate identity is mode-scoped: the same provider fingerprint may be
+    # observed once in demo and once in live, and neither may overwrite the
+    # other's raw payload or mode.
+    scope, scope_args = mode_clause()
+    existing = q(
+        "SELECT id, first_observed_ts, canonical_type FROM provider_match_events"
+        f" WHERE event=? AND fingerprint=?{scope}",
+        (row["event"], row["fingerprint"], *scope_args),
+    )
+    if existing:
+        ex(
+            """UPDATE provider_match_events
+                  SET last_observed_ts=?, poll_started_ts=?, previous_poll_ts=?, response_ms=?
+                WHERE id=?""",
+            (
+                row["observed_ts"], row["poll_started_ts"], row.get("previous_poll_ts"),
+                row["response_ms"], existing[0]["id"],
+            ),
+        )
+        return existing[0]["id"], False
+    cur = ex(
+        """INSERT INTO provider_match_events(
+               observed_ts,first_observed_ts,last_observed_ts,poll_started_ts,previous_poll_ts,
+               response_ms,event,milestone_id,fingerprint,previous_fingerprint,canonical_type,
+               canonical_side,provider_period,provider_minute,provider_stoppage,provider_clock,
+               normalized_event,raw_payload,mode,
+               provider_occurrence_ts,provider_occurrence_source,
+               provider_occurrence_unavailable_reason)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            row["observed_ts"], row["observed_ts"], row["observed_ts"],
+            row["poll_started_ts"], row.get("previous_poll_ts"), row["response_ms"],
+            row["event"], row["milestone_id"], row["fingerprint"],
+            row.get("previous_fingerprint"), row["canonical_type"],
+            row.get("canonical_side"), row.get("provider_period"),
+            row.get("provider_minute"), row.get("provider_stoppage"),
+            row.get("provider_clock"),
+            json.dumps(row.get("normalized_event") or {}, separators=(",", ":")),
+            json.dumps(row.get("raw_payload") or {}, separators=(",", ":")),
+            _mode,
+            occurrence_ts, occurrence_source, occurrence_reason,
+        ),
+    )
+    return cur.lastrowid, True
+
+
+SUBSTANTIVE_REVISION_TYPES = (
+    "goal.observed", "penalty.scored",
+)
+
+
+def previous_substantive_fingerprint(event, mode=None):
+    """Newest persisted substantive event for this event and capture mode.
+
+    A correction usually arrives on a later poll than the goal it revises, and
+    a restart loses the in-memory link entirely.  Resolving it from durable
+    state keeps the revision chain intact across process death.  Corrections
+    are excluded so a correction never links to another correction, and the
+    lookup is mode- and event-scoped so it can never link across either.
+    """
+    scope, scope_args = mode_clause(selector=mode)
+    marks = ",".join("?" for _ in SUBSTANTIVE_REVISION_TYPES)
+    rows = q(
+        f"""SELECT fingerprint FROM provider_match_events
+             WHERE event=? AND canonical_type IN ({marks}){scope}
+             ORDER BY id DESC LIMIT 1""",
+        (event, *SUBSTANTIVE_REVISION_TYPES, *scope_args),
+    )
+    return rows[0]["fingerprint"] if rows else None
 
 
 def finish_goal_latency(row_id, first_book=None, first_trade=None):
@@ -239,13 +1134,24 @@ def upsert_market(ticker, event, series, title, close_time, status,
         display_game, display_leg))
 
 
+def _stamp_text(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, separators=(",", ":"))
+
+
 def insert_signal(s):
     cur = ex("""INSERT INTO signals(ts_ms,local_ts,market,event,series,dir,dl,levels,size,
-                ref,ext,conf_lag_ms,late,outcome,detail,mode)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ref,ext,conf_lag_ms,late,outcome,detail,mode,match_clock_snapshot,
+                forward_path_started_ts)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
              (s["ts_ms"], s["local_ts"], s["market"], s["event"], s["series"], s["dir"],
               s["dl"], s["levels"], s["size"], s["ref"], s["ext"], s.get("conf_lag_ms"),
-              1 if s.get("late") else 0, s["outcome"], json.dumps(s.get("detail") or {}), _mode))
+              1 if s.get("late") else 0, s["outcome"], json.dumps(s.get("detail") or {}), _mode,
+              _stamp_text(s.get("match_clock_snapshot")),
+              s.get("forward_path_started_ts")))
     return cur.lastrowid
 
 
@@ -260,11 +1166,11 @@ def finish_paper_signal(signal_id, outcome, detail, latency_ms, order_arrival_ms
         try:
             _conn.execute("UPDATE signals SET outcome=?, detail=? WHERE id=?",
                           (outcome, json.dumps(detail or {}), signal_id))
-            _conn.execute("INSERT INTO latency(ts,kind,ms) VALUES(?,?,?)",
-                          (time.time(), "paper_entry", latency_ms))
+            _conn.execute("INSERT INTO latency(ts,kind,ms,mode) VALUES(?,?,?,?)",
+                          (time.time(), "paper_entry_ms", latency_ms, _mode))
             if order_arrival_ms is not None:
-                _conn.execute("INSERT INTO latency(ts,kind,ms) VALUES(?,?,?)",
-                              (time.time(), "order_arrival", order_arrival_ms))
+                _conn.execute("INSERT INTO latency(ts,kind,ms,mode) VALUES(?,?,?,?)",
+                              (time.time(), "order_arrival_ms", order_arrival_ms, _mode))
             _conn.commit()
         except Exception:
             _conn.rollback()
@@ -300,11 +1206,11 @@ def open_paper_trade(t, detail, fill_levels, entry_fee, latency_ms, order_arriva
             trade_id = cur.lastrowid
             _conn.execute("UPDATE signals SET outcome='filled', detail=? WHERE id=?",
                           (json.dumps(detail or {}), t["signal_id"]))
-            _conn.execute("INSERT INTO latency(ts,kind,ms) VALUES(?,?,?)",
-                          (time.time(), "paper_entry", latency_ms))
+            _conn.execute("INSERT INTO latency(ts,kind,ms,mode) VALUES(?,?,?,?)",
+                          (time.time(), "paper_entry_ms", latency_ms, _mode))
             if order_arrival_ms is not None:
-                _conn.execute("INSERT INTO latency(ts,kind,ms) VALUES(?,?,?)",
-                              (time.time(), "order_arrival", order_arrival_ms))
+                _conn.execute("INSERT INTO latency(ts,kind,ms,mode) VALUES(?,?,?,?)",
+                              (time.time(), "order_arrival_ms", order_arrival_ms, _mode))
             for price, quantity, fee in fill_levels:
                 _conn.execute(
                     """INSERT INTO paper_fills(trade_id,signal_id,ts,leg,side,price,quantity,
@@ -320,10 +1226,33 @@ def open_paper_trade(t, detail, fill_levels, entry_fee, latency_ms, order_arriva
 
 
 def record_paper_exit(tid, signal_id, side, ts, reason, fill_levels, progress,
-                      latency_ms, final=None):
-    """Atomically persist exit fills, position progress, and optional close."""
+                      latency_ms, final=None, path_rows=None, truncated=False,
+                      dropped_samples=0):
+    """Atomically persist exit fills, position progress, and optional close.
+
+    When `final` is supplied this is the trade's last write, so the remaining
+    buffered path rows, the terminal row, the derived summary, the final fill
+    and the closed-trade fields all commit as ONE transaction.  They used to be
+    two: the trade was closed first and the path flushed afterwards, so a failed
+    path write left a closed trade, an orphaned buffer and no retry owner.
+
+    Raises on failure with nothing written; the caller must keep owning the
+    position.  Retrying is safe because path rows carry a sequence key.
+    """
     with _lock:
         try:
+            if final is not None:
+                summary = _persist_path_in_transaction(
+                    path_rows, "trade_id", tid,
+                    truncated=truncated, dropped_samples=dropped_samples,
+                )
+                _conn.execute(
+                    "UPDATE trades SET bid_path_summary=? WHERE id=?",
+                    (json.dumps(summary, separators=(",", ":")) if summary else None,
+                     tid),
+                )
+            elif path_rows:
+                _conn.executemany(_BID_PATH_INSERT, _bid_path_payload(path_rows))
             for price, quantity, fee in fill_levels:
                 _conn.execute(
                     """INSERT INTO paper_fills(trade_id,signal_id,ts,leg,side,price,quantity,
@@ -341,8 +1270,8 @@ def record_paper_exit(tid, signal_id, side, ts, reason, fill_levels, progress,
                        exit_qty=?, exit_vwap_num=? WHERE id=?""",
                 fields,
             )
-            _conn.execute("INSERT INTO latency(ts,kind,ms) VALUES(?,?,?)",
-                          (time.time(), "paper_exit", latency_ms))
+            _conn.execute("INSERT INTO latency(ts,kind,ms,mode) VALUES(?,?,?,?)",
+                          (time.time(), "paper_exit_ms", latency_ms, _mode))
             if final is not None:
                 _conn.execute(
                     """UPDATE trades SET exit_ts=?, exit_px=?, exit_reason=?, gross=?, fees=?,
@@ -361,17 +1290,47 @@ def load_open_paper_positions():
     return q(
         """SELECT t.*, s.ref, s.ext, s.detail AS signal_detail,
                   COALESCE((SELECT SUM(f.fee) FROM paper_fills f
-                            WHERE f.trade_id=t.id AND f.leg='entry'), 0) AS entry_fees
+                            WHERE f.trade_id=t.id AND f.leg='entry'), 0) AS entry_fees,
+                  -- Durable path state: without it the first post-restart sample
+                  -- reuses sequence 1, collides with history, and is silently
+                  -- dropped by the partial unique index.
+                  COALESCE((SELECT MAX(p.sample_seq) FROM bid_path_samples p
+                            WHERE p.trade_id=t.id), 0) AS path_max_seq,
+                  COALESCE((SELECT COUNT(*) FROM bid_path_samples p
+                            WHERE p.trade_id=t.id), 0) AS path_rows_durable,
+                  COALESCE((SELECT MAX(p.terminal) FROM bid_path_samples p
+                            WHERE p.trade_id=t.id), 0) AS path_has_terminal
              FROM trades t LEFT JOIN signals s ON s.id=t.signal_id
             WHERE t.status='open' AND t.mode=? ORDER BY t.id""",
         (_mode,),
     )
 
 
-def close_trade(tid, exit_px, reason, gross, fees, net, mae, shadow_stop_px):
-    ex("""UPDATE trades SET exit_ts=?, exit_px=?, exit_reason=?, gross=?, fees=?, net=?,
-          mae=?, shadow_stop_px=?, status='closed' WHERE id=?""",
-       (time.time(), exit_px, reason, gross, fees, net, mae, shadow_stop_px, tid))
+def close_trade(tid, exit_px, reason, gross, fees, net, mae, shadow_stop_px,
+                path_rows=None, truncated=False, dropped_samples=0):
+    """Close a simple (non-realistic) trade and its path in ONE transaction.
+
+    Same contract as `record_paper_exit`: path rows, terminal row, summary and
+    the closed-trade fields commit together or not at all.
+    """
+    with _lock:
+        try:
+            summary = _persist_path_in_transaction(
+                path_rows, "trade_id", tid,
+                truncated=truncated, dropped_samples=dropped_samples,
+            )
+            _conn.execute(
+                """UPDATE trades SET exit_ts=?, exit_px=?, exit_reason=?, gross=?,
+                       fees=?, net=?, mae=?, shadow_stop_px=?, bid_path_summary=?,
+                       status='closed' WHERE id=?""",
+                (time.time(), exit_px, reason, gross, fees, net, mae, shadow_stop_px,
+                 json.dumps(summary, separators=(",", ":")) if summary else None,
+                 tid),
+            )
+            _conn.commit()
+        except Exception:
+            _conn.rollback()
+            raise
 
 
 def _paper_fill_integrity(trade):
@@ -445,19 +1404,29 @@ def _event_cluster_ci(closed):
     return ci
 
 
-def _latency_evidence():
-    lat_kind = "order_arrival"
-    lat = q("SELECT ms FROM latency WHERE kind=? ORDER BY ts DESC LIMIT 500", (lat_kind,))
-    if not lat:
-        lat_kind = "feed_lag"
-        lat = q("SELECT ms FROM latency WHERE kind=? ORDER BY ts DESC LIMIT 500", (lat_kind,))
-    lat_ms = sorted(x["ms"] for x in lat)
-    p95 = lat_ms[int(0.95 * len(lat_ms))] if lat_ms else None
+def _latency_evidence(mode=None):
+    summary = latency_kind_summary("order_arrival_ms", mode=mode)
+    source = "order_arrival_ms"
+    if summary["n"] == 0:
+        summary = latency_kind_summary("feed_ingress_ms", mode=mode)
+        source = "feed_ingress_ms" if summary["n"] else "order_arrival_ms"
+    status = summary["state"]
+    if status == "PASS":
+        legacy = "OK"
+    elif status == "BREACH":
+        legacy = "BREACH"
+    else:
+        legacy = status
     return {
-        "p95_ms": p95,
-        "source": lat_kind,
-        "status": "OK" if (p95 is None or p95 < 250) else "BREACH",
+        "p95_ms": summary["p95"],
+        "source": source,
+        "status": legacy,
+        "state": summary["state"],
+        "n": summary["n"],
+        "invalid": summary["invalid"],
+        "threshold_ms": summary["threshold_ms"],
         "scope": "shared_execution_adapter",
+        "kinds": latency_readiness(),
     }
 
 
@@ -524,14 +1493,24 @@ def _strategy_summary(closed, open_t, signals, latency_evidence):
     }
 
 
-def stats():
-    closed = q("SELECT * FROM trades WHERE status='closed'")
-    open_t = q("SELECT * FROM trades WHERE status='open'")
+def stats(mode=None):
+    """Aggregate the study for one capture mode (the active mode by default).
+
+    Isolation is enforced here rather than by deleting rows at startup, so demo
+    and legacy evidence stays on disk without ever entering live aggregates.
+    """
+    scope, scope_args = mode_clause(selector=mode)
+    trade_scope, trade_args = mode_clause("t", selector=mode)
+    signal_scope, signal_args = mode_clause("s", selector=mode)
+    closed = q(f"SELECT * FROM trades WHERE status='closed'{scope}", scope_args)
+    open_t = q(f"SELECT * FROM trades WHERE status='open'{scope}", scope_args)
     signal_rows = q(
-        """SELECT s.outcome,s.detail,t.strategy AS trade_strategy
-             FROM signals s LEFT JOIN trades t ON t.signal_id=s.id"""
+        "SELECT s.outcome,s.detail,t.strategy AS trade_strategy"
+        " FROM signals s LEFT JOIN trades t"
+        f" ON t.signal_id=s.id{trade_scope} WHERE 1=1{signal_scope}",
+        (*trade_args, *signal_args),
     )
-    latency_evidence = _latency_evidence()
+    latency_evidence = _latency_evidence(mode=mode)
     by_strategy = {
         "gate_a": {"closed": [], "open": [], "signals": []},
         "price_only_late_score": {"closed": [], "open": [], "signals": []},

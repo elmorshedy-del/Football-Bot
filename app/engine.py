@@ -12,6 +12,7 @@ from .detector import Detector
 from .goal_latency import GoalLatencyObserver
 from .kalshi import KalshiClient, KalshiWS
 from .late_score_sleeve import PriceOnlyLateScoreSleeve
+from .match_clock import MatchClockGate, MatchClockTracker, unusable_stamp
 from .paper import PaperDesk
 from .recorder import RawRecorder
 
@@ -41,9 +42,79 @@ def parse_iso(s):
         return None
 
 
+
+def _clock_coverage_check(coverage):
+    """Clock coverage as a runtime health check.
+
+    A watched match with no mapping, a stale or missing clock, or accumulated
+    88-gate misses means the price-only study is not collecting, which is a
+    runtime fault and not merely evidence that is still gathering.
+    """
+    watched = int(coverage.get("watched") or 0)
+    mapped = int(coverage.get("mapped") or 0)
+    present = int(coverage.get("clock_present") or 0)
+    fresh = int(coverage.get("clock_fresh") or 0)
+    stale = int(coverage.get("clock_stale") or 0)
+    misses = int(
+        coverage.get("clock_gate_candidate_misses_total")
+        or coverage.get("clock_gate_candidate_misses") or 0
+    )
+    faults = list(coverage.get("faults") or [])
+    mapping_errors = list(coverage.get("mapping_errors") or [])
+    events = coverage.get("events")
+    problems = []
+    if events is None:
+        # Legacy count-only coverage.
+        if watched and not mapped:
+            problems.append("no watched match is mapped to a live clock")
+        if stale:
+            problems.append(f"{stale} clock(s) stale")
+        if mapping_errors:
+            problems.append(f"{len(mapping_errors)} mapping error(s)")
+        if faults and not problems:
+            problems.append(f"{len(faults)} clock fault(s)")
+    else:
+        # Health is decided from per-event CURRENT state.  Count arithmetic
+        # reported a mapped pre-match fixture as a missing clock, and a single
+        # cumulative miss as a permanent fault that recovery could never clear.
+        if watched and not mapped:
+            problems.append("no watched match is mapped to a live clock")
+        reasons = {}
+        for row in events:
+            if row.get("state") == "fault" and row.get("current_fault"):
+                reasons.setdefault(row["current_fault"], 0)
+                reasons[row["current_fault"]] += 1
+        for reason, count in sorted(reasons.items()):
+            problems.append(f"{count} clock {reason.replace('_', ' ')}")
+    # Cumulative evidence is reported but never blocks recovery.
+    notes = []
+    if misses:
+        notes.append(f"{misses} 88-gate candidate miss(es) recorded")
+    waiting = int(coverage.get("clock_waiting") or 0)
+    if waiting and not problems:
+        notes.append(f"{waiting} match(es) waiting for kickoff")
+    status = "; ".join(problems + notes) if (problems or notes) else "observing"
+    return {
+        "healthy": not problems,
+        "status": status,
+        "watched": watched, "mapped": mapped, "clock_present": present,
+        "clock_fresh": fresh, "clock_stale": stale,
+        "clock_waiting": waiting,
+        "clock_gate_candidate_misses": misses,
+        "clock_gate_candidate_misses_total": misses,
+        "faults": len(faults), "mapping_errors": len(mapping_errors),
+        "events": events or [],
+    }
+
+
 class Engine:
     def __init__(self, queue):
         self.q = queue
+        self._signal_paths = deque()
+        # Current fault, latched until a finalization actually succeeds.  A
+        # historical entry in `errors` decays; this does not.
+        self.signal_path_fault = None
+        self._signal_path_failed_owners = set()
         self.errors = deque(maxlen=50)
         self._last_error_key = None
         self._last_error_ts = 0.0
@@ -79,6 +150,7 @@ class Engine:
         self.market_observations = {}  # event -> recent locally timestamped price changes
         self._last_market_state = {}   # (kind, ticker) -> tuple, suppress unchanged frames
         self.goal_latency = None
+        self.clock_tracker = MatchClockTracker()
         self.ws = None
         self.ws_state = "init"
         self.started = time.time()
@@ -284,6 +356,174 @@ class Engine:
             if res in ("yes", "no"):
                 self.desk.settle_market(ticker, res)
 
+    def _watch_signal_forward(self, sid, cand, outcome):
+        """Track the held-side price for a bounded window after any signal.
+
+        Without this a declined signal is a dead record: the study can see that
+        the sleeve said no, but never whether saying no was right.  Every
+        signal, accepted or declined, becomes a labelled observation.
+        """
+        if not config.SIGNAL_PATH_WINDOW_S or sid is None:
+            return
+        ticker = cand.get("ticker")
+        meta = self.meta.get(ticker, {})
+        now = cand.get("local_ts") or time.time()
+        side = "yes" if cand.get("dir", 1) >= 0 else "no"
+        self._signal_paths.append({
+            "signal_id": sid, "market": ticker, "event": meta.get("event", "?"),
+            "side": side, "strategy": cand.get("strategy") or "detector",
+            "anchor_ts": now, "expires_at": now + config.SIGNAL_PATH_WINDOW_S,
+            "outcome": outcome, "last": None, "rows": [], "dropped": 0, "total": 0,
+        })
+        self._evict_signal_paths()
+
+    def _record_signal_paths(self, ticker, book, now):
+        for watch in self._signal_paths:
+            if watch.get("retry_only"):
+                continue
+            if watch["market"] != ticker:
+                continue
+            try:
+                ladder = book.bid_ladder(watch["side"])
+            except Exception:
+                ladder = []
+            if ladder:
+                bid, bid_size = ladder[0]
+                availability = "quote"
+            else:
+                # A no-ladder observation is evidence, not a hole.  Skipping it
+                # let the summary bridge an outage the decline never traded
+                # through.  One gap row per outage; repeats are suppressed by
+                # the unchanged-signature check below.
+                bid, bid_size = None, None
+                availability = "gap"
+            signature = (bid, bid_size, availability)
+            if signature == watch["last"]:
+                continue
+            if availability == "gap" and watch["last"] is None:
+                # Never open a path with a gap: there is no availability to end.
+                continue
+            watch["last"] = signature
+            # One slot is reserved so a terminal/final row always fits.
+            if watch.get("total", 0) >= store.BID_PATH_MAX_SAMPLES - 1:
+                watch["dropped"] += 1
+                continue
+            watch["total"] = watch.get("total", 0) + 1
+            watch["rows"].append({
+                "kind": "decline", "trade_id": None, "signal_id": watch["signal_id"],
+                "event": watch["event"], "market": ticker, "side": watch["side"],
+                "strategy": watch["strategy"], "anchor_ts": watch["anchor_ts"],
+                "dt_ms": round((now - watch["anchor_ts"]) * 1000.0, 1),
+                "bid": bid, "bid_size": bid_size, "exec_px": None, "qty": None,
+                # Sequence keys make a retry exactly-once under the partial
+                # unique index; without them a retry duplicated every row.
+                "sample_seq": watch["total"], "availability": availability,
+                "terminal": 0,
+            })
+
+    def _mark_signal_path_failure(self, signal_id, exc):
+        self._signal_path_failed_owners.add(signal_id)
+        self.signal_path_fault = "signal_path_persistence_failed"
+        self._record_error("signal_path", exc)
+
+    def _mark_signal_path_success(self, signal_id):
+        self._signal_path_failed_owners.discard(signal_id)
+        if not self._signal_path_failed_owners:
+            self.signal_path_fault = None
+
+    def _flush_signal_path(self, watch, final=False):
+        """Incremental flush. Returns True when the buffer is durable."""
+        if final:
+            return self._finalize_signal_path(watch)
+        if not watch["rows"]:
+            return True
+        rows = list(watch["rows"])
+        try:
+            written = store.insert_bid_path(rows)
+        except Exception as exc:
+            # Keep the rows and the owning watch. A sequence conflict is a
+            # current health fault until this exact owner later commits.
+            self._mark_signal_path_failure(watch["signal_id"], exc)
+            return False
+        if isinstance(written, int) and written < len(rows):
+            exc = RuntimeError(
+                f"signal {watch['signal_id']}: short path persistence "
+                f"{written}/{len(rows)}"
+            )
+            self._mark_signal_path_failure(watch["signal_id"], exc)
+            return False
+        watch["rows"] = watch["rows"][len(rows):]
+        self._mark_signal_path_success(watch["signal_id"])
+        return True
+
+    def _finalize_signal_path(self, watch, incomplete_reason=None):
+        """Persist remaining rows, summary and the durable finalized marker.
+
+        One transaction.  The caller releases the watch only when this returns
+        True, so a failed write always leaves an owner to retry.  Recovery
+        metadata belongs to the watch owner as well: a failed first attempt
+        must not lose the reason when the same watch retries later.
+        """
+        if incomplete_reason is None:
+            incomplete_reason = watch.get("incomplete_reason")
+        try:
+            store.finalize_signal_path(
+                watch["signal_id"],
+                path_rows=list(watch["rows"]),
+                truncated=bool(watch.get("dropped")),
+                dropped_samples=watch.get("dropped", 0),
+                incomplete_reason=incomplete_reason,
+            )
+        except Exception as exc:
+            self._mark_signal_path_failure(watch["signal_id"], exc)
+            return False
+        watch["rows"] = []
+        self._mark_signal_path_success(watch["signal_id"])
+        return True
+
+    def _release_finalized(self, index=0):
+        """Finalize the watch at `index`, popping it only after it commits."""
+        watch = self._signal_paths[index]
+        if not self._finalize_signal_path(watch):
+            return False
+        del self._signal_paths[index]
+        return True
+
+    def _expire_signal_paths(self, now):
+        # Peek, finalize, then pop.  popleft() before persisting destroyed the
+        # only owner of the buffered rows when the write failed.
+        while self._signal_paths and self._signal_paths[0]["expires_at"] <= now:
+            if not self._release_finalized(0):
+                return
+
+    def _evict_signal_paths(self):
+        """Drop the oldest watches over the tracking cap, ownership-safely."""
+        while len(self._signal_paths) > config.SIGNAL_PATH_MAX_TRACKED:
+            if not self._release_finalized(0):
+                return
+
+    def rebuild_signal_paths(self):
+        """Finalize watches whose process died inside the observation window.
+
+        Their in-memory tail is unrecoverable, so the path is labelled
+        incomplete rather than presented as a complete forward observation.
+        """
+        rebuilt = 0
+        for row in store.unfinalized_signal_paths():
+            watch = {
+                "signal_id": row["id"], "rows": [], "dropped": 0,
+                "market": row.get("market"), "event": row.get("event"),
+                "expires_at": 0.0, "retry_only": True,
+                "incomplete_reason": "in_memory_tail_lost_on_restart",
+            }
+            if self._finalize_signal_path(watch):
+                rebuilt += 1
+            else:
+                # Startup failure must retain an owned retry object.  A local
+                # dictionary that falls out of scope cannot ever recover.
+                self._signal_paths.append(watch)
+        return rebuilt
+
     def on_book(self, ticker, synthetic=False):
         b = self.books.get(ticker)
         if not b:
@@ -291,7 +531,10 @@ class Engine:
         ps = self.price_state(ticker)
         ps["bid"], ps["ask"] = b.best_yes_bid(), b.best_yes_ask()
         ps["dirty"] = True
-        self._observe_sleeve(ticker, time.time() * 1000.0)
+        now = time.time()
+        self._observe_sleeve(ticker, now * 1000.0)
+        self._record_signal_paths(ticker, b, now)
+        self._expire_signal_paths(now)
         self.desk.on_book(ticker, b)
 
     # ---------- signal flow ----------
@@ -332,14 +575,44 @@ class Engine:
 
     def record_signal(self, cand, lag, outcome, announce=True):
         m = self.meta.get(cand["ticker"], {})
+        event = m.get("event", "?")
+        signal_ts = cand.get("local_ts")
+        if self.mode == "demo" and event not in self.clock_tracker.latest:
+            stamp = unusable_stamp(
+                event, signal_ts, "demo_mode_no_match_clock",
+                gate_outcome="clock_demo", source="demo_replay",
+            )
+        else:
+            stamp = self.clock_tracker.stamp(event, signal_ts)
+            if not stamp.get("usable_for_88_gate"):
+                reason = stamp.get("unusable_reason")
+                if reason in {
+                    "unmapped", "stale", "malformed", "missing_clock", "unpersisted",
+                }:
+                    # Count it as cumulative evidence only.  Latching it as a
+                    # current fault made the banner unrecoverable after one miss.
+                    self.clock_tracker.clock_gate_candidate_misses += 1
+                    self._record_error(
+                        "match_clock",
+                        f"{event}: clock stamp unusable ({reason})",
+                    )
         sid = store.insert_signal({
             "ts_ms": cand["ts_ms"], "local_ts": cand["local_ts"], "market": cand["ticker"],
-            "event": m.get("event", "?"), "series": m.get("series", "?"),
+            "event": event, "series": m.get("series", "?"),
             "dir": cand["dir"], "dl": cand["dl"], "levels": cand["levels"],
             "size": cand["size"], "ref": cand["ref"], "ext": cand["ext"],
             "conf_lag_ms": lag, "late": self.is_late(cand["ticker"]), "outcome": outcome,
             "detail": cand.get("detail") or {},
+            "match_clock_snapshot": stamp,
+            "forward_path_started_ts": (
+                cand.get("local_ts") or time.time()
+                if config.SIGNAL_PATH_WINDOW_S else None
+            ),
         })
+        age = stamp.get("age_ms")
+        if isinstance(age, (int, float)):
+            store.add_latency("match_clock_age_ms", age)
+        self._watch_signal_forward(sid, cand, outcome)
         if announce:
             self._announce_signal(sid, cand, lag, outcome)
         return sid
@@ -414,16 +687,33 @@ class Engine:
             return "not_late"
         return self._execute_strategy_candidate(tagged, lag, decision_start)
 
+    def _clock_gate_for(self, ticker, signal_ts):
+        """Evaluate the persisted live clock; expected expiration is not consulted."""
+        event = self.meta.get(ticker, {}).get("event", "?")
+        stamp = self.clock_tracker.stamp(event, signal_ts)
+        return stamp, MatchClockGate(stamp).evaluate()
+
     def _run_price_only(self, cand, lag, decision_start):
-        if not self.is_sleeve_window(cand["ticker"]):
+        stamp, gate = self._clock_gate_for(cand["ticker"], cand.get("local_ts"))
+        if not gate["accepted"]:
             sleeve = {
                 "strategy": "price_only_late_score_v1",
                 "feed_independent": True,
-                "decision": "outside_minute_88_window",
+                "decision": gate["outcome"],
+                "match_clock_gate": {
+                    "outcome": gate["outcome"],
+                    "provider_clock": gate.get("provider_clock"),
+                    "provider_minute": gate.get("provider_minute"),
+                    "provider_period": gate.get("provider_period"),
+                    "provider_status": gate.get("provider_status"),
+                    "age_ms": gate.get("age_ms"),
+                    "observation_id": gate.get("observation_id"),
+                    "source": gate.get("source"),
+                },
             }
             tagged = self._strategy_candidate(cand, PRICE_ONLY_STRATEGY, sleeve)
-            self.record_signal(tagged, lag, "sleeve_outside_window")
-            return "sleeve_outside_window"
+            self.record_signal(tagged, lag, f"sleeve_{gate['outcome']}")
+            return f"sleeve_{gate['outcome']}"
         m = self.meta.get(cand["ticker"], {"event": "?", "series": "?"})
         event = m.get("event", "?")
         decision = self.late_score_sleeve.classify(
@@ -434,7 +724,20 @@ class Engine:
             self.books,
             cand.get("local_ts", time.time()) * 1000.0,
         )
-        sleeve = dict(decision.detail, decision=decision.reason)
+        sleeve = dict(
+            decision.detail,
+            decision=decision.reason,
+            match_clock_gate={
+                "outcome": gate["outcome"],
+                "provider_clock": gate.get("provider_clock"),
+                "provider_minute": gate.get("provider_minute"),
+                "provider_period": gate.get("provider_period"),
+                "provider_status": gate.get("provider_status"),
+                "age_ms": gate.get("age_ms"),
+                "observation_id": gate.get("observation_id"),
+                "source": gate.get("source"),
+            },
+        )
         tagged = self._strategy_candidate(cand, PRICE_ONLY_STRATEGY, sleeve)
         if not decision.accepted:
             self.record_signal(tagged, lag, f"sleeve_{decision.reason}")
@@ -555,6 +858,8 @@ class Engine:
             self.desk.check_timeouts()
             # expire stale pendings
             now = time.time()
+            # Also retries startup watches when no new book frame arrives.
+            self._expire_signal_paths(now)
             for p in [p for p in self.pending if now >= p["deadline"]]:
                 self.record_signal(p["cand"], None, "unconfirmed")
             self.pending = [p for p in self.pending if now < p["deadline"]]
@@ -579,19 +884,30 @@ class Engine:
     async def paper_execution_task(self):
         """Low-jitter clock for opt-in paper order arrivals."""
         delay = max(config.PAPER_EXECUTION_POLL_MS, 1.0) / 1000.0
+        next_due = time.monotonic()
         while True:
+            started = time.monotonic()
+            store.add_latency("scheduler_lag_ms", max(0.0, (started - next_due) * 1000.0))
             try:
                 self.desk.process_pending(self.books)
             except Exception as exc:
                 self._record_error("paper_execution", exc)
                 store.log_event("paper", f"execution adapter error: {exc!r}")
                 self.broadcast({"type": "log", "text": f"paper execution error: {exc!r}"})
-            await asyncio.sleep(delay)
+            next_due = started + delay
+            await asyncio.sleep(max(next_due - time.monotonic(), 0.0))
 
     def status(self):
         lat = sorted(self.feed_lag)
         recorder = self.recorder.status()
         goal = (self.goal_latency.status() if self.goal_latency else {"enabled": False})
+        tracker = getattr(self, "clock_tracker", None)
+        watched = getattr(self, "watched_events", set())
+        clock_coverage = tracker.coverage(watched) if tracker else {
+            "watched": 0, "mapped": 0, "clock_present": 0, "clock_fresh": 0,
+            "clock_stale": 0, "clock_gate_candidate_misses": 0,
+            "faults": [], "mapping_errors": [],
+        }
         database = store.database_health()
         ws_healthy = self.ws_state == "demo" or str(self.ws_state).startswith("connected")
         poll_age = (
@@ -610,6 +926,12 @@ class Engine:
         recent_errors = [row for row in self.errors if row["ts"] >= recent_cutoff]
         execution_errors = [row for row in recent_errors
                             if row["component"].startswith("paper")]
+        try:
+            latency_readiness = store.latency_readiness()
+        except Exception:
+            latency_readiness = {}
+        k4 = latency_readiness.get("order_arrival_ms") or {"state": "COLLECTING"}
+        k4_blocking = k4.get("state") in {"BREACH", "INVALID"}
         checks = {
             "websocket": {"healthy": ws_healthy, "status": self.ws_state},
             "recorder": {"healthy": bool(recorder.get("healthy")),
@@ -629,6 +951,11 @@ class Engine:
                 "mapped_matches": goal.get("mapped_matches", 0),
                 "last_error": goal.get("last_error"),
             },
+            "signal_path_persistence": {
+                "healthy": not getattr(self, "signal_path_fault", None),
+                "status": getattr(self, "signal_path_fault", None) or "persisted",
+                "watches_open": len(getattr(self, "_signal_paths", ())),
+            },
             "paper_execution": {
                 "healthy": not execution_errors,
                 "status": "ready" if not execution_errors else "recent_error",
@@ -643,8 +970,32 @@ class Engine:
                 "healthy": not recent_errors,
                 "status": "clear" if not recent_errors else f"{len(recent_errors)} recent",
             },
+            "match_clock": _clock_coverage_check(clock_coverage),
+            "latency_evidence": {
+                "healthy": not k4_blocking,
+                "status": k4.get("state") or "COLLECTING",
+                "p95_ms": k4.get("p95"),
+                "n": k4.get("n"),
+                "threshold_ms": k4.get("threshold_ms"),
+            },
         }
-        system_healthy = all(check["healthy"] for check in checks.values())
+        runtime_ok = all(
+            check["healthy"] for name, check in checks.items() if name != "latency_evidence"
+        )
+        system_healthy = runtime_ok and not k4_blocking
+        k4_state = k4.get("state") or "COLLECTING"
+        if not runtime_ok:
+            banner = "attention_required"
+            banner_text = "Attention required"
+        elif k4_blocking:
+            banner = "latency_breach"
+            banner_text = "Runtime healthy · execution latency breached"
+        elif k4_state in {"COLLECTING", "STALE"}:
+            banner = "evidence_not_ready"
+            banner_text = "Runtime healthy · paper evidence not ready"
+        else:
+            banner = "all_systems_good"
+            banner_text = "All systems good"
         return {"mode": self.mode, "ws": self.ws_state, "uptime_s": int(time.time() - self.started),
                 "markets": len(self.meta), "matches": len(self.event_markets),
                 "trades_seen": self.n_trades, "recorded": self.recorder.total,
@@ -655,17 +1006,36 @@ class Engine:
                 "foreign_dropped": self.n_foreign,
                 "price_only_sleeve": config.PRICE_ONLY_SLEEVE_MODE,
                 "goal_latency": goal,
-                "health": {"ok": system_healthy, "checks": checks,
-                           "recent_errors": list(reversed(recent_errors[-20:]))},
+                "clock_coverage": clock_coverage,
+                "latency_readiness": latency_readiness,
+                "health": {
+                    "ok": system_healthy,
+                    "runtime_ok": runtime_ok,
+                    "banner": banner,
+                    "banner_text": banner_text,
+                    "checks": checks,
+                    "recent_errors": list(reversed(recent_errors[-20:])),
+                },
                 "feed_lag_p50": round(lat[len(lat) // 2], 1) if lat else None,
                 "feed_lag_p95": round(lat[int(0.95 * len(lat))], 1) if len(lat) > 20 else None}
 
     async def start(self):
         store.set_mode(self.mode)
         if self.mode == "live":
-            store.purge_non_live()  # clean demo/legacy rows so live P&L starts fresh
+            # Mode-scoped queries isolate live evidence; deleting demo/legacy
+            # rows here would make the explicit all-mode archival export lie.
             if config.PAPER_EXECUTION_V2:
                 self.desk.restore_open_positions(store.load_open_paper_positions())
+            # Signal collection is independent of realistic paper execution.
+            # Always reconcile started-but-unfinalized forward watches.
+            rebuilt = self.rebuild_signal_paths()
+            if rebuilt:
+                store.log_event(
+                    "paper",
+                    f"rebuilt {rebuilt} unfinalized signal forward path(s) "
+                    "as incomplete after restart",
+                )
+            if config.PAPER_EXECUTION_V2:
                 for pos in self.desk.positions.values():
                     self._remember_fill({
                         "strategy": pos.strategy,
@@ -681,10 +1051,18 @@ class Engine:
                     self.client,
                     lambda: self.watched_events,
                     self.market_window,
+                    clock_tracker=self.clock_tracker,
                 )
                 asyncio.create_task(self.goal_latency.run())
             store.log_event("sys", "engine started in LIVE mode")
         else:
+            rebuilt = self.rebuild_signal_paths()
+            if rebuilt:
+                store.log_event(
+                    "paper",
+                    f"rebuilt {rebuilt} unfinalized signal forward path(s) "
+                    "as incomplete after restart",
+                )
             from .replay import DemoReplay
             asyncio.create_task(DemoReplay(self).run())
             self.ws_state = "demo"

@@ -98,6 +98,13 @@ GOAL_LATENCY_LOOKBACK_S = _f("GOAL_LATENCY_LOOKBACK_S", 10.0)
 GOAL_LATENCY_AFTER_S = _f("GOAL_LATENCY_AFTER_S", 2.0)
 EVENT_MATCH_WINDOW_S = _f("EVENT_MATCH_WINDOW_S", 20.0)
 
+# Forward price window recorded after every signal, accepted or declined, so a
+# decline is a labelled observation rather than a dead record.  Collection only:
+# nothing in the trading path reads it.
+SIGNAL_PATH_WINDOW_S = _f("SIGNAL_PATH_WINDOW_S", 300.0)
+SIGNAL_PATH_MAX_TRACKED = _i("SIGNAL_PATH_MAX_TRACKED", 400)
+MATCH_CLOCK_MAX_AGE_MS = _f("MATCH_CLOCK_MAX_AGE_MS", 2500.0)
+
 # --- Market discovery ---
 DISCOVERY_INTERVAL_S = _i("DISCOVERY_INTERVAL_S", 180)
 SUBSCRIBE_BEFORE_CLOSE_MIN = _i("SUBSCRIBE_BEFORE_CLOSE_MIN", 150)  # watch markets closing within this

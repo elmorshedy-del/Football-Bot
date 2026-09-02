@@ -10,7 +10,18 @@ import re
 import time
 
 from . import config, store
-from .match_events import normalize_match_event
+
+# Events a later correction may point back at.
+_SUBSTANTIVE_FOR_REVISION = {
+    "goal.observed", "penalty.scored", "score.correction",
+    "goal.disallowed", "var.overturned",
+}
+from .match_clock import MatchClockTracker, is_persisted_id, parse_current_clock
+from .match_events import (
+    iter_provider_event_rows,
+    normalize_match_event,
+    period_status_event,
+)
 
 _SCORE_KEY = re.compile(r"score", re.IGNORECASE)
 
@@ -87,10 +98,11 @@ def correlate_market_window(observations, goal_mono, before=True):
 
 
 class GoalLatencyObserver:
-    def __init__(self, client, event_tickers, market_window):
+    def __init__(self, client, event_tickers, market_window, clock_tracker=None):
         self.client = client
         self.event_tickers = event_tickers
         self.market_window = market_window
+        self.clock_tracker = clock_tracker or MatchClockTracker()
         self.milestones = {}            # event ticker -> milestone id
         self.events_by_milestone = {}
         self.scores = {}                # milestone id -> deterministic signature
@@ -104,6 +116,13 @@ class GoalLatencyObserver:
         self.scoreless_payloads = 0
         self.goals = 0
         self.corrections = 0
+        self.clocks_recorded = 0
+        self.provider_events_recorded = 0
+        self.seen_fingerprints = {}     # event -> set of fingerprints
+        self.lifecycle_state = {}       # event -> {period, status}
+        # event -> fingerprint of the last substantive event, so a correction
+        # arriving on a later poll still links to what it revises.
+        self.last_substantive_fingerprint = {}
 
     async def _resolve_new_events(self):
         now = time.time()
@@ -113,6 +132,10 @@ class GoalLatencyObserver:
             self.events_by_milestone.pop(milestone_id, None)
             self.scores.pop(milestone_id, None)
             self.last_poll_ts.pop(milestone_id, None)
+            self.seen_fingerprints.pop(event, None)
+            self.lifecycle_state.pop(event, None)
+            self.last_substantive_fingerprint.pop(event, None)
+            self.clock_tracker.drop_event(event)
         for event in sorted(active - set(self.milestones)):
             if now - self.last_mapping_attempt.get(event, 0.0) < 30.0:
                 continue
@@ -129,8 +152,10 @@ class GoalLatencyObserver:
                 milestone_id = str(milestone["id"])
                 self.milestones[event] = milestone_id
                 self.events_by_milestone[milestone_id] = event
+                self.clock_tracker.set_mapping(event, milestone_id)
             except (KeyError, RuntimeError, TypeError, ValueError) as exc:
                 self.last_error = f"milestone {event}: {type(exc).__name__}: {exc}"
+                self.clock_tracker.set_mapping(event, None, error=self.last_error)
 
     async def _record_change(self, live_data, before, after, timing):
         milestone_id = str(live_data.get("milestone_id") or "")
@@ -193,6 +218,113 @@ class GoalLatencyObserver:
             f"last_trade_led={trade_text}",
         )
 
+    async def _record_clock(self, event, milestone_id, details, timing):
+        parsed = parse_current_clock(details)
+        row = self.clock_tracker.observe(event, milestone_id, parsed, {
+            **timing,
+            "previous_poll_ts": self.last_poll_ts.get(milestone_id),
+        })
+        if row is None:
+            return parsed
+        # Persist first, publish second.  Until this returns a positive row id
+        # the previous persisted observation stays the only decision-visible
+        # one, so a signal racing this await cannot read an id-less clock.
+        try:
+            row_id = await asyncio.to_thread(store.insert_match_clock, row)
+        except Exception as exc:
+            self.clock_tracker.fail_persist(event, exc)
+            store.log_event(
+                "match_clock",
+                f"{event}: clock insert failed ({exc!r}); retrying on next poll",
+            )
+            return parsed
+        if not is_persisted_id(row_id):
+            self.clock_tracker.fail_persist(
+                event, ValueError(f"insert returned non-positive id {row_id!r}"),
+            )
+            return parsed
+        self.clock_tracker.promote(event, row_id)
+        self.clocks_recorded += 1
+        return parsed
+
+    async def _record_provider_events(self, event, milestone_id, live_data, parsed, timing):
+        seen = self.seen_fingerprints.setdefault(event, set())
+        previous_lifecycle = self.lifecycle_state.get(event)
+        current_lifecycle = {
+            "period": parsed.provider_period if parsed else None,
+            "status": parsed.provider_status if parsed else None,
+        }
+        candidates = list(iter_provider_event_rows(live_data))
+        lifecycle = period_status_event(previous_lifecycle, current_lifecycle, live_data)
+        if lifecycle is not None:
+            candidates.append(lifecycle)
+        self.lifecycle_state[event] = current_lifecycle
+        # A correction usually arrives on a LATER poll than the goal it
+        # corrects.  Resetting this per poll meant every such correction was
+        # stored with previous_fingerprint=null and the revision chain broke.
+        # In-memory state is preferred; after a restart it is empty, so the
+        # link is resolved from durable same-event, same-mode history instead.
+        previous_fingerprint = self.last_substantive_fingerprint.get(event)
+        if previous_fingerprint is None:
+            previous_fingerprint = await asyncio.to_thread(
+                store.previous_substantive_fingerprint, event,
+            )
+            if previous_fingerprint is not None:
+                self.last_substantive_fingerprint[event] = previous_fingerprint
+        for item in candidates:
+            fingerprint = item["fingerprint"]
+            if fingerprint in seen:
+                await asyncio.to_thread(store.upsert_provider_event, {
+                    "observed_ts": timing["received_wall"],
+                    "poll_started_ts": timing["started_wall"],
+                    "previous_poll_ts": self.last_poll_ts.get(milestone_id),
+                    "response_ms": timing["response_ms"],
+                    "event": event,
+                    "milestone_id": milestone_id,
+                    "fingerprint": fingerprint,
+                    "previous_fingerprint": None,
+                    "canonical_type": item["canonical_type"],
+                    "canonical_side": item.get("side"),
+                    "provider_period": parsed.provider_period if parsed else None,
+                    "provider_minute": item.get("provider_minute"),
+                    "provider_stoppage": item.get("provider_stoppage"),
+                    "provider_clock": item.get("provider_clock"),
+                    "normalized_event": item,
+                    "raw_payload": item.get("raw") or live_data,
+                })
+                continue
+            seen.add(fingerprint)
+            row = {
+                "observed_ts": timing["received_wall"],
+                "poll_started_ts": timing["started_wall"],
+                "previous_poll_ts": self.last_poll_ts.get(milestone_id),
+                "response_ms": timing["response_ms"],
+                "event": event,
+                "milestone_id": milestone_id,
+                "fingerprint": fingerprint,
+                "previous_fingerprint": (
+                    previous_fingerprint if item["canonical_type"] in {
+                        "score.correction", "goal.disallowed", "var.overturned",
+                    } else None
+                ),
+                "canonical_type": item["canonical_type"],
+                "canonical_side": item.get("side"),
+                "provider_period": parsed.provider_period if parsed else None,
+                "provider_minute": item.get("provider_minute"),
+                "provider_stoppage": item.get("provider_stoppage"),
+                "provider_clock": item.get("provider_clock"),
+                "normalized_event": item,
+                "raw_payload": item.get("raw") or live_data,
+            }
+            inserted, is_new = await asyncio.to_thread(store.upsert_provider_event, row)
+            if item["canonical_type"] in _SUBSTANTIVE_FOR_REVISION:
+                previous_fingerprint = fingerprint
+                self.last_substantive_fingerprint[event] = fingerprint
+            if is_new:
+                self.provider_events_recorded += 1
+                previous_fingerprint = fingerprint
+            _ = inserted
+
     async def _poll(self):
         milestone_ids = sorted(self.events_by_milestone)
         if not milestone_ids:
@@ -214,11 +346,18 @@ class GoalLatencyObserver:
         self.polls += 1
         self.last_poll_wall = received_wall
         self.last_response_ms = timing["response_ms"]
+        store.add_latency("match_response_ms", timing["response_ms"])
         for live_data in response.get("live_datas") or []:
             milestone_id = str(live_data.get("milestone_id") or "")
             if milestone_id not in self.events_by_milestone:
                 continue
-            signature = score_signature(live_data.get("details") or {})
+            event = self.events_by_milestone[milestone_id]
+            details = live_data.get("details") or {}
+            parsed = await self._record_clock(event, milestone_id, details, timing)
+            await self._record_provider_events(
+                event, milestone_id, live_data, parsed, timing,
+            )
+            signature = score_signature(details)
             if not signature:
                 self.scoreless_payloads += 1
                 self.last_poll_ts[milestone_id] = received_wall
@@ -270,7 +409,10 @@ class GoalLatencyObserver:
             "scoreless_payloads": self.scoreless_payloads,
             "goals": self.goals,
             "corrections": self.corrections,
+            "clocks_recorded": self.clocks_recorded,
+            "provider_events_recorded": self.provider_events_recorded,
             "last_poll_ts": self.last_poll_wall,
             "last_response_ms": self.last_response_ms,
             "last_error": self.last_error,
+            "clock_coverage": self.clock_tracker.coverage(),
         }

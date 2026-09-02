@@ -140,7 +140,7 @@ class PaperExecutionStoreTests(unittest.TestCase):
         self.assertEqual(store.q("SELECT outcome FROM signals"), [{"outcome": "no_book"}])
         self.assertEqual(store.q(
             "SELECT kind,ms FROM latency"
-        ), [{"kind": "paper_entry", "ms": 150.0}])
+        ), [{"kind": "paper_entry_ms", "ms": 150.0}])
 
     def test_open_position_loader_includes_signal_and_fill_state(self):
         signal_id = self.insert_signal()
@@ -207,7 +207,7 @@ class PaperExecutionStoreTests(unittest.TestCase):
 
         gate = store.stats()["kill"]
 
-        self.assertEqual(gate["k4_latency_source"], "order_arrival")
+        self.assertEqual(gate["k4_latency_source"], "order_arrival_ms")
         self.assertEqual(gate["k4_latency_p95_ms"], 220.0)
 
     def test_zero_trade_stats_include_both_sleeves_and_reconcile(self):

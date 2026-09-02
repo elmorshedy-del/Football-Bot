@@ -1,7 +1,7 @@
 # Football-Bot audit remediation ledger
 
-Date: 2026-08-27  
-Audited base: `main` at `61eae4f0e370740803bd71614384d2e03cfb41d4`  
+Date: 2026-08-27
+Audited base: `main` at `61eae4f0e370740803bd71614384d2e03cfb41d4`
 Scope: paper trading only; detector, Gate A thresholds, signal confirmation,
 price cap, target, stop setting, timeout, and real-order behavior were not
 changed.

@@ -8,8 +8,9 @@ import os
 import time
 from datetime import datetime, timezone
 
-from . import config
+from . import config, store
 from .books import Book
+from .match_clock import ParsedClock
 
 EVENT = "KXLALIGAGAME-26AUG22ESPRMA"
 MKTS = {
@@ -87,6 +88,17 @@ class DemoReplay:
             self.e.register_market(tk, EVENT, "KXLALIGAGAME", f"Espanyol vs Real Madrid — {title}",
                                    None, leg_title=title,
                                    game_title="Espanyol vs Real Madrid")
+        parsed = ParsedClock(
+            provider_period="2nd", provider_minute=90, provider_stoppage=5,
+            provider_clock="90+5′", provider_status="live",
+            source_field="demo", raw_context={"source": "demo_replay_clock"},
+        )
+        row = self.e.clock_tracker.ingest_synthetic(
+            EVENT, "demo-milestone", parsed, time.time(), "demo_replay_clock",
+        )
+        if row is not None:
+            row_id = store.insert_match_clock(row)
+            self.e.clock_tracker.promote(EVENT, row_id)
         while True:
             loop_n += 1
             self.e.demo_status = f"loop {loop_n} — Espanyol 1-1 Real Madrid, closing minutes"

@@ -8,7 +8,14 @@ import json
 from datetime import datetime, timezone
 
 from . import config
-from .match_events import event_consistency, normalize_match_event
+from .match_clock import parse_stored_stamp
+from .match_events import (
+    SUBSTANTIVE_EVENT_TYPES,
+    association_class,
+    event_consistency,
+    normalize_match_event,
+    provider_occurrence,
+)
 
 
 def json_object(value):
@@ -25,6 +32,8 @@ def json_object(value):
 
 def normalized_event(row):
     stored = json_object(row.get("normalized_event"))
+    if stored.get("schema") == "football.provider_match_event.v1":
+        return stored
     detail = json_object(row.get("detail"))
     derived = normalize_match_event(
         row.get("change_kind"),
@@ -159,9 +168,13 @@ def match_signal_event(signal, observations, window_s=None):
         "provider_poll_uncertainty_ms": None,
         "provider_response_ms": None,
         "provider_occurrence_ts": None,
+        "provider_occurrence_source": None,
+        "provider_occurrence_unavailable_reason": None,
         "occurrence_minus_signal_ms": None,
         "association": "unmatched",
+        "event_association": "no_nearby_same_match_event",
         "raw_provider_payload": None,
+        "match_clock": parse_stored_stamp(signal.get("match_clock_snapshot")),
     }
     if not isinstance(signal_ts, (int, float)):
         base["match_status"] = "signal_time_missing"
@@ -169,23 +182,48 @@ def match_signal_event(signal, observations, window_s=None):
     event = signal.get("event")
     eligible = []
     for row in observations:
-        observed_ts = row.get("observed_ts")
+        observed_ts = row.get("first_observed_ts", row.get("observed_ts"))
         if row.get("event") != event or not isinstance(observed_ts, (int, float)):
             continue
         delta = observed_ts - signal_ts
         if abs(delta) <= window_s:
-            eligible.append((abs(delta), observed_ts, row.get("id") or 0, delta, row))
+            canonical = row.get("canonical_type") or ""
+            if not canonical and isinstance(row.get("normalized_event"), dict):
+                canonical = row["normalized_event"].get("canonical_type") or ""
+            priority = 0 if (
+                canonical in SUBSTANTIVE_EVENT_TYPES or
+                str(canonical).startswith("goal_observed") or
+                str(canonical).startswith("score_correction")
+            ) else 1
+            eligible.append((priority, abs(delta), observed_ts, row.get("id") or 0, delta, row))
     if not eligible:
         return base
-    _distance, observed_ts, _row_id, delta, row = min(
-        eligible, key=lambda item: (item[0], item[1], item[2]),
+    _priority, _distance, observed_ts, _row_id, delta, row = min(
+        eligible, key=lambda item: (item[0], item[1], item[2], item[3]),
     )
     normalized = normalized_event(row)
+    # goal_latency_observations carry `detail`; provider_match_events carry
+    # `raw_payload`.  Reading only `detail` left every canonical provider
+    # association with an empty payload, no occurrence time, and no poll
+    # uncertainty.
     detail = json_object(row.get("detail"))
-    raw_provider = detail.get("live_data") or {}
-    provider_details = raw_provider.get("details") or {}
-    last_play = provider_details.get("last_play") or {}
-    occurrence_ts = last_play.get("occurence_ts") if isinstance(last_play, dict) else None
+    raw_provider = detail.get("live_data") or json_object(row.get("raw_payload")) or {}
+    # Prefer the normalized column written at canonicalization.  Rows persisted
+    # before that column existed are derived from their preserved raw payload
+    # using the same fixed precedence, and labelled as such -- absence stays
+    # null with an explicit reason rather than borrowing a receipt time.
+    occurrence_ts = row.get("provider_occurrence_ts")
+    occurrence_source = row.get("provider_occurrence_source")
+    occurrence_reason = row.get("provider_occurrence_unavailable_reason")
+    if occurrence_ts is None and occurrence_source is None:
+        derived_ts, derived_source, derived_reason = provider_occurrence(raw_provider)
+        occurrence_ts = derived_ts
+        occurrence_source = (
+            f"legacy_raw_derived:{derived_source}" if derived_source else None
+        )
+        occurrence_reason = occurrence_reason or derived_reason
+    if occurrence_ts is not None:
+        occurrence_reason = None
     occurrence_delta_ms = (
         round((occurrence_ts - signal_ts) * 1000.0, 3)
         if isinstance(occurrence_ts, (int, float)) else None
@@ -199,11 +237,25 @@ def match_signal_event(signal, observations, window_s=None):
         "timing_relation": _timing_relation(delta_ms),
         "state_consistency": consistency,
         "association": _association_label(consistency),
+        "event_association": association_class(consistency, True),
         "observation_id": row.get("id"),
         "canonical_event": normalized,
-        "provider_poll_uncertainty_ms": detail.get("poll_uncertainty_ms"),
+        # goal_latency rows carry a precomputed value in `detail`; provider rows
+        # carry the raw previous_poll_ts, so derive it rather than reporting
+        # empty polling uncertainty for every canonical provider association.
+        "provider_poll_uncertainty_ms": (
+            detail.get("poll_uncertainty_ms")
+            if detail.get("poll_uncertainty_ms") is not None
+            else (
+                round((observed_ts - row["previous_poll_ts"]) * 1000.0, 3)
+                if isinstance(row.get("previous_poll_ts"), (int, float))
+                and isinstance(observed_ts, (int, float)) else None
+            )
+        ),
         "provider_response_ms": row.get("response_ms"),
         "provider_occurrence_ts": occurrence_ts,
+        "provider_occurrence_source": occurrence_source,
+        "provider_occurrence_unavailable_reason": occurrence_reason,
         "occurrence_minus_signal_ms": occurrence_delta_ms,
         "raw_provider_payload": raw_provider,
     })

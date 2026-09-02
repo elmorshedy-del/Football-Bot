@@ -11,15 +11,79 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
+    env:
+      # Browser acceptance is mandatory here.  Without this the suite would
+      # skip the browser tests and still report success, which is exactly how
+      # run 33561327860 went green with three skipped acceptance tests.
+      REQUIRE_BROWSER_TESTS: "1"
     steps:
       - uses: actions/checkout@v4
+        with:
+          # git diff --check compares against the base branch, which needs history.
+          fetch-depth: 0
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: requirements-dev.lock
-      - run: pip install --requirement requirements-dev.lock
-      - run: python -X dev -m unittest discover -s tests -v
-      - run: python -m compileall -q app tests
-      - run: ruff check --select E9,F63,F7,F82 app tests
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Python dependencies
+        run: pip install --requirement requirements-dev.lock
+
+      - name: Install Chromium for browser acceptance
+        run: python -m playwright install --with-deps chromium
+
+      - name: Confirm the browser actually runs
+        run: |
+          python - <<'PY'
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as p:
+              browser = p.chromium.launch()
+              print("chromium", browser.version)
+              browser.close()
+          PY
+
+      # Strict: RuntimeWarnings are errors, so an unawaited coroutine or an
+      # unretrieved task exception fails the run instead of printing quietly.
+      - name: Unit and browser tests
+        run: python -X dev -W error::RuntimeWarning -m unittest discover -s tests -v
+
+      - name: Fail if browser acceptance was skipped
+        run: |
+          python -X dev -m unittest discover -s tests 2>&1 | tee /tmp/suite.txt
+          if grep -qi "chromium is not available\|playwright is not installed" /tmp/suite.txt; then
+            echo "::error::browser acceptance was skipped; it is mandatory in CI"
+            exit 1
+          fi
+          # Both asyncio wordings, not just the Task one: a leaked Future
+          # reports "Future exception was never retrieved", which an earlier
+          # version of this guard missed while still reporting the job green.
+          if grep -qE "(Task|Future) exception was never retrieved" /tmp/suite.txt; then
+            echo "::error::an unretrieved async exception escaped the suite"
+            grep -nE "(Task|Future) exception was never retrieved" /tmp/suite.txt
+            exit 1
+          fi
+          if grep -q "Task was destroyed but it is pending" /tmp/suite.txt; then
+            echo "::error::a pending task was destroyed during teardown"
+            exit 1
+          fi
+
+      - name: Byte-compile
+        run: python -m compileall -q app tests
+
+      - name: Ruff fatal-error selection
+        run: ruff check --select E9,F63,F7,F82 app tests
+
+      - name: JavaScript syntax
+        run: node --check static/app.js
+
+      - name: Whitespace and conflict markers
+        run: |
+          git diff --check "origin/${GITHUB_BASE_REF:-main}...HEAD"
+          git diff --check

@@ -10,6 +10,9 @@ from collections import deque
 from dataclasses import dataclass
 
 from . import config, store
+
+# Samples buffered before an incremental write; bounds crash loss.
+BID_PATH_FLUSH_EVERY = 250
 from .execution import ShadowBooks
 from .late_score_sleeve import sleeve_exit_reason
 
@@ -77,6 +80,20 @@ class Position:
         self.sleeve_anchor_bid = None
         self.peak_bid = entry_px
         self.bid_path = deque(maxlen=240)
+        # Persisted execution path, separate from `bid_path` above, which the
+        # sleeve exit logic owns and must keep at its current shape/length.
+        self.exec_path = []
+        self.exec_path_last = None
+        self.exec_path_dropped = 0
+        # Total ever buffered for this position.  The cap must be checked
+        # against this, not len(exec_path): the buffer is emptied on every
+        # incremental flush, so a length check silently resets the cap.
+        self.exec_path_total = 0
+        self.exec_path_flush_failed = False
+        self.high_dirty = False
+        self.max_executable_bid = None
+        self.max_executable_bid_ts = None
+        self.mfe_c = None
 
     def unrealized(self, bid):
         return self.realized_gross + (bid - self.entry_px) * self.remaining / 100.0
@@ -159,6 +176,23 @@ class PaperDesk:
             pos.exit_vwap_num = float(row["exit_vwap_num"] or 0.0)
             pos.mae = float(row["mae"] or 0.0)
             pos.shadow_stop_hit_px = row["shadow_stop_px"]
+            pos.max_executable_bid = row.get("max_executable_bid")
+            pos.max_executable_bid_ts = row.get("max_executable_bid_ts")
+            pos.mfe_c = row.get("mfe_c")
+            # Resume the path at the durable maximum sequence.  Starting from
+            # zero made the first post-restart quote reuse sequence 1, which the
+            # partial unique index ignored, so the observation was lost in
+            # silence and the cap restarted from empty.
+            durable_seq = int(row.get("path_max_seq") or 0)
+            durable_rows = int(row.get("path_rows_durable") or 0)
+            pos.exec_path_total = max(durable_seq, durable_rows)
+            pos.exec_path_terminal_written = bool(row.get("path_has_terminal"))
+            # The in-memory tail of an abnormally stopped process is gone; the
+            # last durable observation is unknown, so no signature is restored
+            # and the next quote is recorded rather than deduplicated away.
+            pos.exec_path_last = None
+            if durable_rows:
+                pos.path_restored_from_seq = durable_seq
             self.positions[pos.tid] = pos
         if self.positions:
             self._safe_log("paper", f"restored {len(self.positions)} open paper positions")
@@ -407,14 +441,197 @@ class PaperDesk:
                 "size": round(pos.remaining if self.realistic else pos.size, 1),
                 "initial_size": round(pos.initial_size, 1), "entry_ts": pos.entry_ts,
                 "bid": bid, "upnl": round(pos.unrealized(bid), 2) if bid is not None else None,
-                "strategy": pos.strategy}
+                "strategy": pos.strategy,
+                "max_executable_bid": pos.max_executable_bid,
+                "max_executable_bid_ts": pos.max_executable_bid_ts,
+                "mfe_c": pos.mfe_c,
+                "high_after_entry_s": (
+                    round(pos.max_executable_bid_ts - pos.entry_ts, 3)
+                    if pos.max_executable_bid_ts is not None else None
+                )}
+
+    def _record_exec_path(self, pos, book, bid, now):
+        """Buffer one held-side quote when it changes.  Memory only.
+
+        A scalar high cannot say whether that high was reachable: 90c resting
+        for 200ms in size 1 and 90c resting for 12s in size 500 produce an
+        identical max_executable_bid.  Storing the change-log keeps time-at-price
+        and depth, so exit rules can be re-tuned without re-collecting.
+        """
+        try:
+            ladder = book.bid_ladder(pos.side)
+        except Exception:
+            ladder = []
+        bid_size = ladder[0][1] if ladder else None
+        qty = pos.remaining
+        exec_px = None
+        if ladder and qty and qty > 0:
+            taken, weighted = 0.0, 0.0
+            for price, size in ladder:
+                take = min(size, qty - taken)
+                if take <= 0:
+                    break
+                weighted += take * price
+                taken += take
+                if taken >= qty:
+                    break
+            # Only a fully fillable size gets a VWAP; a partial walk would
+            # overstate what the position could actually have realized.
+            if taken >= qty and taken > 0:
+                exec_px = weighted / taken
+        signature = (bid, bid_size, exec_px, qty)
+        if signature == pos.exec_path_last:
+            return
+        pos.exec_path_last = signature
+        # One slot is reserved so the terminal row always fits inside the cap.
+        if pos.exec_path_total >= store.BID_PATH_MAX_SAMPLES - 1:
+            pos.exec_path_dropped += 1
+            return
+        pos.exec_path_total += 1
+        pos.exec_path.append({
+            "kind": "position", "trade_id": pos.tid, "signal_id": pos.signal_id,
+            "event": pos.event, "market": pos.market, "side": pos.side,
+            "strategy": pos.strategy, "anchor_ts": pos.entry_ts,
+            "dt_ms": round((now - pos.entry_ts) * 1000.0, 1),
+            "bid": bid, "bid_size": bid_size, "exec_px": exec_px, "qty": qty,
+            "sample_seq": pos.exec_path_total, "availability": "quote",
+            "terminal": 0,
+        })
+        # Bound how much a crash can lose without paying a commit per quote.
+        if len(pos.exec_path) >= BID_PATH_FLUSH_EVERY:
+            self._flush_exec_path(pos)
+
+    def _record_exec_gap(self, pos, now):
+        """Record that the held side had no executable bid.
+
+        Skipping these left an unexplained hole in the path, so time-at-peak
+        was computed across a window in which the peak may not have been
+        quotable at all.
+        """
+        if pos.exec_path_last is None and not pos.exec_path:
+            return
+        signature = (None, None, None, pos.remaining)
+        if signature == pos.exec_path_last:
+            return
+        pos.exec_path_last = signature
+        if pos.exec_path_total >= store.BID_PATH_MAX_SAMPLES - 1:
+            pos.exec_path_dropped += 1
+            return
+        pos.exec_path_total += 1
+        pos.exec_path.append({
+            "kind": "position", "trade_id": pos.tid, "signal_id": pos.signal_id,
+            "event": pos.event, "market": pos.market, "side": pos.side,
+            "strategy": pos.strategy, "anchor_ts": pos.entry_ts,
+            "dt_ms": round((now - pos.entry_ts) * 1000.0, 1),
+            "bid": None, "bid_size": None, "exec_px": None, "qty": pos.remaining,
+            "sample_seq": pos.exec_path_total, "availability": "gap",
+            "terminal": 0,
+        })
+
+    def _record_exec_terminal(self, pos, exit_px, now):
+        """Close the path at the exit so the last interval has a real end.
+
+        Without a terminal sample the final segment had no duration and
+        time-at-peak was understated whenever the peak was the last quote.
+        """
+        if getattr(pos, "exec_path_terminal_written", False):
+            return
+        pos.exec_path_terminal_written = True
+        pos.exec_path_total += 1
+        pos.exec_path.append({
+            "kind": "position", "trade_id": pos.tid, "signal_id": pos.signal_id,
+            "event": pos.event, "market": pos.market, "side": pos.side,
+            "strategy": pos.strategy, "anchor_ts": pos.entry_ts,
+            "dt_ms": round((now - pos.entry_ts) * 1000.0, 1),
+            # The executed exit price belongs on trades.exit_px.  A terminal
+            # row is only the end timestamp for availability and must never be
+            # relabelled as an executable quote.
+            "bid": None, "bid_size": None, "exec_px": None,
+            "qty": pos.remaining,
+            "sample_seq": pos.exec_path_total, "availability": "terminal",
+            "terminal": 1,
+        })
+
+    def _flush_exec_path(self, pos, final=False):
+        """Write the buffered path in one transaction.
+
+        Called incrementally so a restart loses at most BID_PATH_FLUSH_EVERY
+        samples, and once more at close.  dt_ms is relative to the restored
+        entry_ts, so partial flushes reassemble in dt_ms order.
+        """
+        if pos.exec_path:
+            rows = list(pos.exec_path)
+            try:
+                written = store.insert_bid_path(rows)
+            except Exception as exc:
+                # Keep the buffer.  Clearing before the write made a failed
+                # write lose the rows permanently; retrying on the next flush
+                # is the whole point of buffering.
+                pos.exec_path_flush_failed = True
+                self._report_error("bid_path", exc)
+            else:
+                if isinstance(written, int) and written < len(rows):
+                    # An ignored row means its sequence key already exists.
+                    # That is expected for a retry of rows we know are durable,
+                    # and a real fault otherwise, so it is reported rather than
+                    # treated as a successful write.
+                    self._report_error("bid_path", RuntimeError(
+                        f"trade {pos.tid}: {len(rows) - written} of {len(rows)} "
+                        "path rows collided with an existing sequence key",
+                    ))
+                pos.exec_path = pos.exec_path[len(rows):]
+                pos.exec_path_flush_failed = False
+        if final:
+            try:
+                samples = store.bid_path_for_trade(pos.tid)
+                store.set_trade_path_summary(pos.tid, store.bid_path_summary(
+                    samples,
+                    truncated=bool(pos.exec_path_dropped),
+                    dropped_samples=pos.exec_path_dropped,
+                ))
+            except Exception as exc:
+                self._report_error("bid_path_summary", exc)
+        if final and pos.exec_path_dropped:
+            self._safe_log(
+                "paper",
+                f"bid path for trade {pos.tid} truncated at "
+                f"{store.BID_PATH_MAX_SAMPLES} samples "
+                f"({pos.exec_path_dropped} dropped)",
+            )
+
+    def _observe_executable_high(self, pos, bid, now=None):
+        """Record the highest executable held-side bid after entry fill."""
+        if bid is None:
+            return
+        now = time.time() if now is None else now
+        if pos.max_executable_bid is not None and bid <= pos.max_executable_bid:
+            return
+        candidate_bid = float(bid)
+        candidate_ts = now
+        candidate_mfe = max(0.0, candidate_bid - pos.entry_px)
+        try:
+            store.update_trade_high(pos.tid, candidate_bid, candidate_ts)
+        except Exception as exc:
+            # Do not advance the in-memory high on a failed write.  Doing so
+            # made every later quote compare against a high the database never
+            # accepted, so the write was never retried and the high was lost.
+            pos.high_dirty = True
+            self._report_error("trade_high", exc)
+            return
+        pos.max_executable_bid = candidate_bid
+        pos.max_executable_bid_ts = candidate_ts
+        pos.mfe_c = candidate_mfe
+        pos.high_dirty = False
 
     def on_book(self, ticker, book):
         """Mark open positions on this market; handle target exits + shadow metrics."""
         for pos in [p for p in self.positions.values() if p.market == ticker]:
             bid = book.best_yes_bid() if pos.side == "yes" else book.best_no_bid()
             if bid is None:
+                self._record_exec_gap(pos, time.time())
                 continue
+            self._observe_executable_high(pos, bid)
+            self._record_exec_path(pos, book, bid, time.time())
             pos.best_bid = bid
             adverse = pos.entry_px - bid
             if adverse > pos.mae:
@@ -537,15 +754,28 @@ class PaperDesk:
         source = shadow.yes_bids if pos.side == "yes" else shadow.no_bids
         before = dict(source)
         shadow.consume_sell(pos.side, fill)
+        if final is not None:
+            # Last write for this trade: the terminal row joins the same
+            # transaction as the final fill, progress and closed fields.
+            self._record_exec_terminal(pos, final["exit_px"], now_wall)
         try:
             store.record_paper_exit(
                 pos.tid, pos.signal_id, pos.side, now_wall, order.reason, fees, progress,
                 max(0.0, (now_wall - order.queued_wall) * 1000.0), final,
+                path_rows=list(pos.exec_path) if final is not None else None,
+                truncated=bool(pos.exec_path_dropped),
+                dropped_samples=pos.exec_path_dropped,
             )
         except Exception:
             source.clear()
             source.update(before)
+            if final is not None:
+                self._retract_terminal(pos)
+                pos.exec_path_flush_failed = True
             raise
+        if final is not None:
+            pos.exec_path = []
+            pos.exec_path_flush_failed = False
         pos.remaining = remaining
         pos.realized_gross = realized_gross
         pos.exit_fees = exit_fees
@@ -594,10 +824,25 @@ class PaperDesk:
                     pos, realized_gross, pos.entry_fees + pos.exit_fees,
                     exit_qty, exit_vwap_num,
                 )
-                store.record_paper_exit(
-                    pos.tid, pos.signal_id, pos.side, time.time(), "settle",
-                    [(exit_px, qty, 0.0)], progress, 0.0, final,
-                )
+                settled_at = time.time()
+                self._record_exec_terminal(pos, final["exit_px"], settled_at)
+                try:
+                    store.record_paper_exit(
+                        pos.tid, pos.signal_id, pos.side, settled_at, "settle",
+                        [(exit_px, qty, 0.0)], progress, 0.0, final,
+                        path_rows=list(pos.exec_path),
+                        truncated=bool(pos.exec_path_dropped),
+                        dropped_samples=pos.exec_path_dropped,
+                    )
+                except Exception as exc:
+                    # Settlement is the same all-or-nothing contract: keep the
+                    # position owned rather than half-settling it.
+                    self._retract_terminal(pos)
+                    pos.exec_path_flush_failed = True
+                    self._report_error("paper_settle", exc)
+                    continue
+                pos.exec_path = []
+                pos.exec_path_flush_failed = False
                 pos.realized_gross = realized_gross
                 pos.exit_qty = exit_qty
                 pos.exit_vwap_num = exit_vwap_num
@@ -619,6 +864,9 @@ class PaperDesk:
         }
 
     def _complete_realistic(self, pos, reason, final):
+        # The path, summary and closed fields were already committed with the
+        # final fill by record_paper_exit(); reaching here means that
+        # transaction succeeded, so the position may finally be released.
         self.positions.pop(pos.tid, None)
         self.pending_exits.pop(pos.tid, None)
         self._safe_broadcast({"type": "trade_close", "trade": {
@@ -636,9 +884,28 @@ class PaperDesk:
         if reason != "settle" and config.FEE_EXIT_TAKER:
             fees += fee_dollars(pos.size, exit_px)
         net = gross - fees
-        store.close_trade(pos.tid, round(exit_px, 2), reason, round(gross, 2),
-                          round(fees, 2), round(net, 2), round(pos.mae, 2),
-                          pos.shadow_stop_hit_px)
+        # Terminal row first, then ONE transaction covering path, summary and
+        # the closed-trade fields.  Closing before flushing the path left a
+        # closed trade whose final rows had no owner when the write failed.
+        self._record_exec_terminal(pos, round(exit_px, 2), time.time())
+        try:
+            store.close_trade(
+                pos.tid, round(exit_px, 2), reason, round(gross, 2),
+                round(fees, 2), round(net, 2), round(pos.mae, 2),
+                pos.shadow_stop_hit_px,
+                path_rows=list(pos.exec_path),
+                truncated=bool(pos.exec_path_dropped),
+                dropped_samples=pos.exec_path_dropped,
+            )
+        except Exception as exc:
+            # Nothing committed: keep owning the position so a later attempt can
+            # retry the same sequence keys.  No close is broadcast or logged.
+            pos.exec_path_flush_failed = True
+            self._retract_terminal(pos)
+            self._report_error("paper_close", exc)
+            return False
+        pos.exec_path = []
+        pos.exec_path_flush_failed = False
         self.positions.pop(pos.tid, None)
         self.broadcast({"type": "trade_close", "trade": {
             "id": pos.tid, "market": pos.market, "series": pos.series, "side": pos.side,
@@ -646,6 +913,18 @@ class PaperDesk:
             "size": round(pos.size, 1), "reason": reason, "net": round(net, 2),
             "strategy": pos.strategy}})
         store.log_event("trade", f"CLOSE {pos.market} {reason} net ${net:+.2f}")
+        return True
+
+    def _retract_terminal(self, pos):
+        """Undo an unpersisted terminal row so a retry appends exactly one.
+
+        The row stays in the buffer only if it was already durable; otherwise a
+        retry would append a second terminal sample under a new sequence key.
+        """
+        while pos.exec_path and pos.exec_path[-1].get("terminal"):
+            pos.exec_path.pop()
+            pos.exec_path_total = max(0, pos.exec_path_total - 1)
+        pos.exec_path_terminal_written = False
 
     def flatten_all(self, reason="flatten"):
         for pos in list(self.positions.values()):

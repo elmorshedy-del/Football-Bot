@@ -5,9 +5,9 @@ const state = {
   status: null, config: {}, stats: {}, matches: [],
   trades: {open: [], closed: []}, signals: [], events: [], latency: {},
   equity: {combined: [], gate_a: [], price_only_late_score: []},
-  activity: [], hydrated: false,
+  activity: [], clocks: {coverage: {}, observations: []}, providerEvents: [], hydrated: false,
 };
-const filters = {query: "", strategy: "all", match: "all", result: "all", association: "all", period: "all"};
+const filters = {query: "", strategy: "all", match: "all", result: "all", association: "all", gate: "all", period: "all"};
 const visibleEquitySeries = new Set(["combined", "gate_a", "price_only_late_score"]);
 const clientErrors = [];
 const activeClientFaults = new Map();
@@ -99,6 +99,20 @@ const outcomeLabels = {
   sleeve_incomplete_book: "Ignored: a contract order book was incomplete",
   sleeve_ambiguous_draw_leg: "Ignored: draw contract could not be identified",
   sleeve_not_rising_leg: "Ignored: target contract was not rising", execution_error: "Execution adapter error",
+  sleeve_clock_88_plus: "Price-only 88+ clock accepted",
+  sleeve_clock_pre_88: "Declined: persisted clock is before minute 88",
+  sleeve_clock_unmapped: "Declined: match is not mapped to a live clock",
+  sleeve_clock_missing: "Declined: live clock is missing",
+  sleeve_clock_malformed: "Declined: live clock is malformed",
+  sleeve_clock_stale: "Declined: live clock is stale",
+  sleeve_clock_not_live: "Declined: provider status is not live",
+  sleeve_clock_final: "Declined: match clock is final",
+  sleeve_clock_suspended: "Declined: match clock is suspended",
+  sleeve_clock_abandoned: "Declined: match clock is abandoned",
+  sleeve_clock_first_half: "Declined: clock is still first half",
+  sleeve_clock_half_time: "Declined: clock is half-time",
+  sleeve_clock_pre_match: "Declined: clock is pre-match",
+  sleeve_clock_period_unusable: "Declined: clock period is unusable",
 };
 const exitLabels = {
   target: "Profit target reached", timeout: "Gate A time limit", sleeve_timeout: "Price-only time limit",
@@ -110,10 +124,28 @@ const associationLabels = {
   state_consistent: "State-consistent match event", nearby_goal: "Nearby goal; state not confirmed",
   nearby_correction: "Nearby score correction", state_mismatch: "Nearby event conflicts with inference",
   time_only: "Time proximity only", unmatched: "No nearby same-match event",
+  temporally_associated: "Temporally associated", no_nearby_same_match_event: "No nearby same-match event",
+};
+const clockGateLabels = {
+  clock_88_plus: "88+ clock accepted", clock_pre_88: "Clock before minute 88",
+  clock_unmapped: "Clock unmapped", clock_missing: "Clock missing", clock_malformed: "Clock malformed",
+  clock_stale: "Clock stale", clock_not_live: "Clock not live", clock_final: "Clock final",
+  clock_suspended: "Clock suspended", clock_abandoned: "Clock abandoned",
+  clock_first_half: "First-half clock", clock_half_time: "Half-time clock",
+  clock_pre_match: "Pre-match clock", clock_period_unusable: "Clock period unusable",
+};
+const latencyLabels = {
+  feed_ingress_ms: "Feed ingress", feed_lag: "Feed ingress",
+  decision_ms: "Decision", paper_entry_ms: "Paper entry", paper_entry: "Paper entry",
+  order_arrival_ms: "Order arrival (K4)", order_arrival: "Order arrival (K4)",
+  paper_exit_ms: "Paper exit", paper_exit: "Paper exit",
+  match_response_ms: "Match-feed response", goal_provider_response: "Match-feed response",
+  match_clock_age_ms: "Match-clock age", scheduler_lag_ms: "Scheduler lag",
 };
 function humanOutcome(value) { return outcomeLabels[value] || String(value || "Unknown outcome").replaceAll("_", " "); }
 function humanExit(value) { return exitLabels[value] || String(value || "Unknown exit").replaceAll("_", " "); }
 function humanAssociation(value) { return associationLabels[value] || String(value || "unmatched").replaceAll("_", " "); }
+function humanClockGate(value) { return clockGateLabels[value] || String(value || "not recorded").replaceAll("_", " "); }
 function humanStatus(value) {
   const text = String(value || "unknown").replaceAll("_", " ");
   return text.charAt(0).toUpperCase() + text.slice(1);
@@ -170,6 +202,9 @@ function activateTab(name, focus = false) {
   document.querySelectorAll(".tab-panel").forEach(panel => { panel.hidden = panel.id !== `panel-${safeName}`; });
   history.replaceState(null, "", `#${safeName}`);
   if (safeName === "overview") requestAnimationFrame(renderEquity);
+  // Per-segment downloads are the fallback for when the full archive is
+  // impractical, so the list must be reachable without first building one.
+  if (safeName === "system") refreshRawSegments().catch(error => recordClientError("Raw segment listing", error));
 }
 function initializeTabs() {
   document.querySelectorAll("[data-tab]").forEach(button => {
@@ -198,6 +233,22 @@ function healthCheckLabel(key) {
     paper_execution: "Paper execution", database: "Database", credentials: "Credentials",
     recent_backend_faults: "Backend faults", dashboard_websocket: "Dashboard live link"})[key] || key.replaceAll("_", " ");
 }
+// Banner keys come from engine.status().health.banner; keep the literal
+// "ALL SYSTEMS GOOD" in JS so tests/test_frontend_contract.py can assert it.
+const bannerClass = {
+  all_systems_good: "healthy", evidence_not_ready: "collecting",
+  latency_breach: "fault", attention_required: "fault",
+};
+const bannerTitle = {
+  all_systems_good: "ALL SYSTEMS GOOD",
+  evidence_not_ready: "Runtime healthy · paper evidence not ready",
+  latency_breach: "Runtime healthy · execution latency breached",
+  attention_required: "ATTENTION REQUIRED",
+};
+const bannerChip = {
+  all_systems_good: "Healthy", evidence_not_ready: "Collecting evidence",
+  latency_breach: "Latency breach", attention_required: "Fault visible",
+};
 function renderHealth() {
   const panel = byId("health-panel");
   if (!panel) return;
@@ -206,24 +257,54 @@ function renderHealth() {
   checks.dashboard_websocket = {healthy: socketConnected, status: socketConnected ? "connected" : "disconnected"};
   const currentFaults = [...activeClientFaults.values()], rows = Object.entries(checks);
   const ready = state.hydrated && rows.length > 1;
-  const allHealthy = ready && rows.every(([, check]) => check.healthy) && currentFaults.length === 0;
-  panel.className = `health-panel ${!ready ? "checking" : allHealthy ? "healthy" : "fault"}`;
-  byId("health-title").textContent = !ready ? "Checking every connection" : allHealthy ? "ALL SYSTEMS GOOD" : "ATTENTION REQUIRED";
-  byId("health-indicator").textContent = !ready ? "Checking" : allHealthy ? "Healthy" : "Fault visible";
+  const runtimeOk = backend?.runtime_ok !== false;
+  const clientFault = currentFaults.length > 0;
+  // Banner state comes from backend when we have it; fall back to a conservative
+  // classification while checking or when a client-side fault has fired.
+  let banner = backend?.banner || "attention_required";
+  if (!ready) banner = "checking";
+  else if (clientFault && banner === "all_systems_good") banner = "attention_required";
+  else if (clientFault && banner === "evidence_not_ready") banner = "attention_required";
+  const kind = banner === "checking" ? "checking" : bannerClass[banner] || "fault";
+  const title = banner === "checking" ? "Checking every connection" :
+    (banner === "all_systems_good" ? "ALL SYSTEMS GOOD" : bannerTitle[banner] || "ATTENTION REQUIRED");
+  const chip = banner === "checking" ? "Checking" : bannerChip[banner] || "Fault visible";
+  panel.className = `health-panel ${kind}`;
+  byId("health-title").textContent = title;
+  byId("health-indicator").textContent = chip;
   const failed = rows.filter(([, check]) => !check.healthy).map(([key]) => healthCheckLabel(key));
-  byId("health-summary").textContent = !ready ? "Waiting for the first complete status response." : allHealthy ?
-    "Market stream, recorder, diagnostic feed, execution, database, and dashboard link report healthy." :
-    `Current issue${failed.length + currentFaults.length === 1 ? "" : "s"}: ${[...failed, ...currentFaults.map(row => row.component)].join(", ") || "see recent errors"}.`;
-  byId("health-checks").innerHTML = rows.map(([key, check]) => `<div class="health-check ${check.healthy ? "good" : "bad"}"><span>${escapeHtml(healthCheckLabel(key))}</span><strong>${escapeHtml(humanStatus(check.status))}</strong></div>`).join("");
+  const backendText = backend?.banner_text || "";
+  let summary;
+  if (!ready) summary = "Waiting for the first complete status response.";
+  else if (banner === "all_systems_good")
+    summary = "Market stream, recorder, diagnostic feed, execution, database, and dashboard link report healthy; execution latency is within threshold.";
+  else if (banner === "evidence_not_ready")
+    summary = backendText || "Runtime is healthy but K4 order-arrival latency is still collecting samples.";
+  else if (banner === "latency_breach")
+    summary = backendText || "Runtime is healthy but K4 order-arrival p95 exceeds its 250 ms threshold.";
+  else summary = `Current issue${failed.length + currentFaults.length === 1 ? "" : "s"}: ${[...failed, ...currentFaults.map(row => row.component)].join(", ") || "see recent errors"}.`;
+  byId("health-summary").textContent = summary;
+  byId("health-checks").innerHTML = rows.map(([key, check]) => {
+    const bits = [];
+    if (finite(check.p95_ms)) bits.push(`p95 ${check.p95_ms.toFixed(1)} ms`);
+    if (finite(check.threshold_ms)) bits.push(`threshold ${check.threshold_ms.toFixed(0)} ms`);
+    if (finite(check.n)) bits.push(`${integer(check.n)} samples`);
+    const detail = bits.length ? `<br><small>${escapeHtml(bits.join(" · "))}</small>` : "";
+    return `<div class="health-check ${check.healthy ? "good" : "bad"}"><span>${escapeHtml(healthCheckLabel(key))}</span><strong>${escapeHtml(humanStatus(check.status))}${detail}</strong></div>`;
+  }).join("");
   const errors = [...currentFaults, ...clientErrors, ...(backend?.recent_errors || [])]
     .sort((a, b) => (b.ts || 0) - (a.ts || 0))
     .filter((row, index, all) => index === all.findIndex(other => other.component === row.component && other.message === row.message && other.ts === row.ts)).slice(0, 20);
   byId("error-count").textContent = String(errors.length);
   byId("error-list").innerHTML = errors.length ? errors.map(row => `<div class="error-row"><strong>${escapeHtml(row.component || "system")}</strong> · ${escapeHtml(fullDate(row.ts))}<br>${escapeHtml(row.message || "Unknown error")}</div>`).join("") : '<div class="empty-state">No errors or disconnects have been reported.</div>';
-  if (errors.length && !allHealthy) byId("error-details").open = true;
+  if (errors.length && banner !== "all_systems_good") byId("error-details").open = true;
   const global = byId("global-health");
-  global.className = `health-link ${!ready ? "checking" : allHealthy ? "healthy" : "fault"}`;
-  byId("global-health-text").textContent = !ready ? "Checking systems" : allHealthy ? "All systems good" : `${errors.length + failed.length} issue${errors.length + failed.length === 1 ? "" : "s"}`;
+  global.className = `health-link ${kind}`;
+  byId("global-health-text").textContent = banner === "checking" ? "Checking systems" :
+    banner === "all_systems_good" ? "All systems good" :
+    banner === "evidence_not_ready" ? "Evidence collecting" :
+    banner === "latency_breach" ? "Latency breach" :
+    `${errors.length + failed.length} issue${errors.length + failed.length === 1 ? "" : "s"}`;
 }
 function renderRuntime() {
   const status = state.status || {};
@@ -267,12 +348,127 @@ function providerClock(normalized) {
   if (finite(normalized?.provider_minute)) return `${normalized.provider_minute}${finite(normalized.provider_stoppage) ? `+${normalized.provider_stoppage}` : ""}′`;
   return "Clock not supplied";
 }
+function clockStampBlock(stamp) {
+  // Persisted match-clock snapshot for one signal or trade. Legacy rows and
+  // unusable stamps stay honest — no fake minute is invented.
+  if (!stamp) return "";
+  const clock = providerClock(stamp);
+  const usable = stamp.usable_for_88_gate === true;
+  const reason = stamp.unusable_reason || (usable ? null : "not recorded");
+  const age = finite(stamp.age_ms) ? relativeMs(stamp.age_ms) : "age unavailable";
+  const precision = stamp.precision || "unknown precision";
+  const status = stamp.provider_status || "status unavailable";
+  const legacy = reason === "legacy_signal_recorded_before_clock_stamps";
+  const kind = usable ? "good" : legacy ? "warn" : "warn";
+  const outcome = stamp.gate_outcome || (usable ? "clock_88_plus" : reason ? `clock_${reason}` : null);
+  const chip = outcome ? `<span class="tag ${usable ? "good" : "warn"}">${escapeHtml(humanClockGate(outcome))}</span>` : "";
+  return `<div class="clock-stamp ${kind}"><div><span>Match clock</span><strong>${escapeHtml(clock)}</strong></div><div><span>Age</span><strong>${escapeHtml(age)}</strong></div><div><span>Precision</span><strong>${escapeHtml(precision.replaceAll("_", " "))}</strong></div><div><span>Provider status</span><strong>${escapeHtml(status)}</strong></div>${chip ? `<div><span>88+ gate</span><strong>${chip}</strong></div>` : ""}${legacy ? '<div class="clock-legacy">Legacy signal recorded before clock stamps were persisted.</div>' : ""}${!usable && !legacy && reason ? `<div class="clock-reason">${escapeHtml(reason.replaceAll("_", " "))}</div>` : ""}</div>`;
+}
+function tradeHighBlock(trade) {
+  // Executable held-side best bid after entry (never mid/ask/last/settlement).
+  if (trade.max_executable_bid == null && trade.mfe_c == null) return "";
+  const high = trade.max_executable_bid, highTs = trade.max_executable_bid_ts;
+  const mfe = trade.mfe_c, secondsAfter = trade.high_after_entry_s;
+  const mfeNet = finite(mfe) ? mfe : (finite(high) && finite(trade.entry_px) ? Math.max(0, high - trade.entry_px) : null);
+  return `<div class="trade-high"><div><span>Max executable bid</span><strong>${cents(high)}</strong></div><div><span>MFE from entry</span><strong>${finite(mfeNet) ? cents(mfeNet) : "Not observed"}</strong></div><div><span>UTC time of high</span><strong>${escapeHtml(fullDate(highTs))}</strong></div><div><span>After entry</span><strong>${finite(secondsAfter) ? duration(secondsAfter) : "not derived"}</strong></div></div>`;
+}
+const pathCache = new Map();   // trade id -> samples, filled on demand
+// The button carries a string id and trade.id is a number, so the cache was
+// written under one key and read under another: a successful fetch rendered
+// nothing at all. Every access normalizes the key.
+const pathKey = id => String(id);
+async function loadTradePath(tradeId) {
+  if (pathCache.has(pathKey(tradeId))) return pathCache.get(pathKey(tradeId));
+  const payload = await apiJson(`/api/trades/${encodeURIComponent(tradeId)}/path`);
+  pathCache.set(pathKey(tradeId), payload.samples || []);
+  return pathCache.get(pathKey(tradeId));
+}
+// A quote outage is a break in availability, not a straight line between the
+// prices either side of it. Each run of priced samples becomes its own subpath.
+function segmentsFromSamples(samples) {
+  const segments = [];
+  let current = null;
+  for (const row of samples || []) {
+    if (finite(row.bid)) {
+      if (!current) { current = []; segments.push(current); }
+      current.push(row);
+    } else {
+      current = null;
+    }
+  }
+  return segments;
+}
+function pathSparkline(trade) {
+  // The path is what a scalar high cannot show: whether the peak was a spike
+  // or a plateau, and whether it was reachable in the held size.  The list
+  // endpoint carries only the summary; samples arrive from the per-trade
+  // endpoint when the reader asks for them.
+  const summary = trade.bid_path_summary;
+  const samples = pathCache.get(pathKey(trade.id)) || [];
+  if (!summary) return "";
+  if (samples.length < 2) {
+    const reachablePending = finite(summary.peak_exec_px)
+      ? `${cents(summary.peak_exec_px)} for ${integer(trade.size)}` : "size not fillable at peak";
+    return `<div class="bid-path"><div class="bid-path-head"><span>Executable bid path</span><strong>${integer(summary.samples)} quotes over ${escapeHtml(duration((summary.span_ms || 0) / 1000))}</strong></div><button class="text-button" type="button" data-load-path="${escapeHtml(String(trade.id))}">Show path</button><div class="bid-path-facts"><div><span>Peak held</span><strong>${escapeHtml(relativeMs(summary.ms_at_peak))}</strong></div><div><span>Fillable at peak</span><strong>${escapeHtml(reachablePending)}</strong></div><div><span>Round trip</span><strong>${cents(summary.path_travelled_c)}</strong></div></div></div>`;
+  }
+  const width = 320, height = 64, pad = 4;
+  const segments = segmentsFromSamples(samples);
+  const priced = segments.flat();
+  if (priced.length < 2) return "";
+  const allTimes = samples.map(row => row.dt_ms).filter(finite);
+  const xs = priced.map(row => row.dt_ms), ys = priced.map(row => row.bid);
+  const minX = Math.min(...allTimes), maxX = Math.max(...allTimes);
+  const minY = Math.min(...ys, trade.entry_px), maxY = Math.max(...ys, trade.entry_px);
+  const spanX = maxX - minX || 1, spanY = maxY - minY || 1;
+  const px = value => pad + (value - minX) / spanX * (width - pad * 2);
+  const py = value => pad + (maxY - value) / spanY * (height - pad * 2);
+  // One M...L... subpath per segment; never an L across an outage.
+  const d = segments.map(segment => segment.map((row, index) =>
+    `${index ? "L" : "M"}${px(row.dt_ms).toFixed(1)},${py(row.bid).toFixed(1)}`).join(" ")).join(" ");
+  const gapNote = finite(summary.gap_count) && summary.gap_count > 0
+    ? ` · ${integer(summary.gap_count)} gap${summary.gap_count === 1 ? "" : "s"} (${escapeHtml(relativeMs(summary.gap_duration_ms))} unquotable)`
+    : "";
+  const truncatedNote = summary.truncated
+    ? ` · truncated, ${integer(summary.dropped_samples)} dropped` : "";
+  const entryY = py(trade.entry_px).toFixed(1);
+  const peakX = px(summary.peak_dt_ms).toFixed(1), peakY = py(summary.peak_bid).toFixed(1);
+  const terminal = [...samples].reverse().find(row => row.terminal || row.availability === "terminal");
+  const terminalX = terminal && finite(terminal.dt_ms) ? px(terminal.dt_ms).toFixed(1) : null;
+  const terminalMarker = terminalX == null ? "" : `<line class="bid-path-terminal" x1="${terminalX}" x2="${terminalX}" y1="${pad}" y2="${height - pad}"/>`;
+  const reachable = finite(summary.peak_exec_px) && finite(summary.peak_bid)
+    ? `${cents(summary.peak_exec_px)} for ${integer(trade.size)}`
+    : "size not fillable at peak";
+  const efficiency = finite(summary.path_efficiency)
+    ? `${(summary.path_efficiency * 100).toFixed(0)}% direct`
+    : "path efficiency unavailable";
+  return `<div class="bid-path"><div class="bid-path-head"><span>Executable bid path</span><strong>${integer(summary.samples)} quotes over ${escapeHtml(duration((summary.span_ms || 0) / 1000))}${gapNote}${truncatedNote}</strong></div><svg class="bid-path-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="Held-side executable bid path with entry, peak, gaps and end-of-availability"><line class="bid-path-entry" x1="${pad}" x2="${width - pad}" y1="${entryY}" y2="${entryY}"/>${terminalMarker}<path class="bid-path-line" d="${d}"/><circle class="bid-path-peak" cx="${peakX}" cy="${peakY}" r="3.5"/></svg><div class="bid-path-legend" aria-label="Path chart legend"><span><i class="legend-entry"></i>Entry price</span><span><i class="legend-path"></i>Executable bid</span><span><i class="legend-peak"></i>Peak executable bid</span><span><i class="legend-terminal"></i>End of availability</span></div><p class="bid-path-note">The terminal marker is time only; the exit price is not plotted as a bid.</p><div class="bid-path-facts"><div><span>Peak held</span><strong>${escapeHtml(relativeMs(summary.ms_at_peak))}</strong></div><div><span>Fillable at peak</span><strong>${escapeHtml(reachable)}</strong></div><div><span>Round trip</span><strong>${cents(summary.path_travelled_c)} · ${escapeHtml(efficiency)}</strong></div></div></div>`;
+}
+function lossPath(trade) {
+  // Losing trades expose entry → high → exit so the missed profit is legible.
+  if ((trade.net || 0) >= 0) return "";
+  const high = trade.max_executable_bid;
+  const highSuffix = finite(trade.high_after_entry_s) ? `<br><small>${escapeHtml(duration(trade.high_after_entry_s))} after entry</small>` : "";
+  return `<div class="loss-path"><div><span>Entry</span><strong>${cents(trade.entry_px)}</strong></div><div><span>Executable high</span><strong>${cents(high)}${highSuffix}</strong></div><div><span>Exit</span><strong>${cents(trade.exit_px)}<br><small>${escapeHtml(humanExit(trade.exit_reason))}</small></strong></div></div>`;
+}
 
 function outcomeGroup(row, isTrade = false) {
   if (isTrade) return (row.net || 0) >= 0 ? "profitable" : "loss";
   return ["filled", "queued", "executing"].includes(row.outcome) ? "executed" : "declined";
 }
 function rowTimestamp(row) { return row.entry_ts || row.local_ts || row.ts || row.observed_ts || 0; }
+function gateOutcome(row) {
+  // Trade or signal → normalized 88-gate outcome (e.g. "clock_88_plus", "clock_pre_88").
+  const inference = row.trigger?.price_only_inference || {};
+  const trigger = inference.match_clock_gate?.outcome;
+  if (trigger) return trigger;
+  const stamp = row.match_clock || {};
+  if (stamp.gate_outcome) return stamp.gate_outcome;
+  const outcome = row.outcome || row.exit_reason || "";
+  if (typeof outcome === "string" && outcome.startsWith("sleeve_clock_")) return outcome.slice("sleeve_".length);
+  if (stamp.usable_for_88_gate === true) return "clock_88_plus";
+  if (stamp.unusable_reason) return "clock_" + stamp.unusable_reason;
+  return null;
+}
 function passesFilters(row, isTrade = false) {
   const searchable = [row.display_game, row.display_contract, row.display_leg, row.market, row.event, row.series, row.outcome, row.exit_reason,
     row.matched_event?.canonical_event?.human_label, row.matched_event?.canonical_event?.provider_description].join(" ").toLowerCase();
@@ -282,6 +478,12 @@ function passesFilters(row, isTrade = false) {
   if (filters.result !== "all" && outcomeGroup(row, isTrade) !== filters.result) return false;
   const association = row.matched_event?.association || "unmatched";
   if (filters.association !== "all" && association !== filters.association) return false;
+  if (filters.gate && filters.gate !== "all") {
+    const outcome = gateOutcome(row);
+    if (filters.gate === "accepted" && outcome !== "clock_88_plus") return false;
+    if (filters.gate === "declined" && (!outcome || outcome === "clock_88_plus")) return false;
+    if (filters.gate !== "accepted" && filters.gate !== "declined" && outcome !== filters.gate) return false;
+  }
   if (filters.period !== "all") {
     const seconds = timestampSeconds(rowTimestamp(row)), cutoff = Date.now() / 1000 - Number(filters.period) * 86400;
     if (seconds == null || seconds < cutoff) return false;
@@ -294,7 +496,11 @@ function filterOptions() {
     .map(name => `<option value="${escapeHtml(name)}" ${filters.match === name ? "selected" : ""}>${escapeHtml(name)}</option>`).join("");
 }
 function filterMarkup(scope, visible, total) {
-  return `<label class="filter-field">Search<input type="search" data-filter-field="query" value="${escapeHtml(filters.query)}" placeholder="Team, contract, event"></label><label class="filter-field">Sleeve<select data-filter-field="strategy"><option value="all">Both sleeves</option><option value="gate_a" ${filters.strategy === "gate_a" ? "selected" : ""}>Gate A</option><option value="price_only_late_score" ${filters.strategy === "price_only_late_score" ? "selected" : ""}>Price-only</option></select></label><label class="filter-field">Match<select data-filter-field="match"><option value="all">All matches</option>${filterOptions()}</select></label><label class="filter-field">Result<select data-filter-field="result"><option value="all">All results</option><option value="executed" ${filters.result === "executed" ? "selected" : ""}>Executed signals</option><option value="declined" ${filters.result === "declined" ? "selected" : ""}>Declined signals</option><option value="profitable" ${filters.result === "profitable" ? "selected" : ""}>Profitable trades</option><option value="loss" ${filters.result === "loss" ? "selected" : ""}>Losing trades</option></select></label><label class="filter-field">Event link<select data-filter-field="association"><option value="all">All associations</option>${Object.entries(associationLabels).map(([key, label]) => `<option value="${key}" ${filters.association === key ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}</select></label><label class="filter-field">Period<select data-filter-field="period"><option value="all">All recorded time</option><option value="1" ${filters.period === "1" ? "selected" : ""}>Last 24 hours</option><option value="7" ${filters.period === "7" ? "selected" : ""}>Last 7 days</option><option value="30" ${filters.period === "30" ? "selected" : ""}>Last 30 days</option></select></label><button class="reset-filter" data-reset-filters type="button">Reset</button><div class="filter-count">Showing ${integer(visible)} of ${integer(total)} ${scope}. Filters apply to both audit views.</div>`;
+  const gateOptions = [
+    ["accepted", "88+ gate accepted"], ["declined", "88+ gate declined"],
+    ...Object.entries(clockGateLabels),
+  ];
+  return `<label class="filter-field">Search<input type="search" data-filter-field="query" value="${escapeHtml(filters.query)}" placeholder="Team, contract, event"></label><label class="filter-field">Sleeve<select data-filter-field="strategy"><option value="all">Both sleeves</option><option value="gate_a" ${filters.strategy === "gate_a" ? "selected" : ""}>Gate A</option><option value="price_only_late_score" ${filters.strategy === "price_only_late_score" ? "selected" : ""}>Price-only</option></select></label><label class="filter-field">Match<select data-filter-field="match"><option value="all">All matches</option>${filterOptions()}</select></label><label class="filter-field">Result<select data-filter-field="result"><option value="all">All results</option><option value="executed" ${filters.result === "executed" ? "selected" : ""}>Executed signals</option><option value="declined" ${filters.result === "declined" ? "selected" : ""}>Declined signals</option><option value="profitable" ${filters.result === "profitable" ? "selected" : ""}>Profitable trades</option><option value="loss" ${filters.result === "loss" ? "selected" : ""}>Losing trades</option></select></label><label class="filter-field">88+ clock gate<select data-filter-field="gate"><option value="all">Any gate outcome</option>${gateOptions.map(([key, label]) => `<option value="${key}" ${filters.gate === key ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}</select></label><label class="filter-field">Event link<select data-filter-field="association"><option value="all">All associations</option>${Object.entries(associationLabels).map(([key, label]) => `<option value="${key}" ${filters.association === key ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}</select></label><label class="filter-field">Period<select data-filter-field="period"><option value="all">All recorded time</option><option value="1" ${filters.period === "1" ? "selected" : ""}>Last 24 hours</option><option value="7" ${filters.period === "7" ? "selected" : ""}>Last 7 days</option><option value="30" ${filters.period === "30" ? "selected" : ""}>Last 30 days</option></select></label><button class="reset-filter" data-reset-filters type="button">Reset</button><div class="filter-count">Showing ${integer(visible)} of ${integer(total)} ${scope}. Filters apply to both audit views.</div>`;
 }
 function bindFilters() {
   document.querySelectorAll("[data-filter-field]").forEach(control => control.addEventListener(control.type === "search" ? "input" : "change", () => {
@@ -308,7 +514,7 @@ function bindFilters() {
     }
   }));
   document.querySelectorAll("[data-reset-filters]").forEach(button => button.addEventListener("click", () => {
-    Object.assign(filters, {query: "", strategy: "all", match: "all", result: "all", association: "all", period: "all"});
+    Object.assign(filters, {query: "", strategy: "all", match: "all", result: "all", association: "all", gate: "all", period: "all"});
     renderFilters(); renderTrades(); renderSignals();
   }));
 }
@@ -355,7 +561,12 @@ function tradeTimeline(trade) {
 }
 function tradeCard(trade) {
   const matched = trade.matched_event || {};
-  return `<article class="trade-story ${strategyClass(trade.strategy)}"><div class="trade-core"><div class="trade-title-row"><div><h3>${escapeHtml(trade.display_game || "Unnamed match")}</h3><p class="contract-line">${escapeHtml(trade.display_contract || trade.display_leg || "Unnamed contract")} · ${escapeHtml(leagueName(trade.series))}</p></div><span class="tag ${strategyClass(trade.strategy) === "price" ? "info" : "warn"}">${escapeHtml(strategyLabel(trade.strategy))}</span></div><div class="sleeve-net ${(trade.net || 0) >= 0 ? "positive" : "negative"}">${money(trade.net || 0)}</div><p class="muted">Net after ${money(-(trade.fees || 0))} fees</p><div class="trade-economics"><div><span>Entry → exit</span><strong>${cents(trade.entry_px)} → ${cents(trade.exit_px)}</strong></div><div><span>Contracts</span><strong>${integer(trade.size)}</strong></div><div><span>Gross</span><strong>${money(trade.gross || 0)}</strong></div></div><div class="trade-reason"><strong>${escapeHtml(humanExit(trade.exit_reason))}</strong><br>${escapeHtml(triggerSummary(trade.trigger))}</div></div><div class="trade-audit">${eventAssociationBlock(matched)}${tradeTimeline(trade)}<div class="audit-footer">${rawDetails("Raw identifiers and audit record", {trade_id: trade.id, signal_id: trade.signal_id, market: trade.market, event: trade.event, series: trade.series, trigger: trade.trigger, schedule_window: trade.schedule_window, matched_event: matched})}</div></div></article>`;
+  const matchTime = shortDate(trade.entry_ts || trade.timing?.entry_ts || trade.exit_ts);
+  const clock = clockStampBlock(trade.match_clock);
+  const highBlock = tradeHighBlock(trade);
+  const loss = lossPath(trade);
+  const spark = pathSparkline(trade);
+  return `<article class="trade-story ${strategyClass(trade.strategy)}"><div class="trade-core"><div class="trade-title-row"><div><h3>${escapeHtml(trade.display_game || "Unnamed match")}</h3><p class="contract-line">${escapeHtml(trade.display_contract || trade.display_leg || "Unnamed contract")} · ${escapeHtml(leagueName(trade.series))} · ${escapeHtml(matchTime)}</p></div><span class="tag ${strategyClass(trade.strategy) === "price" ? "info" : "warn"}">${escapeHtml(strategyLabel(trade.strategy))}</span></div><div class="sleeve-net ${(trade.net || 0) >= 0 ? "positive" : "negative"}">${money(trade.net || 0)}</div><p class="muted">Net after ${money(-(trade.fees || 0))} fees</p><div class="trade-economics"><div><span>Entry → exit</span><strong>${cents(trade.entry_px)} → ${cents(trade.exit_px)}</strong></div><div><span>Contracts</span><strong>${integer(trade.size)}</strong></div><div><span>Gross</span><strong>${money(trade.gross || 0)}</strong></div></div>${loss}${spark}${clock}${highBlock}<div class="trade-reason"><strong>${escapeHtml(humanExit(trade.exit_reason))}</strong><br>${escapeHtml(triggerSummary(trade.trigger))}</div></div><div class="trade-audit">${eventAssociationBlock(matched)}${tradeTimeline(trade)}<div class="audit-footer">${rawDetails("Raw identifiers and audit record", {trade_id: trade.id, signal_id: trade.signal_id, market: trade.market, event: trade.event, series: trade.series, trigger: trade.trigger, schedule_window: trade.schedule_window, matched_event: matched, match_clock: trade.match_clock, max_executable_bid: trade.max_executable_bid, max_executable_bid_ts: trade.max_executable_bid_ts, mfe_c: trade.mfe_c, high_after_entry_s: trade.high_after_entry_s})}</div></div></article>`;
 }
 function renderTrades() {
   const rows = (state.trades.closed || []).filter(row => passesFilters(row, true));
@@ -396,7 +607,9 @@ function thresholdItems(signal) {
 }
 function signalCard(signal) {
   const matched = signal.matched_event || {}, group = outcomeGroup(signal), event = matched.canonical_event;
-  return `<article class="decision-card"><div class="story-summary"><div><h3>${escapeHtml(signal.display_game || "Unnamed match")}</h3><p class="contract-line">${escapeHtml(signal.display_contract || signal.display_leg || "Unnamed contract")} · ${escapeHtml(strategyLabel(signal.strategy))}</p></div><span class="tag ${group === "executed" ? "good" : signal.outcome === "execution_error" ? "bad" : "warn"}">${escapeHtml(humanOutcome(signal.outcome))}</span></div><p class="decision-sentence">${escapeHtml(decisionSentence(signal))}</p><div class="decision-meta"><span>${escapeHtml(fullDate(signal.local_ts))}</span><span>·</span><span>${escapeHtml(humanAssociation(matched.association || "unmatched"))}</span>${event ? `<span>·</span><span>${escapeHtml(event.human_label)} at ${escapeHtml(providerClock(event))}</span>` : ""}</div><div class="threshold-grid">${thresholdItems(signal)}</div>${signal.outcome === "sleeve_outside_window" ? `<div class="schedule-warning"><strong>Timing-proxy rejection:</strong> expected market expiration ${escapeHtml(signal.schedule_window?.expected_expiration_time || "not supplied")}; ${escapeHtml(signal.schedule_window?.assumption || "Schedule proxy only; not a verified live match clock.")}</div>` : ""}${rawDetails("Raw identifiers, thresholds, and event audit", {signal_id: signal.id, market: signal.market, event: signal.event, series: signal.series, outcome: signal.outcome, trigger: signal.trigger, schedule_window: signal.schedule_window, matched_event: matched})}</article>`;
+  const gate = gateOutcome(signal);
+  const gateChip = gate ? `<span>·</span><span class="tag ${gate === "clock_88_plus" ? "good" : "warn"}">${escapeHtml(humanClockGate(gate))}</span>` : "";
+  return `<article class="decision-card"><div class="story-summary"><div><h3>${escapeHtml(signal.display_game || "Unnamed match")}</h3><p class="contract-line">${escapeHtml(signal.display_contract || signal.display_leg || "Unnamed contract")} · ${escapeHtml(strategyLabel(signal.strategy))}</p></div><span class="tag ${group === "executed" ? "good" : signal.outcome === "execution_error" ? "bad" : "warn"}">${escapeHtml(humanOutcome(signal.outcome))}</span></div><p class="decision-sentence">${escapeHtml(decisionSentence(signal))}</p><div class="decision-meta"><span>${escapeHtml(fullDate(signal.local_ts))}</span><span>·</span><span>${escapeHtml(humanAssociation(matched.association || "unmatched"))}</span>${event ? `<span>·</span><span>${escapeHtml(event.human_label)} at ${escapeHtml(providerClock(event))}</span>` : ""}${gateChip}</div>${clockStampBlock(signal.match_clock)}<div class="threshold-grid">${thresholdItems(signal)}</div>${signal.outcome === "sleeve_outside_window" ? `<div class="schedule-warning"><strong>Timing-proxy rejection:</strong> expected market expiration ${escapeHtml(signal.schedule_window?.expected_expiration_time || "not supplied")}; ${escapeHtml(signal.schedule_window?.assumption || "Schedule proxy only; not a verified live match clock.")}</div>` : ""}${rawDetails("Raw identifiers, thresholds, and event audit", {signal_id: signal.id, market: signal.market, event: signal.event, series: signal.series, outcome: signal.outcome, trigger: signal.trigger, schedule_window: signal.schedule_window, matched_event: matched, match_clock: signal.match_clock})}</article>`;
 }
 function renderSignals() {
   const rows = (state.signals || []).filter(row => passesFilters(row, false));
@@ -430,6 +643,25 @@ function renderTimingDiagnostics() {
     return `<div class="timing-row"><div><strong>${escapeHtml(signal.display_game || "Unnamed match")}</strong><p>${escapeHtml(event.human_label)}${event.provider_description ? ` · ${escapeHtml(event.provider_description)}` : ""}</p></div><span>${escapeHtml(providerClock(event))}</span><span>${escapeHtml(distance)}<br><small>Schedule proxy, not live match time</small></span><span class="tag ${inside ? "good" : "warn"}">${inside ? "Inside window" : escapeHtml(humanOutcome(signal.outcome))}</span></div>`;
   }).join("");
   byId("timing-diagnostics").innerHTML = `<div class="timing-summary-grid">${summaries}</div><p class="timing-subheading">Recent paired observations</p>${cases}`;
+}
+function providerEventRow(row) {
+  const normalized = row.normalized_event || {};
+  const kind = String(row.canonical_type || normalized.canonical_type || "provider.unknown");
+  const tone = kind.startsWith("goal.disallowed") || kind.startsWith("var.") ? "warn"
+    : kind.startsWith("score.correction") ? "warn"
+    : kind.startsWith("goal.") || kind.startsWith("penalty.scored") ? "good" : "info";
+  const revises = row.previous_fingerprint
+    ? `<p class="event-note">Revises earlier observation ${escapeHtml(String(row.previous_fingerprint).slice(0, 12))}…</p>` : "";
+  const uncertainty = finite(row.previous_poll_ts) && finite(row.first_observed_ts)
+    ? `poll uncertainty ${relativeMs((row.first_observed_ts - row.previous_poll_ts) * 1000)}` : "poll uncertainty unavailable";
+  return `<article class="event-row"><time datetime="${escapeHtml(fullDate(row.first_observed_ts))}">${escapeHtml(fullDate(row.first_observed_ts))}<br>First observed</time><div><strong>${escapeHtml(row.display_game || row.event || "Unnamed match")}</strong><p>${escapeHtml(kind.replaceAll(".", " "))} · ${escapeHtml(providerClock(row))}${normalized.scorer ? ` · ${escapeHtml(normalized.scorer)}` : ""}</p><p>${escapeHtml(normalized.provider_description || normalized.human_label || "Provider supplied no narrative.")}</p><p class="event-note">${escapeHtml(uncertainty)}. Provider receipt is not the on-field occurrence time.</p>${revises}</div><span class="tag ${tone}">${escapeHtml(kind.split(".")[0])}</span>${rawDetails("Raw provider payload", {id: row.id, fingerprint: row.fingerprint, previous_fingerprint: row.previous_fingerprint, canonical_type: kind, normalized_event: normalized, raw_payload: row.raw_payload})}</article>`;
+}
+function renderProviderEvents() {
+  const holder = byId("provider-event-list");
+  if (!holder) return;
+  const rows = state.providerEvents || [];
+  holder.innerHTML = rows.length ? rows.map(providerEventRow).join("")
+    : '<div class="empty-state">No canonical provider events recorded. Goals, cards, VAR and corrections appear here once the feed reports them.</div>';
 }
 function renderEvents() {
   const rows = state.events || [];
@@ -529,11 +761,58 @@ function renderPositions() {
   const rows = state.trades.open || [];
   byId("position-list").innerHTML = rows.length ? rows.map(position => `<div class="position-row"><div class="metric-inline"><strong>${escapeHtml(position.display_game || "Unnamed match")}</strong><span class="tag ${strategyClass(position.strategy) === "price" ? "info" : "warn"}">${escapeHtml(strategyLabel(position.strategy))}</span></div><p>${escapeHtml(position.display_contract || position.display_leg || "Unnamed contract")} · ${integer(position.remaining ?? position.size)} contracts remaining · entry ${cents(position.entry_px)} · best bid ${cents(position.best_bid)}</p><strong class="${(position.upnl || 0) >= 0 ? "positive" : "negative"}">${money(position.upnl || 0)} open mark</strong>${rawDetails("Raw identifiers", {trade_id: position.id, signal_id: position.signal_id, market: position.market, event: position.event, series: position.series})}</div>`).join("") : '<div class="empty-state">No open paper positions.</div>';
 }
+const LATENCY_STATE_TAG = {PASS: "good", BREACH: "bad", COLLECTING: "warn", STALE: "warn", INVALID: "bad"};
+// Canonical kinds are named in tests/test_health.py / app/store.py; render every
+// kind including COLLECTING and STALE so K4 is never hidden by a global LIMIT.
+const CANONICAL_LATENCY_KINDS = [
+  "order_arrival_ms", "paper_entry_ms", "paper_exit_ms", "decision_ms",
+  "feed_ingress_ms", "match_response_ms", "match_clock_age_ms", "scheduler_lag_ms",
+];
+function latencyLabel(kind) { return latencyLabels[kind] || String(kind || "unknown").replaceAll("_", " "); }
 function renderLatency() {
-  const definitions = [["order_arrival", "Trigger → paper arrival"], ["paper_entry", "Queued order → fill"], ["paper_exit", "Exit decision → fill"], ["feed_lag", "Exchange timestamp → service"], ["goal_provider_response", "Match-feed response"]];
-  const rows = definitions.map(([key, label]) => ({key, label, ...(state.latency[key] || {})})).filter(row => row.n);
-  const max = Math.max(1, ...rows.map(row => row.p95 ?? row.p50 ?? 0));
-  byId("latency-chart").innerHTML = rows.length ? rows.map(row => `<div class="bar-row"><span class="bar-label">${escapeHtml(row.label)}<br><small>${integer(row.n)} samples</small></span><div class="bar-track"><div class="bar-fill" style="width:${Math.max(2, (row.p95 ?? row.p50 ?? 0) / max * 100).toFixed(1)}%"></div></div><strong class="bar-value">p50 ${finite(row.p50) ? row.p50.toFixed(1) : "—"} ms<br><small>p95 ${finite(row.p95) ? row.p95.toFixed(1) : "collecting"}</small></strong></div>`).join("") : '<div class="empty-state">Latency samples are still collecting.</div>';
+  const rows = CANONICAL_LATENCY_KINDS.map(kind => ({kind, label: latencyLabel(kind), ...(state.latency[kind] || {kind, state: "COLLECTING", n: 0})}));
+  const barable = rows.filter(row => finite(row.p95) || finite(row.p50));
+  const max = Math.max(1, ...barable.map(row => row.p95 ?? row.p50 ?? 0));
+  byId("latency-chart").innerHTML = barable.length ? barable.map(row => `<div class="bar-row"><span class="bar-label">${escapeHtml(row.label)}<br><small>${integer(row.n)} samples · ${escapeHtml(row.state || "COLLECTING")}</small></span><div class="bar-track"><div class="bar-fill ${row.state === "BREACH" ? "negative" : ""}" style="width:${Math.max(2, (row.p95 ?? row.p50 ?? 0) / max * 100).toFixed(1)}%"></div></div><strong class="bar-value">p50 ${finite(row.p50) ? row.p50.toFixed(1) : "—"} ms<br><small>p95 ${finite(row.p95) ? row.p95.toFixed(1) : "collecting"}</small></strong></div>`).join("") : '<div class="empty-state">Latency samples are still collecting.</div>';
+  byId("latency-table").innerHTML = `<table><thead><tr><th>Metric</th><th class="numeric">n</th><th class="numeric">p50 ms</th><th class="numeric">p95 ms</th><th class="numeric">max ms</th><th class="numeric">Age</th><th class="numeric">Threshold</th><th>State</th></tr></thead><tbody>${rows.map(row => `<tr><td data-label="Metric"><strong>${escapeHtml(row.label)}</strong></td><td data-label="n" class="numeric">${integer(row.n || 0)}</td><td data-label="p50 ms" class="numeric">${finite(row.p50) ? row.p50.toFixed(1) : "—"}</td><td data-label="p95 ms" class="numeric ${row.state === "BREACH" ? "negative" : ""}">${finite(row.p95) ? row.p95.toFixed(1) : "—"}</td><td data-label="max ms" class="numeric">${finite(row.max) ? row.max.toFixed(1) : "—"}</td><td data-label="Age" class="numeric">${finite(row.age_s) ? duration(row.age_s) : "—"}</td><td data-label="Threshold" class="numeric">${finite(row.threshold_ms) ? `${row.threshold_ms.toFixed(0)} ms` : "—"}</td><td data-label="State"><span class="tag ${LATENCY_STATE_TAG[row.state] || "warn"}">${escapeHtml(row.state || "COLLECTING")}</span></td></tr>`).join("")}</tbody></table>`;
+}
+function renderClockCoverage() {
+  const coverage = state.status?.clock_coverage || {};
+  const cells = [
+    ["Watched matches", coverage.watched],
+    ["Mapped to live clock", coverage.mapped],
+    ["Clock present", coverage.clock_present],
+    ["Clock fresh", coverage.clock_fresh],
+    ["88+ gate misses", coverage.clock_gate_candidate_misses],
+  ];
+  byId("clock-coverage").innerHTML = cells.map(([label, value]) => `<div class="metric-cell"><span>${escapeHtml(label)}</span><strong>${integer(value || 0)}</strong></div>`).join("");
+  const faults = coverage.faults || [], mapping = coverage.mapping_errors || [];
+  if (!faults.length && !mapping.length) {
+    byId("clock-faults").innerHTML = '<div class="empty-state">No live-clock faults reported for watched matches.</div>';
+    return;
+  }
+  byId("clock-faults").innerHTML = [
+    ...faults.map(row => `<div class="clock-fault-row warn"><strong>${escapeHtml(row.event || "unknown event")}</strong><span>${escapeHtml(String(row.reason || "unknown reason").replaceAll("_", " "))}</span></div>`),
+    ...mapping.map(row => `<div class="clock-fault-row bad"><strong>${escapeHtml(row.event || "unknown event")}</strong><span>Mapping error: ${escapeHtml(String(row.error || "unknown"))}</span></div>`),
+  ].join("");
+}
+function renderClockObservations() {
+  // The persisted observation timeline is the middle link in the lineage the
+  // reviewer has to trace: raw provider payload -> normalized observation ->
+  // immutable signal stamp -> 88 gate.
+  const holder = byId("clock-observations");
+  if (!holder) return;
+  const rows = (state.clocks?.observations || []).slice(0, 12);
+  if (!rows.length) {
+    holder.innerHTML = '<div class="empty-state">No match-clock observations persisted yet.</div>';
+    return;
+  }
+  holder.innerHTML = `<p class="timing-subheading">Recent persisted clock observations</p>${rows.map(row => {
+    const clock = providerClock(row);
+    const status = row.provider_status || "status unavailable";
+    const period = row.provider_period || "period unavailable";
+    return `<div class="clock-observation-row"><span><strong>${escapeHtml(row.event || "unknown event")}</strong><br><small>${escapeHtml(fullDate(row.observed_ts))}</small></span><span>${escapeHtml(clock)}</span><span>${escapeHtml(period)} · ${escapeHtml(status)}</span></div>`;
+  }).join("")}`;
 }
 function renderEvidence() {
   const cards = [];
@@ -555,15 +834,15 @@ function renderActivity() {
 }
 function renderAll() {
   renderHealth(); renderRuntime(); renderSleeves(); renderFilters(); renderTrades(); renderSignals(); renderEvents();
-  renderTimingDiagnostics();
+  renderTimingDiagnostics(); renderProviderEvents();
   renderEquity(); renderAssociationChart(); renderExitChart(); renderFeaturedTrades(); renderPositions(); renderLeagues();
-  renderMatches(); renderLatency(); renderEvidence(); renderActivity();
+  renderMatches(); renderLatency(); renderClockCoverage(); renderClockObservations(); renderEvidence(); renderActivity();
 }
 
 async function refreshAll() {
   if (refreshInFlight) return;
   refreshInFlight = true;
-  const requests = [["status", "/api/status"], ["config", "/api/config"], ["matches", "/api/matches"], ["trades", "/api/trades?limit=500"], ["signals", "/api/signals?limit=500"], ["stats", "/api/stats"], ["events", "/api/goal-latency?limit=200"], ["latency", "/api/latency"], ["equity", "/api/equity"], ["activity", "/api/eventlog?limit=100"]];
+  const requests = [["status", "/api/status"], ["config", "/api/config"], ["matches", "/api/matches"], ["trades", "/api/trades?limit=500"], ["signals", "/api/signals?limit=500"], ["stats", "/api/stats"], ["events", "/api/goal-latency?limit=200"], ["latency", "/api/latency"], ["equity", "/api/equity"], ["activity", "/api/eventlog?limit=100"], ["clocks", "/api/match-clocks?limit=60"], ["providerEvents", "/api/provider-events?limit=120"]];
   try {
     const results = await Promise.allSettled(requests.map(([, path]) => apiJson(path)));
     results.forEach((result, index) => {
@@ -611,48 +890,151 @@ async function adminPost(path, body) {
   try {
     const response = await fetch(path, {method: "POST", headers: {"Content-Type": "application/json", "X-Admin-Token": token}, body: body == null ? null : JSON.stringify(body)});
     if (!response.ok) {
+      // Only an explicit auth failure invalidates the token. The kill switch
+      // runs this path, and a transient 5xx must not wipe the operator's token
+      // mid-incident and force a re-prompt.
+      if (response.status === 401) sessionStorage.removeItem("footballbot_admin_token");
       const payload = await response.json().catch(error => ({detail: `Unable to read error response: ${error.message}`}));
       throw new Error(payload.detail || `${response.status} ${response.statusText}`);
     }
     clearClientFault(`Admin ${path}`);
     return await response.json();
-  } catch (error) { sessionStorage.removeItem("footballbot_admin_token"); recordClientError(`Admin ${path}`, error); return null; }
+  } catch (error) { recordClientError(`Admin ${path}`, error); return null; }
 }
-async function downloadExport() {
+// One in-flight export at a time per scope; the cancel button targets it.
+const activeExports = new Map(); // scope → {jobId, controller}
+const EXPORT_ORIGINAL_LABEL = {
+  "export-button": "Download audit data",
+  "export-audit-button": "Download audit bundle",
+  "export-full-button": "Prepare full raw handoff",
+  "export-archive-button": "Prepare all-mode archive",
+};
+function exportProgressText(job) {
+  const bits = [];
+  if (job.total_bytes) bits.push(`${formatBytes(job.processed_bytes || 0)} / ${formatBytes(job.total_bytes)}`);
+  if (job.total_segments) bits.push(`${integer(job.processed_segments || 0)} / ${integer(job.total_segments)} raw segments`);
+  return bits.join(" · ");
+}
+function setExportButtonsDisabled(disabled) {
+  document.querySelectorAll("[data-export-scope]").forEach(button => { button.disabled = disabled; });
+}
+function resetExportButtonLabels() {
+  Object.entries(EXPORT_ORIGINAL_LABEL).forEach(([id, label]) => { const button = byId(id); if (button) button.textContent = label; });
+}
+async function timedFetch(url, options = {}, timeoutMs = 15000) {
+  // Local AbortController per request so a hung status poll cannot wedge the loop.
+  // Caller-supplied signal (for user-driven cancel) still takes precedence.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error(`request timed out after ${timeoutMs} ms`)), timeoutMs);
+  const upstream = options.signal;
+  // {once:true} only detaches after the listener fires, so a poll loop that
+  // completes normally would leave one listener per iteration on the caller's
+  // signal. Detach explicitly instead.
+  const forward = () => controller.abort(upstream.reason);
+  if (upstream) upstream.addEventListener("abort", forward, {once: true});
+  try {
+    return await fetch(url, {...options, signal: controller.signal});
+  } finally {
+    clearTimeout(timer);
+    if (upstream) upstream.removeEventListener("abort", forward);
+  }
+}
+async function readExportError(response) {
+  try { return (await response.json()).detail || `${response.status} ${response.statusText}`; }
+  catch (error) { return `${response.status} ${response.statusText} (body unreadable: ${error.message})`; }
+}
+async function downloadExport(scope = "audit") {
+  scope = ["audit", "full", "archive"].includes(scope) ? scope : "audit";
   let token = sessionStorage.getItem("footballbot_admin_token");
-  if (!token) token = window.prompt("Admin token for protected study download");
+  if (!token) token = window.prompt(scope === "archive" ?
+    "Admin token for the all-mode archival handoff" : scope === "full" ?
+    "Admin token for the full raw handoff (multi-GB export, cancellable)" :
+    "Admin token for the audit bundle download");
   if (!token) return;
   sessionStorage.setItem("footballbot_admin_token", token);
-  const buttons = [byId("export-button"), ...document.querySelectorAll("[data-export-trigger]")];
-  buttons.forEach(button => { button.disabled = true; button.textContent = "Preparing data…"; });
+  if (activeExports.has(scope)) { showToast(`A ${scope} export is already running; cancel it first.`, true); return; }
+  const controller = new AbortController();
+  const cancelButton = byId("export-cancel-button");
+  const progress = byId("export-progress"), errorLabel = byId("export-error");
+  progress.hidden = true; errorLabel.hidden = true;
+  setExportButtonsDisabled(true);
+  if (scope !== "audit" && cancelButton) cancelButton.hidden = false;
+  const headers = {"X-Admin-Token": token};
+  const buttonId = scope === "archive" ? "export-archive-button" : scope === "full" ? "export-full-button" : "export-audit-button";
+  const button = byId(buttonId) || byId("export-button");
+  const scopeLabel = scope === "archive" ? "All-mode archive" : scope === "full" ? "Full raw handoff" : "Audit bundle";
   try {
-    const headers = {"X-Admin-Token": token};
-    const started = await fetch("/api/export/prepare", {method: "POST", headers});
-    if (!started.ok) {
-      const payload = await started.json().catch(error => ({detail: `Unable to read export error: ${error.message}`}));
-      throw new Error(payload.detail || `${started.status} ${started.statusText}`);
-    }
+    const started = await timedFetch(`/api/export/prepare?scope=${encodeURIComponent(scope)}`, {method: "POST", headers, signal: controller.signal}, 30000);
+    if (started.status === 401) { sessionStorage.removeItem("footballbot_admin_token"); throw new Error("admin token was rejected (401)"); }
+    if (!started.ok) throw new Error(await readExportError(started));
     let job = await started.json();
+    activeExports.set(scope, {jobId: job.job_id, controller});
     const beganAt = Date.now();
-    while (job.status === "preparing") {
+    while (job.status === "queued" || job.status === "preparing") {
+      progress.hidden = false;
       const elapsed = Math.max(1, Math.round((Date.now() - beganAt) / 1000));
-      buttons.forEach(button => { button.textContent = `Preparing… ${elapsed}s`; });
+      const detail = exportProgressText(job);
+      button.textContent = `${scopeLabel}: ${humanStatus(job.status)} · ${elapsed}s`;
+      progress.textContent = `${scopeLabel}: ${humanStatus(job.status)} for ${elapsed}s${detail ? ` · ${detail}` : ""}.`;
       await new Promise(resolve => setTimeout(resolve, 2000));
-      const polled = await fetch(`/api/export/jobs/${encodeURIComponent(job.job_id)}`, {headers});
-      if (!polled.ok) {
-        const payload = await polled.json().catch(error => ({detail: `Unable to read export status: ${error.message}`}));
-        throw new Error(payload.detail || `${polled.status} ${polled.statusText}`);
-      }
+      if (controller.signal.aborted) throw new Error("cancelled");
+      const polled = await timedFetch(`/api/export/jobs/${encodeURIComponent(job.job_id)}`, {headers, signal: controller.signal}, 15000);
+      if (polled.status === 401) { sessionStorage.removeItem("footballbot_admin_token"); throw new Error("admin token was rejected (401)"); }
+      if (!polled.ok) throw new Error(await readExportError(polled));
       job = await polled.json();
     }
-    if (job.status !== "ready") throw new Error(job.error || "Study export preparation failed");
+    if (job.status === "cancelled") throw new Error("cancelled");
+    if (job.status !== "ready") throw new Error(job.error || `${scopeLabel} preparation failed (${job.status})`);
     const anchor = document.createElement("a");
     anchor.href = `/api/export/jobs/${encodeURIComponent(job.job_id)}/download`;
+    // rely on the job-scoped HttpOnly cookie set by /api/export/prepare
     document.body.appendChild(anchor); anchor.click(); anchor.remove();
-    clearClientFault("Study export");
-    showToast(`Study data download started (${formatBytes(job.bytes)}).`);
-  } catch (error) { sessionStorage.removeItem("footballbot_admin_token"); recordClientError("Study export", error); }
-  finally { buttons.forEach(button => { button.disabled = false; button.textContent = button.id === "export-button" ? "Download study data" : "Prepare study data"; }); }
+    clearClientFault(`Study export ${scope}`);
+    showToast(`${scopeLabel} download started (${formatBytes(job.bytes)}).`);
+    if (scope !== "audit") refreshRawSegments();
+  } catch (error) {
+    const message = error?.message || String(error);
+    if (message === "cancelled") showToast(`${scopeLabel} cancelled.`);
+    else {
+      // Only invalidate the token on an explicit auth failure. Transient 5xx,
+      // timeouts, and network errors must not force the operator to re-prompt.
+      if (/\b401\b/.test(message)) sessionStorage.removeItem("footballbot_admin_token");
+      errorLabel.hidden = false; errorLabel.textContent = `${scopeLabel}: ${message}`;
+      recordClientError(`Study export ${scope}`, error);
+    }
+  } finally {
+    activeExports.delete(scope);
+    if (!activeExports.size) { setExportButtonsDisabled(false); resetExportButtonLabels(); if (cancelButton) cancelButton.hidden = true; }
+  }
+}
+async function cancelActiveExport() {
+  // Prefer cancelling a heavy raw/archive job (audit bundles finish quickly).
+  const scope = activeExports.has("archive") ? "archive" : activeExports.has("full") ? "full" : activeExports.keys().next().value;
+  if (!scope) return;
+  const active = activeExports.get(scope);
+  const token = sessionStorage.getItem("footballbot_admin_token");
+  active.controller.abort(new Error("cancelled"));
+  if (token && active.jobId) {
+    try { await fetch(`/api/export/jobs/${encodeURIComponent(active.jobId)}/cancel`, {method: "POST", headers: {"X-Admin-Token": token}}); }
+    catch (error) { recordClientError(`Study export ${scope} cancel`, error); }
+  }
+}
+async function refreshRawSegments() {
+  // Lists immutable recorder segments so operators can pull one file at a time
+  // instead of waiting on the multi-GB full bundle.
+  const holder = byId("raw-segment-list");
+  if (!holder) return;
+  const token = sessionStorage.getItem("footballbot_admin_token");
+  if (!token) { holder.innerHTML = '<div class="empty-state">Enter the admin token in a download button to list raw segments.</div>'; return; }
+  try {
+    const response = await timedFetch("/api/export/raw", {headers: {"X-Admin-Token": token}, credentials: "same-origin"}, 15000);
+    if (response.status === 401) { sessionStorage.removeItem("footballbot_admin_token"); holder.innerHTML = '<div class="empty-state">Admin token was rejected; enter it again.</div>'; return; }
+    if (!response.ok) throw new Error(await readExportError(response));
+    const payload = await response.json();
+    const segments = payload.segments || [];
+    if (!segments.length) { holder.innerHTML = '<div class="empty-state">No raw recorder segments recorded yet.</div>'; return; }
+    holder.innerHTML = segments.slice(0, 60).map(row => `<div class="raw-segment-row"><span><strong>${escapeHtml(row.name || "segment")}</strong></span><span>${escapeHtml(formatBytes(row.bytes))}</span><a href="/api/export/raw/${encodeURIComponent(row.name)}">Download</a></div>`).join("");
+  } catch (error) { recordClientError("Raw segment listing", error); }
 }
 function playSignalTone() {
   if (!soundEnabled) return;
@@ -668,8 +1050,29 @@ function playSignalTone() {
 initializeTabs();
 byId("kill-button").addEventListener("click", async () => { const result = await adminPost("/api/kill", {on: !killEnabled}); if (result) scheduleRefresh(0); });
 byId("sound-button").addEventListener("click", () => { soundEnabled = !soundEnabled; byId("sound-button").textContent = soundEnabled ? "Sound on" : "Sound off"; if (soundEnabled) playSignalTone(); });
-byId("export-button").addEventListener("click", () => downloadExport().catch(error => recordClientError("Study export", error)));
-document.querySelectorAll("[data-export-trigger]").forEach(button => button.addEventListener("click", () => downloadExport().catch(error => recordClientError("Study export", error))));
+document.querySelectorAll("[data-export-scope]").forEach(button => button.addEventListener("click", () => {
+  const scope = button.dataset.exportScope || "audit";
+  downloadExport(scope).catch(error => recordClientError(`Study export ${scope}`, error));
+}));
+document.addEventListener("click", event => {
+  const button = event.target.closest?.("[data-load-path]");
+  if (!button) return;
+  const tradeId = button.dataset.loadPath;
+  button.disabled = true; button.textContent = "Loading path…";
+  loadTradePath(tradeId).then(renderTrades)
+    .catch(error => {
+      // A failed fetch must never leave the button silently spinning.
+      button.disabled = false;
+      button.textContent = "Show path";
+      const failure = document.createElement("p");
+      failure.className = "path-error";
+      failure.setAttribute("role", "alert");
+      failure.textContent = `Could not load the path for trade ${tradeId}: ${error && error.message ? error.message : error}`;
+      button.insertAdjacentElement("afterend", failure);
+      recordClientError("Trade path", error);
+    });
+});
+byId("export-cancel-button")?.addEventListener("click", () => cancelActiveExport().catch(error => recordClientError("Study export cancel", error)));
 byId("market-search").addEventListener("input", renderMatches);
 byId("league-sort").addEventListener("change", renderLeagues);
 document.querySelectorAll("[data-league-sleeve]").forEach(button => button.addEventListener("click", () => { leagueSleeve = button.dataset.leagueSleeve; document.querySelectorAll("[data-league-sleeve]").forEach(other => other.classList.toggle("active", other === button)); renderLeagues(); }));

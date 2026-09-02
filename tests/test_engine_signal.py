@@ -3,6 +3,7 @@ from unittest.mock import Mock, patch
 
 from app.engine import Engine
 from app.late_score_sleeve import SleeveDecision
+from app.match_clock import MatchClockTracker, parse_current_clock
 
 
 class SignalPersistenceTests(unittest.TestCase):
@@ -15,8 +16,15 @@ class SignalPersistenceTests(unittest.TestCase):
         engine.detector = Mock()
         engine.late_score_sleeve = Mock()
         engine.last_entry_ms = {}
-        engine.is_late = Mock(return_value=True)
-        engine.is_sleeve_window = Mock(return_value=True)
+        engine.clock_tracker = MatchClockTracker()
+        parsed = parse_current_clock({
+            "time": "90+5'", "half": "2nd", "status": "live",
+        })
+        engine.clock_tracker.observe("E", "M", parsed, {
+            "received_wall": 1.0, "started_wall": 0.999,
+            "previous_poll_ts": 0.75, "response_ms": 5.0,
+        })
+        engine.clock_tracker.promote("E", 9)
         engine.record_signal = Mock(return_value=42)
         engine._announce_signal = Mock()
         return engine
@@ -165,6 +173,67 @@ class SignalPersistenceTests(unittest.TestCase):
         self.assertEqual(outcomes["price_only_late_score"], "strategy_lockout")
         self.assertEqual(engine.desk.try_enter.call_count, 1)
         self.assertIn(("gate_a", "T"), engine.last_entry_ms)
+
+    def test_al_hazm_90_plus_5_clock_reaches_price_classifier(self):
+        engine = self.make_engine()
+        engine.late_score_sleeve.classify.return_value = SleeveDecision(
+            True, "accepted",
+            {"strategy": "price_only_late_score_v1", "feed_independent": True},
+        )
+        engine.desk.try_enter.return_value = "filled"
+        candidate = {
+            "ticker": "T", "ts_ms": 1000, "local_ts": 1.0, "dir": 1,
+            "dl": 1.0, "levels": 5, "size": 200.0, "ref": 40.0, "ext": 60.0,
+        }
+
+        with patch("app.engine.config.PRICE_ONLY_SLEEVE_MODE", "enforce"), \
+                patch("app.engine.config.LATE_ONLY", False), \
+                patch("app.engine.store.add_latency"), \
+                patch("app.engine.store.update_signal_outcome"):
+            outcomes = engine.act_on_signal(candidate, 10.0)
+
+        self.assertEqual(outcomes["price_only_late_score"], "filled")
+        engine.late_score_sleeve.classify.assert_called_once()
+        self.assertNotEqual(outcomes["price_only_late_score"], "sleeve_outside_window")
+
+    def test_minute_87_fails_closed_and_skips_classifier(self):
+        engine = self.make_engine()
+        parsed = parse_current_clock({"time": "87'", "half": "2nd", "status": "live"})
+        engine.clock_tracker.observe("E", "M", parsed, {
+            "received_wall": 1.0, "started_wall": 0.999,
+            "previous_poll_ts": 0.75, "response_ms": 5.0,
+        })
+        # A reading is only decision-visible once persisted, so the 87 must be
+        # promoted to replace the 90+5 established by make_engine().
+        engine.clock_tracker.promote("E", 10)
+        candidate = {
+            "ticker": "T", "ts_ms": 1000, "local_ts": 1.0, "dir": 1,
+            "dl": 1.0, "levels": 5, "size": 200.0, "ref": 40.0, "ext": 60.0,
+        }
+
+        with patch("app.engine.config.PRICE_ONLY_SLEEVE_MODE", "enforce"):
+            outcomes = engine.act_on_signal(candidate, 10.0)
+
+        self.assertEqual(outcomes["price_only_late_score"], "sleeve_clock_pre_88")
+        engine.late_score_sleeve.classify.assert_not_called()
+        engine.desk.try_enter.assert_not_called()
+
+    def test_expected_expiration_cannot_open_the_clock_gate(self):
+        engine = self.make_engine()
+        engine.clock_tracker = MatchClockTracker()
+        engine.meta["T"]["close_time"] = "1970-01-01T00:00:01Z"
+        candidate = {
+            "ticker": "T", "ts_ms": 1000, "local_ts": 1.0, "dir": 1,
+            "dl": 1.0, "levels": 5, "size": 200.0, "ref": 40.0, "ext": 60.0,
+        }
+
+        with patch("app.engine.config.PRICE_ONLY_SLEEVE_MODE", "enforce"), \
+                patch("app.engine.config.SLEEVE_START_BEFORE_EXPIRY_MIN", 10_000), \
+                patch("app.engine.config.SLEEVE_AFTER_EXPIRY_MIN", 10_000):
+            outcomes = engine.act_on_signal(candidate, 10.0)
+
+        self.assertEqual(outcomes["price_only_late_score"], "sleeve_clock_unmapped")
+        engine.late_score_sleeve.classify.assert_not_called()
 
 
 if __name__ == "__main__":

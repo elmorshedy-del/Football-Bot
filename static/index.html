@@ -22,7 +22,7 @@
       </div>
       <div class="header-actions">
         <button id="sound-button" class="button quiet" type="button">Sound off</button>
-        <button id="export-button" class="button secondary" type="button">Download study data</button>
+        <button id="export-button" class="button secondary" type="button" data-export-scope="audit">Download audit data</button>
         <button id="kill-button" class="button danger" type="button">Kill switch</button>
       </div>
     </div>
@@ -69,6 +69,8 @@
       <div class="section-divider"></div>
       <div class="surface-heading events-heading"><div><p class="eyebrow">Diagnostic feed</p><h3>Canonical match events</h3></div><p>Provider receipt time is not the exact on-field occurrence time.</p></div>
       <div id="event-list" class="event-timeline"><div class="empty-state">No score change observed.</div></div>
+      <div class="surface-heading events-heading"><div><p class="eyebrow">Canonical ledger</p><h3>Provider match events</h3></div><p>Goals, disallowed goals, penalties, VAR, cards and corrections — not only score changes.</p></div>
+      <div id="provider-event-list" class="event-timeline"><div class="empty-state">Loading canonical provider events.</div></div>
     </section>
 
     <section id="panel-signals" class="tab-panel" role="tabpanel" aria-labelledby="tab-signals" hidden>
@@ -111,9 +113,30 @@
         <div><span>Dashboard link</span><strong id="runtime-dashboard">Connecting</strong></div><div><span>Market stream</span><strong id="runtime-market">Checking</strong></div><div><span>Match-event feed</span><strong id="runtime-event">Checking</strong></div><div><span>Last match-feed poll</span><strong id="runtime-event-poll">Not supplied by provider</strong></div><div><span>Match-feed response</span><strong id="runtime-event-response">Collecting</strong></div><div><span>Median market delay</span><strong id="runtime-feed-lag">Collecting</strong></div><div><span>Watched matches</span><strong id="runtime-matches">0</strong></div><div><span>Raw messages recorded</span><strong id="runtime-recorded">0</strong></div><div><span>Service uptime</span><strong id="runtime-uptime">Collecting</strong></div>
       </section>
       <div class="content-grid system-grid">
-        <article class="surface"><div class="surface-heading"><div><p class="eyebrow">Timing</p><h3>Recorded latency</h3></div></div><div id="latency-chart" class="bar-chart"></div></article>
+        <article class="surface" id="clock-coverage-panel">
+          <div class="surface-heading"><div><p class="eyebrow">Match clock</p><h3>Live clock coverage</h3><p>Price-only 88+ admission uses this persisted clock. Expected expiration is diagnostic only.</p></div></div>
+          <div id="clock-coverage" class="metric-grid"></div>
+          <div id="clock-faults" class="clock-faults"></div>
+          <div id="clock-observations" class="clock-observations"></div>
+        </article>
+        <article class="surface"><div class="surface-heading"><div><p class="eyebrow">Timing</p><h3>Recorded latency</h3></div></div><div id="latency-chart" class="bar-chart"></div><div id="latency-table" class="table-wrap latency-table"></div></article>
         <article class="surface"><div class="surface-heading"><div><p class="eyebrow">Promotion discipline</p><h3>Evidence gates</h3></div></div><div id="evidence-list" class="evidence-list"></div></article>
-        <article class="surface data-card"><div><p class="eyebrow">Research handoff</p><h3>Download the complete study bundle</h3><p>Includes the database, canonical events, fills, configuration, hashes, and raw WebSocket recordings.</p></div><button class="button secondary" type="button" data-export-trigger>Prepare study data</button></article>
+        <article class="surface data-card" id="export-panel">
+          <div>
+            <p class="eyebrow">Research handoff</p>
+            <h3>Download study data</h3>
+            <p>The audit bundle is the default browser download. It includes tables, clocks, events, and a raw-file inventory. Full raw bodies and individual recorder segments are separate products.</p>
+          </div>
+          <div class="export-actions">
+            <button id="export-audit-button" class="button secondary" type="button" data-export-scope="audit" data-export-trigger>Download audit bundle</button>
+            <button id="export-full-button" class="button" type="button" data-export-scope="full">Prepare full raw handoff</button>
+            <button id="export-archive-button" class="button" type="button" data-export-scope="archive">Prepare all-mode archive</button>
+            <button id="export-cancel-button" class="button quiet" type="button" hidden>Cancel active export</button>
+          </div>
+          <p id="export-progress" class="export-progress" hidden></p>
+          <p id="export-error" class="export-error" hidden></p>
+          <div id="raw-segment-list" class="raw-segment-list"></div>
+        </article>
         <article class="surface"><div class="surface-heading"><div><p class="eyebrow">Service activity</p><h3>Recent backend events</h3></div></div><div id="activity-list" class="activity-list"></div></article>
       </div>
     </section>

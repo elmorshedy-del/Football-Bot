@@ -1,0 +1,269 @@
+# PR 13 review — baseline red tests
+# Reviewed head: d69f5a4c512fddf55d30cb79079a69e0fa6a1651
+# Run at:        3b541d33d07b06174dd0dc75f883f55f40b78b5b
+# Date (UTC):    2026-09-02T00:19:59Z
+
+## Review section 1.1 / 1.2 — close ownership and restart sequence recovery
+$ .venv/bin/python -m unittest tests.test_close_ownership -v
+
+test_a_committed_close_writes_path_summary_and_closed_fields_together (tests.test_close_ownership.CloseOwnershipTests.test_a_committed_close_writes_path_summary_and_closed_fields_together) ... ok
+test_an_ignored_collision_does_not_clear_the_buffer (tests.test_close_ownership.CloseOwnershipTests.test_an_ignored_collision_does_not_clear_the_buffer)
+INSERT OR IGNORE returning cleanly is not proof of durability. ... FAIL
+test_final_trade_path_failure_keeps_position_then_retries_exactly_once (tests.test_close_ownership.CloseOwnershipTests.test_final_trade_path_failure_keeps_position_then_retries_exactly_once) ... FAIL
+test_restored_position_resumes_at_durable_max_sequence (tests.test_close_ownership.CloseOwnershipTests.test_restored_position_resumes_at_durable_max_sequence) ... FAIL
+test_uncommitted_final_close_restores_open_trade_after_restart (tests.test_close_ownership.CloseOwnershipTests.test_uncommitted_final_close_restores_open_trade_after_restart) ... FAIL
+
+======================================================================
+FAIL: test_an_ignored_collision_does_not_clear_the_buffer (tests.test_close_ownership.CloseOwnershipTests.test_an_ignored_collision_does_not_clear_the_buffer)
+INSERT OR IGNORE returning cleanly is not proof of durability.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_close_ownership.py", line 232, in test_an_ignored_collision_does_not_clear_the_buffer
+    self.assertEqual(
+AssertionError: 1 != 0 : a fully ignored batch must report zero durable rows, not the input length
+
+======================================================================
+FAIL: test_final_trade_path_failure_keeps_position_then_retries_exactly_once (tests.test_close_ownership.CloseOwnershipTests.test_final_trade_path_failure_keeps_position_then_retries_exactly_once)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_close_ownership.py", line 106, in test_final_trade_path_failure_keeps_position_then_retries_exactly_once
+    self.assertEqual(
+AssertionError: 'closed' != 'open'
+- closed
++ open
+ : the trade was closed even though its final path never persisted
+
+======================================================================
+FAIL: test_restored_position_resumes_at_durable_max_sequence (tests.test_close_ownership.CloseOwnershipTests.test_restored_position_resumes_at_durable_max_sequence)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_close_ownership.py", line 193, in test_restored_position_resumes_at_durable_max_sequence
+    self.assertEqual(
+AssertionError: 0 != 2 : durable path length was not restored, so the next sample reuses a key
+
+======================================================================
+FAIL: test_uncommitted_final_close_restores_open_trade_after_restart (tests.test_close_ownership.CloseOwnershipTests.test_uncommitted_final_close_restores_open_trade_after_restart)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_close_ownership.py", line 169, in test_uncommitted_final_close_restores_open_trade_after_restart
+    self.assertIn(
+AssertionError: 1 not found in {} : an uncommitted close did not restore as an open, retryable trade
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.113s
+
+FAILED (failures=4)
+
+## Review section 1.3 — signal path finalization ownership
+$ .venv/bin/python -m unittest tests.test_signal_path_ownership -v
+
+EFEF.E
+======================================================================
+ERROR: test_a_cleanly_finalized_signal_is_not_rebuilt (tests.test_signal_path_ownership.SignalPathOwnershipTests.test_a_cleanly_finalized_signal_is_not_rebuilt)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_signal_path_ownership.py", line 210, in test_a_cleanly_finalized_signal_is_not_rebuilt
+    self.assertEqual(store.unfinalized_signal_paths(), [])
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: module 'app.store' has no attribute 'unfinalized_signal_paths'
+
+======================================================================
+ERROR: test_eviction_over_max_tracked_also_keeps_the_watch_on_failure (tests.test_signal_path_ownership.SignalPathOwnershipTests.test_eviction_over_max_tracked_also_keeps_the_watch_on_failure)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_signal_path_ownership.py", line 132, in test_eviction_over_max_tracked_also_keeps_the_watch_on_failure
+    self.engine._evict_signal_paths()
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'Engine' object has no attribute '_evict_signal_paths'
+
+======================================================================
+ERROR: test_unfinalized_watch_is_rebuilt_and_marked_incomplete_on_restart (tests.test_signal_path_ownership.SignalPathOwnershipTests.test_unfinalized_watch_is_rebuilt_and_marked_incomplete_on_restart)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_signal_path_ownership.py", line 189, in test_unfinalized_watch_is_rebuilt_and_marked_incomplete_on_restart
+    pending = store.unfinalized_signal_paths()
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: module 'app.store' has no attribute 'unfinalized_signal_paths'
+
+======================================================================
+FAIL: test_decline_rows_carry_sequences_and_record_one_gap (tests.test_signal_path_ownership.SignalPathOwnershipTests.test_decline_rows_carry_sequences_and_record_one_gap)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_signal_path_ownership.py", line 174, in test_decline_rows_carry_sequences_and_record_one_gap
+    self.assertEqual(
+AssertionError: Lists differ: [] != ['quote', 'gap', 'quote']
+
+Second list contains 3 additional elements.
+First extra element 0:
+'quote'
+
+- []
++ ['quote', 'gap', 'quote'] : a no-ladder run must record exactly one gap and then resume
+
+======================================================================
+FAIL: test_final_signal_path_failure_keeps_watch_then_retries_exactly_once (tests.test_signal_path_ownership.SignalPathOwnershipTests.test_final_signal_path_failure_keeps_watch_then_retries_exactly_once)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_signal_path_ownership.py", line 100, in test_final_signal_path_failure_keeps_watch_then_retries_exactly_once
+    self.assertEqual(
+AssertionError: 0 != 1 : the watch was popped even though its final write failed
+
+----------------------------------------------------------------------
+Ran 6 tests in 0.114s
+
+FAILED (failures=2, errors=3)
+
+## Review section 1.4 — mode-scoped APIs and exports
+$ .venv/bin/python -m unittest tests.test_mode_scoped_api
+
+EEEEEEEEEEEFEEEE
+======================================================================
+ERROR: test_all_selector_returns_every_mode (tests.test_mode_scoped_api.ModeScopedApiTests.test_all_selector_returns_every_mode)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_mode_scoped_api.py", line 137, in test_all_selector_returns_every_mode
+    events = {row["event"] for row in run(main.signals(mode="all"))}
+                                          ^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: signals() got an unexpected keyword argument 'mode'
+
+======================================================================
+ERROR: test_an_unknown_selector_is_rejected (tests.test_mode_scoped_api.ModeScopedApiTests.test_an_unknown_selector_is_rejected) (selector='production')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_mode_scoped_api.py", line 129, in test_an_unknown_selector_is_rejected
+    run(main.signals(mode=bad))
+        ^^^^^^^^^^^^^^^^^^^^^^
+TypeError: signals() got an unexpected keyword argument 'mode'
+
+======================================================================
+ERROR: test_an_unknown_selector_is_rejected (tests.test_mode_scoped_api.ModeScopedApiTests.test_an_unknown_selector_is_rejected) (selector='LIVE; DROP TABLE signals')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_mode_scoped_api.py", line 129, in test_an_unknown_selector_is_rejected
+    run(main.signals(mode=bad))
+        ^^^^^^^^^^^^^^^^^^^^^^
+TypeError: signals() got an unexpected keyword argument 'mode'
+
+======================================================================
+ERROR: test_an_unknown_selector_is_rejected (tests.test_mode_scoped_api.ModeScopedApiTests.test_an_unknown_selector_is_rejected) (selector='')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_mode_scoped_api.py", line 129, in test_an_unknown_selector_is_rejected
+    run(main.signals(mode=bad))
+        ^^^^^^^^^^^^^^^^^^^^^^
+TypeError: signals() got an unexpected keyword argument 'mode'
+
+======================================================================
+ERROR: test_an_unknown_selector_is_rejected (tests.test_mode_scoped_api.ModeScopedApiTests.test_an_unknown_selector_is_rejected) (selector='None')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_mode_scoped_api.py", line 129, in test_an_unknown_selector_is_rejected
+    run(main.signals(mode=bad))
+        ^^^^^^^^^^^^^^^^^^^^^^
+TypeError: signals() got an unexpected keyword argument 'mode'
+
+======================================================================
+ERROR: test_demo_selector_returns_only_demo (tests.test_mode_scoped_api.ModeScopedApiTests.test_demo_selector_returns_only_demo)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_mode_scoped_api.py", line 133, in test_demo_selector_returns_only_demo
+    signals = run(main.signals(mode="demo"))
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: signals() got an unexpected keyword argument 'mode'
+
+======================================================================
+ERROR: test_equity_and_latency_exclude_other_modes (tests.test_mode_scoped_api.ModeScopedApiTests.test_equity_and_latency_exclude_other_modes)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_mode_scoped_api.py", line 173, in test_equity_and_latency_exclude_other_modes
+    live_points = run(main.equity(mode="live"))["combined"]
+                      ^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: equity() got an unexpected keyword argument 'mode'
+
+======================================================================
+ERROR: test_every_endpoint_accepts_the_four_safe_selectors (tests.test_mode_scoped_api.ModeScopedApiTests.test_every_endpoint_accepts_the_four_safe_selectors) (selector='live')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_mode_scoped_api.py", line 116, in test_every_endpoint_accepts_the_four_safe_selectors
+    self.assertIsNotNone(run(main.signals(mode=selector)))
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: signals() got an unexpected keyword argument 'mode'
+
+======================================================================
+ERROR: test_every_endpoint_accepts_the_four_safe_selectors (tests.test_mode_scoped_api.ModeScopedApiTests.test_every_endpoint_accepts_the_four_safe_selectors) (selector='demo')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_mode_scoped_api.py", line 116, in test_every_endpoint_accepts_the_four_safe_selectors
+    self.assertIsNotNone(run(main.signals(mode=selector)))
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: signals() got an unexpected keyword argument 'mode'
+
+======================================================================
+ERROR: test_every_endpoint_accepts_the_four_safe_selectors (tests.test_mode_scoped_api.ModeScopedApiTests.test_every_endpoint_accepts_the_four_safe_selectors) (selector='legacy_unknown')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_mode_scoped_api.py", line 116, in test_every_endpoint_accepts_the_four_safe_selectors
+    self.assertIsNotNone(run(main.signals(mode=selector)))
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: signals() got an unexpected keyword argument 'mode'
+
+======================================================================
+ERROR: test_every_endpoint_accepts_the_four_safe_selectors (tests.test_mode_scoped_api.ModeScopedApiTests.test_every_endpoint_accepts_the_four_safe_selectors) (selector='all')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_mode_scoped_api.py", line 116, in test_every_endpoint_accepts_the_four_safe_selectors
+    self.assertIsNotNone(run(main.signals(mode=selector)))
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: signals() got an unexpected keyword argument 'mode'
+
+======================================================================
+ERROR: test_legacy_rows_are_presented_as_legacy_unknown (tests.test_mode_scoped_api.ModeScopedApiTests.test_legacy_rows_are_presented_as_legacy_unknown)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_mode_scoped_api.py", line 141, in test_legacy_rows_are_presented_as_legacy_unknown
+    rows = run(main.signals(mode="legacy_unknown"))
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: signals() got an unexpected keyword argument 'mode'
+
+======================================================================
+ERROR: test_nested_decoration_cannot_cross_modes (tests.test_mode_scoped_api.ModeScopedApiTests.test_nested_decoration_cannot_cross_modes)
+A live trade must not be decorated by a demo signal or event.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_mode_scoped_api.py", line 150, in test_nested_decoration_cannot_cross_modes
+    trades = run(main.trades(mode="live"))
+                 ^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: trades() got an unexpected keyword argument 'mode'
+
+======================================================================
+ERROR: test_path_access_is_scoped_through_its_parent (tests.test_mode_scoped_api.ModeScopedApiTests.test_path_access_is_scoped_through_its_parent)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_mode_scoped_api.py", line 159, in test_path_access_is_scoped_through_its_parent
+    run(main.trade_bid_path(demo_trade, mode="live"))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: trade_bid_path() got an unexpected keyword argument 'mode'
+
+======================================================================
+ERROR: test_signal_path_access_is_scoped_through_its_parent (tests.test_mode_scoped_api.ModeScopedApiTests.test_signal_path_access_is_scoped_through_its_parent)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_mode_scoped_api.py", line 169, in test_signal_path_access_is_scoped_through_its_parent
+    run(main.signal_forward_path(demo_signal, mode="live"))
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: signal_forward_path() got an unexpected keyword argument 'mode'
+
+======================================================================
+FAIL: test_every_study_endpoint_defaults_to_the_active_mode (tests.test_mode_scoped_api.ModeScopedApiTests.test_every_study_endpoint_defaults_to_the_active_mode)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_mode_scoped_api.py", line 98, in test_every_study_endpoint_defaults_to_the_active_mode
+    self.assertEqual({row["event"] for row in signals}, {"LIVE"},
+AssertionError: Items in the first set but not the second:
+'DEMO'
+'LEGACY' : signals leaked another mode
+
+----------------------------------------------------------------------
+Ran 10 tests in 0.252s
+
+FAILED (failures=1, errors=15)

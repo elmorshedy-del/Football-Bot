@@ -308,3 +308,255 @@ Acceptance tests:
 - GitHub Continuous Integration passes and the public deployment reports healthy.
 - The production UI makes trade 51 and its event trace findable in at most two interactions.
 - The repo changelog records findings, exact tests, deployment identifier, and limitations.
+
+## 11. Persist match clocks and canonical provider events — REOPENED / BLOCKED BY §17
+
+Plan:
+
+- Add an append-only `match_clock_observations` table and a parser that reads current match clock
+  from `details.time` → `match_clock`/`game_clock`/`clock` → the clock portion of
+  `details.status_text`; never from `last_play` or historical significant-event times.
+- Store an immutable `signals.match_clock_snapshot` (`football.match_clock_stamp.v1`) on every new
+  signal, including declines, unmapped, and stale clocks (unusable stamps carry a complete
+  `unusable_reason`).
+- Persist a canonical `provider_match_events` ledger with a stable fingerprint that de-duplicates
+  refreshes and links score corrections to their prior fingerprint.
+- Expose `/api/match-clocks` and `/api/provider-events`; the trade API returns the immutable
+  signal stamp as `match_clock`.
+
+Acceptance tests:
+
+- Table-driven parser tests cover `87'`, `88'`, `90'`, `90+N'`, typographic apostrophes, status
+  text, and malformed inputs; a regression proves the parser refuses `last_play` and historical
+  event times as the current clock.
+- Persistence tests prove one observation per changed clock/period/status, that unchanged polls
+  do not flood SQLite, and that every signal outcome carries a complete stamp.
+- Migration tests preserve existing SQLite volumes and mark old signals as legacy without
+  fabricating minutes.
+
+Evidence: PR 12 commit `d0a02aa` — `Persist match clocks and canonical provider events`. Config
+`MATCH_CLOCK_MAX_AGE_MS=2500`. Local suite: 145 tests pass after commit 4.
+
+## 12. Gate paper 88+ sleeve on persisted live clock — REOPENED / BLOCKED BY §17
+
+Plan:
+
+- Introduce a narrow `MatchClockGate` object exposing only period, minute, stoppage, provider
+  status, age, and source identifiers — the only match-feed object the price-only path imports.
+- Replace expected-expiration admission in `engine._run_price_only` with the clock-only gate;
+  keep expected expiration in the UI as a calibration diagnostic only.
+- Record distinct decline outcomes: `sleeve_clock_pre_88`, `sleeve_clock_unmapped`,
+  `sleeve_clock_missing`, `sleeve_clock_malformed`, `sleeve_clock_stale`, `sleeve_clock_not_live`,
+  `sleeve_clock_final`, `sleeve_clock_suspended`, `sleeve_clock_abandoned`,
+  `sleeve_clock_first_half`, `sleeve_clock_half_time`, `sleeve_clock_pre_match`,
+  `sleeve_clock_period_unusable`.
+
+Acceptance tests:
+
+- Deterministic Al-Hazm 90+5 replay reaches the price classifier instead of
+  `sleeve_outside_window`.
+- 87 rejects; 88 accepts; 89, 90, and 90+N accept; first half, final, suspended, missing,
+  malformed, and stale clocks fail closed and raise a readiness fault.
+- Expected-expiration values cannot change the gate result.
+- AST/import allowlist test proves the price-only classifier and paper desk cannot import score,
+  scorer, goal, penalty, VAR, correction, or narrative fields.
+
+Evidence: PR 12 commit `89d15d0` — `Gate paper 88+ sleeve on persisted live clock`. Gate A
+detection, sizing, entry, exit, fee, lockout, and settlement behavior unchanged.
+
+## 13. Record executable trade highs and per-kind latency readiness — PASSED
+
+Plan:
+
+- Add `trades.max_executable_bid`, `trades.max_executable_bid_ts`, and `trades.mfe_c`. Observe
+  after entry only; persist atomically only when a new best bid strictly exceeds the stored high
+  (equal high keeps the first timestamp); continue through partial exits; restore for open
+  positions after restart.
+- Reject ask, midpoint, last price, and settlement values from ever updating the high.
+- Derive `high_after_entry_s` in the trade API.
+- Query latency per canonical kind (`feed_ingress_ms`, `decision_ms`, `paper_entry_ms`,
+  `order_arrival_ms`, `paper_exit_ms`, `match_response_ms`, `match_clock_age_ms`,
+  `scheduler_lag_ms`) instead of a global `LIMIT 1000`; report n, p50, p95, max, invalid,
+  latest_ts, age_s, threshold_ms, and state (`PASS`, `BREACH`, `COLLECTING`, `STALE`, `INVALID`).
+- Split runtime health from evidence readiness: `/api/status.health.ok` becomes false when K4 is
+  `BREACH` or `INVALID`; add `banner` = `all_systems_good` / `evidence_not_ready` /
+  `latency_breach` / `attention_required` and `banner_text`. K4 threshold stays at 250 ms; minimum
+  readiness sample count stays at 20.
+
+Acceptance tests:
+
+- Rising and falling bid tests; repeated equal high keeps first time; held-side conversion for
+  YES and NO; ask/mid/last/settlement cannot update the high; partial exit tracks until final
+  fill; restart recovery continues from the stored high.
+- Per-kind sampling test proves K4 rows cannot be crowded out by high-volume feed rows; monotonic
+  scheduler-lag test; negative and non-finite quarantine.
+- Health-banner test proves the API can not report `all_systems_good` while K4 is `BREACH`.
+
+Evidence: PR 12 commit `f669841` — `Record executable trade highs and latency readiness`. Local
+suite: 136 tests pass at commit 3.
+
+## 14. Split reliable audit and raw exports — REOPENED / BLOCKED BY §17
+
+Plan:
+
+- `POST /api/export/prepare?scope=audit|full` returns HTTP 202 with a pollable `job_id`. `audit`
+  is the browser default: SQLite snapshot + schema + normalized tables + fills + latency +
+  match-clock and event tables + manifest + hashes + raw inventory only. `full` adds raw
+  recorder segments (ZIP64 `STORED`) copied once through a SHA-256 pass with per-segment
+  progress and cancellation.
+- `GET /api/export/jobs/{id}` returns processed/total bytes and segments, status, and error code.
+- `POST /api/export/jobs/{id}/cancel` sets `cancel_requested`; the worker raises
+  `exporter.ExportCancelled`.
+- `GET /api/export/jobs/{id}/download` uses `FileResponse` with HTTP Range support and either the
+  admin header or a job-scoped HttpOnly cookie set on `prepare`.
+- `GET /api/export/raw` lists immutable recorder segments and sets a scoped HttpOnly cookie;
+  `GET /api/export/raw/{name}` streams one segment natively with Range and traversal-safe path
+  resolution (`safe_raw_segment_path`).
+- One `full` job at a time (second `full` prepare returns the active job); many concurrent
+  `audit` jobs are permitted; TTL cleanup respects active leases so a served file is not deleted.
+
+Acceptance tests:
+
+- Authorized `audit` prepare/status/download ZIP validation and manifest/table reconciliation.
+- Authorized `full` progress/cancel/download and per-segment range requests.
+- Ready-file lease prevents premature deletion; unauthorized, wrong-cookie, expired, missing, and
+  path-traversal requests fail closed; secrets never appear.
+- Event loop and `/api/status` remain responsive while a `full` bundle is preparing (a direct
+  test proves the worker does not block asyncio).
+
+Evidence: PR 12 commit `d828357` — `Split reliable audit and raw exports`. Local suite: 145 tests
+pass at commit 4.
+
+## 15. Expose clock, high, event, latency, and export audit UI — REOPENED / BLOCKED BY §17
+
+Plan:
+
+- Fetch `/api/match-clocks` on refresh and populate `state.clocks`.
+- Consume `status.health.banner` and `banner_text` in `renderHealth`; keep the literal
+  `ALL SYSTEMS GOOD` in the healthy case and never say all-good when K4 is `BREACH`, `COLLECTING`,
+  or `STALE`. Show per-check p95, threshold, and sample count inline.
+- Extend the closed trade card with human match/contract, sleeve, match time, persisted clock
+  stamp (age, precision, provider status, 88-gate chip), trigger and exit reason, entry/exit/qty/
+  gross/fees/net, max executable bid, MFE, UTC high time, seconds after entry, and nearby event
+  or an explicit "No nearby same-match event"; losing trades render an
+  entry → executable high → exit `.loss-path` row.
+- Extend the signal card with the immutable clock stamp and the exact 88-gate outcome chip.
+- Render every `CANONICAL_LATENCY_KINDS` entry in `renderLatency` — including `COLLECTING` — in
+  both the bar chart and a full per-kind table with n / p50 / p95 / max / age / threshold / state.
+- Add `renderClockCoverage` for the system tab (`watched`, `mapped`, `clock_present`,
+  `clock_fresh`, `clock_gate_candidate_misses`) plus a per-event fault list.
+- Rewrite `downloadExport` to take `scope=audit|full`, POST `?scope=`, poll `queued` **and**
+  `preparing`, show processed bytes/segments progress, use an `AbortController` with per-request
+  timeouts, expose a `cancel` button that POSTs `/jobs/{id}/cancel`, and clear the admin token
+  only on 401 (transient 5xx and network errors no longer force a reprompt). Downloads use a
+  native `<a>` click relying on the job-scoped HttpOnly cookie.
+- Add `refreshRawSegments` to list `/api/export/raw` with individual gzip Range downloads.
+- Add a `gate` filter select (`accepted`, `declined`, per-outcome) wired through `filterMarkup`,
+  `passesFilters`, and the reset button.
+
+Acceptance tests (`tests/test_frontend_contract.py`, and see 15.1 below):
+
+- All new element ids are present in the HTML (`clock-coverage-panel`, `clock-coverage`,
+  `clock-faults`, `latency-table`, `export-panel`, `export-audit-button`, `export-full-button`,
+  `export-cancel-button`, `export-progress`, `export-error`, `raw-segment-list`).
+- Both `data-export-scope="audit"` and `data-export-scope="full"` are present in the HTML.
+- The three backend banner keys (`all_systems_good`, `evidence_not_ready`, `latency_breach`)
+  appear verbatim in the JS.
+- The prepare URL carries `?scope=`, the poll accepts both `queued` and `preparing`, and a
+  `/jobs/{id}/cancel` path exists.
+- Card helpers `clockStampBlock`, `tradeHighBlock`, `lossPath`, `gateOutcome`, and
+  `CANONICAL_LATENCY_KINDS` are referenced.
+- Filter fields include `gate` alongside `query`, `strategy`, `match`, `result`, `association`,
+  and `period`.
+- The 360 px phone breakpoint is present in the CSS and `text-overflow: ellipsis` is not.
+- `await response.blob()` still does not appear (native anchor + cookie for downloads).
+
+Evidence: PR 12 commit `e551e6d` — `Expose clock, high, event, latency, and export audit UI`.
+Local suite: 146 tests pass (baseline 145 + one new test).
+
+## 16. Production evidence and rollback (final review) — BLOCKED
+
+Plan:
+
+- Machine-readable evidence must be attached to the implementation PR before final review can
+  merge: full suite, `compileall`, `ruff check --select E9,F63,F7,F82 app tests`, `node --check
+  static/app.js`, `git diff --check`, deterministic Al-Hazm replay output, production API
+  snapshots after deploy (`/api/status`, `/api/stats`, `/api/latency`, `/api/match-clocks`,
+  `/api/signals`, `/api/trades`, `/api/export/*`), one authorized audit bundle ready in under
+  10 seconds with a valid ZIP and reconciled manifest, one protected raw-segment range download,
+  and rendered desktop plus 360 px mobile screenshots for the trade, signal, system, and download
+  states.
+- Confirm the live service remains paper-only and that the unrelated Railway service `kalchi-kill`
+  was untouched.
+- Rollback: additive schema means application rollback is a single revert of the merge commit.
+  Old code tolerates the added tables and columns. Do not drop clock, event, or high data. Cancel
+  active export workers before reverting. If containment is needed, disable the price-only clock
+  gate through the `PRICE_ONLY_SLEEVE_MODE` flag; Gate A stays unchanged.
+
+Acceptance tests:
+
+- All items above are recorded in `docs/DUAL_SLEEVE_CHANGELOG.md` under the deploy identifier.
+- Final reviewer checklist (specification § 12) passes every item; a single failed item blocks
+  merge.
+
+Blocker: needs an authorized deploy of PR 12 and access to a live `ADMIN_TOKEN` to collect the
+production evidence and rendered acceptance items. Local checks and the deterministic Al-Hazm
+replay unit test are already green.
+
+Post-merge: record commit SHA, CI run, deployment ID, exact validation outputs, known
+limitations, and the exact rollback command in `docs/DUAL_SLEEVE_CHANGELOG.md`.
+
+## 17. Resolve independent-review blockers at PR 12 head `cd4d36e` — BLOCKED
+
+Binding plan and acceptance contract:
+
+- `docs/PR12_BLOCKER_RESOLUTION_HANDOFF.md`
+
+The handoff pins the reviewed head/tree, exact implementation sequence, forbidden shortcuts,
+behavioral regression tests, mode/migration rules, export concurrency threshold, path failure and
+gap semantics, browser checks, evidence file names, production/restart verification, rollback, and
+the final reviewer decision vocabulary.
+
+Current blocking groups:
+
+- [x] `BR-CLOCK`: no decision-visible clock before successful persistence; positive database id is
+  mandatory; failed identical inserts retry; confirmation uncertainty is non-negative.
+  Commit `c9f490a`. Baseline red and mutation proof recorded.
+- [x] `BR-HEALTH`: pre-match waiting is not an error, current faults recover, cumulative misses do
+  not permanently poison health, and id-less state can never appear fresh.
+  Commit `c9f490a`. Seven section 4.3 cases pass.
+- [x] `BR-MODE`: live/demo/legacy rows are preserved and isolated across all study tables and
+  restarts; startup deletes no observations.
+  Commit `f3d3de0`. Export manifest per-mode counts and the API mode selector remain open.
+- [x] `BR-EVENT`: normalized provider occurrence supports real raw shapes and correction lineage
+  survives restart without cross-match links.
+  Commit `f3d3de0`. Source-string assertions replaced by runtime tests.
+- [x] `BR-EXPORT`: a real SQLite backup cannot block event-loop store/status work; legacy export
+  delegates to the job flow; every task exception is retrieved.
+  Commit `00d41f8`. Contention measured under the 250ms bound against a real WAL database.
+- [x] `BR-PATH`: final trade/signal paths retain ownership on failure, end exactly once
+  within the cap, record gaps, calculate without bridging outages, and render after an actual
+  browser click. Commits `9f831c6` (gaps, cap, chart), `6571ecf` (one-transaction close,
+  restart resumes at durable max sequence), `58860ff` (signal watch ownership, finalization
+  marker, restart rebuild), `0cbf651` (real dashboard click acceptance). PR 13 review §§1.1-1.3
+  and §1.5 closed.
+- [x] `BR-LOCAL` / `BR-AUDIT`: 298 tests pass twice under strict RuntimeWarning with zero
+  tracebacks, zero unretrieved task exceptions and zero skipped browser tests; static checks
+  and `git diff --check` against the base branch are clean; a production-schema copy migrates
+  twice without loss; every study endpoint and export is mode-scoped with per-mode manifest
+  counts and orphan-fill reconciliation (PR 13 review §1.4); evidence corrected to cite real
+  commits and a verified rollback command (§1.6). Rendered acceptance is automated at desktop
+  and 360px; screenshots remain part of `BR-PROD`.
+- [ ] `BR-PROD` / `BR-REVIEW`: authorized review deployment, machine-readable and rendered
+  evidence, restart proof, paper-only proof, `kalchi-kill` untouched proof, and independent signoff.
+
+Earlier section-level `PASSED` entries are historical implementation notes, not current acceptance.
+Sections 11, 12, 14, and 15 are explicitly reopened. Section 16 remains blocked. A green unit suite
+does not close this section.
+
+Status at candidate `0cbf651` (PR #13): **BLOCKED.** Seven of eight `BR-*` items are satisfied
+with baseline red, behavioral tests and mutation proof, including every code and behavioral-test
+requirement in `docs/PR13_INDEPENDENT_REVIEW.md`. `BR-PROD`/`BR-REVIEW` cannot start without an
+authorised deployment target and a live `ADMIN_TOKEN`, and the implementer may not self-approve.
+Evidence index: `docs/evidence/pr13/0cbf651/EVIDENCE_INDEX.md`. PR 13 must be converted to draft
+and must not merge or deploy.
