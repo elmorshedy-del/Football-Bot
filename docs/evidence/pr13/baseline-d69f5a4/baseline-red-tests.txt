@@ -1,0 +1,55 @@
+# PR 13 review — baseline red tests
+# Reviewed head: d69f5a4c512fddf55d30cb79079a69e0fa6a1651
+# Run at:        3b541d33d07b06174dd0dc75f883f55f40b78b5b
+# Date (UTC):    2026-09-02T00:19:59Z
+
+## Review section 1.1 / 1.2 — close ownership and restart sequence recovery
+$ .venv/bin/python -m unittest tests.test_close_ownership -v
+
+test_a_committed_close_writes_path_summary_and_closed_fields_together (tests.test_close_ownership.CloseOwnershipTests.test_a_committed_close_writes_path_summary_and_closed_fields_together) ... ok
+test_an_ignored_collision_does_not_clear_the_buffer (tests.test_close_ownership.CloseOwnershipTests.test_an_ignored_collision_does_not_clear_the_buffer)
+INSERT OR IGNORE returning cleanly is not proof of durability. ... FAIL
+test_final_trade_path_failure_keeps_position_then_retries_exactly_once (tests.test_close_ownership.CloseOwnershipTests.test_final_trade_path_failure_keeps_position_then_retries_exactly_once) ... FAIL
+test_restored_position_resumes_at_durable_max_sequence (tests.test_close_ownership.CloseOwnershipTests.test_restored_position_resumes_at_durable_max_sequence) ... FAIL
+test_uncommitted_final_close_restores_open_trade_after_restart (tests.test_close_ownership.CloseOwnershipTests.test_uncommitted_final_close_restores_open_trade_after_restart) ... FAIL
+
+======================================================================
+FAIL: test_an_ignored_collision_does_not_clear_the_buffer (tests.test_close_ownership.CloseOwnershipTests.test_an_ignored_collision_does_not_clear_the_buffer)
+INSERT OR IGNORE returning cleanly is not proof of durability.
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_close_ownership.py", line 232, in test_an_ignored_collision_does_not_clear_the_buffer
+    self.assertEqual(
+AssertionError: 1 != 0 : a fully ignored batch must report zero durable rows, not the input length
+
+======================================================================
+FAIL: test_final_trade_path_failure_keeps_position_then_retries_exactly_once (tests.test_close_ownership.CloseOwnershipTests.test_final_trade_path_failure_keeps_position_then_retries_exactly_once)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_close_ownership.py", line 106, in test_final_trade_path_failure_keeps_position_then_retries_exactly_once
+    self.assertEqual(
+AssertionError: 'closed' != 'open'
+- closed
++ open
+ : the trade was closed even though its final path never persisted
+
+======================================================================
+FAIL: test_restored_position_resumes_at_durable_max_sequence (tests.test_close_ownership.CloseOwnershipTests.test_restored_position_resumes_at_durable_max_sequence)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_close_ownership.py", line 193, in test_restored_position_resumes_at_durable_max_sequence
+    self.assertEqual(
+AssertionError: 0 != 2 : durable path length was not restored, so the next sample reuses a key
+
+======================================================================
+FAIL: test_uncommitted_final_close_restores_open_trade_after_restart (tests.test_close_ownership.CloseOwnershipTests.test_uncommitted_final_close_restores_open_trade_after_restart)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_close_ownership.py", line 169, in test_uncommitted_final_close_restores_open_trade_after_restart
+    self.assertIn(
+AssertionError: 1 not found in {} : an uncommitted close did not restore as an open, retryable trade
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.113s
+
+FAILED (failures=4)

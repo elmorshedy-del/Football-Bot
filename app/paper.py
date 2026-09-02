@@ -179,6 +179,20 @@ class PaperDesk:
             pos.max_executable_bid = row.get("max_executable_bid")
             pos.max_executable_bid_ts = row.get("max_executable_bid_ts")
             pos.mfe_c = row.get("mfe_c")
+            # Resume the path at the durable maximum sequence.  Starting from
+            # zero made the first post-restart quote reuse sequence 1, which the
+            # partial unique index ignored, so the observation was lost in
+            # silence and the cap restarted from empty.
+            durable_seq = int(row.get("path_max_seq") or 0)
+            durable_rows = int(row.get("path_rows_durable") or 0)
+            pos.exec_path_total = max(durable_seq, durable_rows)
+            pos.exec_path_terminal_written = bool(row.get("path_has_terminal"))
+            # The in-memory tail of an abnormally stopped process is gone; the
+            # last durable observation is unknown, so no signature is restored
+            # and the next quote is recorded rather than deduplicated away.
+            pos.exec_path_last = None
+            if durable_rows:
+                pos.path_restored_from_seq = durable_seq
             self.positions[pos.tid] = pos
         if self.positions:
             self._safe_log("paper", f"restored {len(self.positions)} open paper positions")
@@ -547,7 +561,7 @@ class PaperDesk:
         if pos.exec_path:
             rows = list(pos.exec_path)
             try:
-                store.insert_bid_path(rows)
+                written = store.insert_bid_path(rows)
             except Exception as exc:
                 # Keep the buffer.  Clearing before the write made a failed
                 # write lose the rows permanently; retrying on the next flush
@@ -555,6 +569,15 @@ class PaperDesk:
                 pos.exec_path_flush_failed = True
                 self._report_error("bid_path", exc)
             else:
+                if isinstance(written, int) and written < len(rows):
+                    # An ignored row means its sequence key already exists.
+                    # That is expected for a retry of rows we know are durable,
+                    # and a real fault otherwise, so it is reported rather than
+                    # treated as a successful write.
+                    self._report_error("bid_path", RuntimeError(
+                        f"trade {pos.tid}: {len(rows) - written} of {len(rows)} "
+                        "path rows collided with an existing sequence key",
+                    ))
                 pos.exec_path = pos.exec_path[len(rows):]
                 pos.exec_path_flush_failed = False
         if final:
@@ -730,15 +753,28 @@ class PaperDesk:
         source = shadow.yes_bids if pos.side == "yes" else shadow.no_bids
         before = dict(source)
         shadow.consume_sell(pos.side, fill)
+        if final is not None:
+            # Last write for this trade: the terminal row joins the same
+            # transaction as the final fill, progress and closed fields.
+            self._record_exec_terminal(pos, final["exit_px"], now_wall)
         try:
             store.record_paper_exit(
                 pos.tid, pos.signal_id, pos.side, now_wall, order.reason, fees, progress,
                 max(0.0, (now_wall - order.queued_wall) * 1000.0), final,
+                path_rows=list(pos.exec_path) if final is not None else None,
+                truncated=bool(pos.exec_path_dropped),
+                dropped_samples=pos.exec_path_dropped,
             )
         except Exception:
             source.clear()
             source.update(before)
+            if final is not None:
+                self._retract_terminal(pos)
+                pos.exec_path_flush_failed = True
             raise
+        if final is not None:
+            pos.exec_path = []
+            pos.exec_path_flush_failed = False
         pos.remaining = remaining
         pos.realized_gross = realized_gross
         pos.exit_fees = exit_fees
@@ -787,10 +823,25 @@ class PaperDesk:
                     pos, realized_gross, pos.entry_fees + pos.exit_fees,
                     exit_qty, exit_vwap_num,
                 )
-                store.record_paper_exit(
-                    pos.tid, pos.signal_id, pos.side, time.time(), "settle",
-                    [(exit_px, qty, 0.0)], progress, 0.0, final,
-                )
+                settled_at = time.time()
+                self._record_exec_terminal(pos, final["exit_px"], settled_at)
+                try:
+                    store.record_paper_exit(
+                        pos.tid, pos.signal_id, pos.side, settled_at, "settle",
+                        [(exit_px, qty, 0.0)], progress, 0.0, final,
+                        path_rows=list(pos.exec_path),
+                        truncated=bool(pos.exec_path_dropped),
+                        dropped_samples=pos.exec_path_dropped,
+                    )
+                except Exception as exc:
+                    # Settlement is the same all-or-nothing contract: keep the
+                    # position owned rather than half-settling it.
+                    self._retract_terminal(pos)
+                    pos.exec_path_flush_failed = True
+                    self._report_error("paper_settle", exc)
+                    continue
+                pos.exec_path = []
+                pos.exec_path_flush_failed = False
                 pos.realized_gross = realized_gross
                 pos.exit_qty = exit_qty
                 pos.exit_vwap_num = exit_vwap_num
@@ -812,8 +863,9 @@ class PaperDesk:
         }
 
     def _complete_realistic(self, pos, reason, final):
-        self._record_exec_terminal(pos, final.get("exit_px"), time.time())
-        self._flush_exec_path(pos, final=True)
+        # The path, summary and closed fields were already committed with the
+        # final fill by record_paper_exit(); reaching here means that
+        # transaction succeeded, so the position may finally be released.
         self.positions.pop(pos.tid, None)
         self.pending_exits.pop(pos.tid, None)
         self._safe_broadcast({"type": "trade_close", "trade": {
@@ -831,11 +883,28 @@ class PaperDesk:
         if reason != "settle" and config.FEE_EXIT_TAKER:
             fees += fee_dollars(pos.size, exit_px)
         net = gross - fees
-        store.close_trade(pos.tid, round(exit_px, 2), reason, round(gross, 2),
-                          round(fees, 2), round(net, 2), round(pos.mae, 2),
-                          pos.shadow_stop_hit_px)
+        # Terminal row first, then ONE transaction covering path, summary and
+        # the closed-trade fields.  Closing before flushing the path left a
+        # closed trade whose final rows had no owner when the write failed.
         self._record_exec_terminal(pos, round(exit_px, 2), time.time())
-        self._flush_exec_path(pos, final=True)
+        try:
+            store.close_trade(
+                pos.tid, round(exit_px, 2), reason, round(gross, 2),
+                round(fees, 2), round(net, 2), round(pos.mae, 2),
+                pos.shadow_stop_hit_px,
+                path_rows=list(pos.exec_path),
+                truncated=bool(pos.exec_path_dropped),
+                dropped_samples=pos.exec_path_dropped,
+            )
+        except Exception as exc:
+            # Nothing committed: keep owning the position so a later attempt can
+            # retry the same sequence keys.  No close is broadcast or logged.
+            pos.exec_path_flush_failed = True
+            self._retract_terminal(pos)
+            self._report_error("paper_close", exc)
+            return False
+        pos.exec_path = []
+        pos.exec_path_flush_failed = False
         self.positions.pop(pos.tid, None)
         self.broadcast({"type": "trade_close", "trade": {
             "id": pos.tid, "market": pos.market, "series": pos.series, "side": pos.side,
@@ -843,6 +912,18 @@ class PaperDesk:
             "size": round(pos.size, 1), "reason": reason, "net": round(net, 2),
             "strategy": pos.strategy}})
         store.log_event("trade", f"CLOSE {pos.market} {reason} net ${net:+.2f}")
+        return True
+
+    def _retract_terminal(self, pos):
+        """Undo an unpersisted terminal row so a retry appends exactly one.
+
+        The row stays in the buffer only if it was already durable; otherwise a
+        retry would append a second terminal sample under a new sequence key.
+        """
+        while pos.exec_path and pos.exec_path[-1].get("terminal"):
+            pos.exec_path.pop()
+            pos.exec_path_total = max(0, pos.exec_path_total - 1)
+        pos.exec_path_terminal_written = False
 
     def flatten_all(self, reason="flatten"):
         for pos in list(self.positions.values()):

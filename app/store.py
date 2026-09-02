@@ -522,10 +522,36 @@ def insert_bid_path(rows):
     The caller accumulates samples in memory for the life of a position or a
     decline window and flushes once.  Committing per sample would add a
     synchronous fsync to the asyncio hot path for every book update.
+
+    Returns the number of rows that actually became durable, which is NOT the
+    input length: `INSERT OR IGNORE` silently drops a row whose sequence key
+    already exists.  Returning the input length let a caller clear its buffer
+    on a batch that wrote nothing.
     """
     if not rows:
         return 0
-    payload = [
+    payload = _bid_path_payload(rows)
+    with _lock:
+        before = _conn.total_changes
+        _conn.executemany(_BID_PATH_INSERT, payload)
+        written = _conn.total_changes - before
+        _conn.commit()
+    return written
+
+
+_BID_PATH_INSERT = """INSERT OR IGNORE INTO bid_path_samples(
+       kind,trade_id,signal_id,event,market,side,strategy,
+       anchor_ts,dt_ms,bid,bid_size,exec_px,qty,mode,
+       sample_seq,availability,terminal)
+     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
+
+_BID_PATH_COLUMNS = (
+    "dt_ms,bid,bid_size,exec_px,qty,availability,terminal,sample_seq"
+)
+
+
+def _bid_path_payload(rows):
+    return [
         (
             row.get("kind"), row.get("trade_id"), row.get("signal_id"),
             row.get("event"), row.get("market"), row.get("side"),
@@ -538,17 +564,31 @@ def insert_bid_path(rows):
         )
         for row in rows
     ]
-    with _lock:
-        _conn.executemany(
-            """INSERT OR IGNORE INTO bid_path_samples(
-                   kind,trade_id,signal_id,event,market,side,strategy,
-                   anchor_ts,dt_ms,bid,bid_size,exec_px,qty,mode,
-                   sample_seq,availability,terminal)
-                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            payload,
-        )
-        _conn.commit()
-    return len(payload)
+
+
+def _read_rows(cursor):
+    columns = [column[0] for column in cursor.description]
+    return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+
+def _persist_path_in_transaction(rows, owner_column, owner_id, extra_where="",
+                                 truncated=False, dropped_samples=0):
+    """Write buffered path rows and derive the summary from what is persisted.
+
+    Must be called with ``_lock`` held and inside an open transaction.  The
+    summary is read back after the inserts so it always describes exactly the
+    rows on disk, never the caller's in-memory guess.
+    """
+    if rows:
+        _conn.executemany(_BID_PATH_INSERT, _bid_path_payload(rows))
+    samples = _read_rows(_conn.execute(
+        f"SELECT {_BID_PATH_COLUMNS} FROM bid_path_samples"
+        f" WHERE {owner_column}=?{extra_where} ORDER BY dt_ms LIMIT ?",
+        (owner_id, BID_PATH_MAX_SAMPLES),
+    ))
+    return bid_path_summary(
+        samples, truncated=truncated, dropped_samples=dropped_samples,
+    )
 
 
 def set_trade_path_summary(trade_id, summary):
@@ -970,10 +1010,33 @@ def open_paper_trade(t, detail, fill_levels, entry_fee, latency_ms, order_arriva
 
 
 def record_paper_exit(tid, signal_id, side, ts, reason, fill_levels, progress,
-                      latency_ms, final=None):
-    """Atomically persist exit fills, position progress, and optional close."""
+                      latency_ms, final=None, path_rows=None, truncated=False,
+                      dropped_samples=0):
+    """Atomically persist exit fills, position progress, and optional close.
+
+    When `final` is supplied this is the trade's last write, so the remaining
+    buffered path rows, the terminal row, the derived summary, the final fill
+    and the closed-trade fields all commit as ONE transaction.  They used to be
+    two: the trade was closed first and the path flushed afterwards, so a failed
+    path write left a closed trade, an orphaned buffer and no retry owner.
+
+    Raises on failure with nothing written; the caller must keep owning the
+    position.  Retrying is safe because path rows carry a sequence key.
+    """
     with _lock:
         try:
+            if final is not None:
+                summary = _persist_path_in_transaction(
+                    path_rows, "trade_id", tid,
+                    truncated=truncated, dropped_samples=dropped_samples,
+                )
+                _conn.execute(
+                    "UPDATE trades SET bid_path_summary=? WHERE id=?",
+                    (json.dumps(summary, separators=(",", ":")) if summary else None,
+                     tid),
+                )
+            elif path_rows:
+                _conn.executemany(_BID_PATH_INSERT, _bid_path_payload(path_rows))
             for price, quantity, fee in fill_levels:
                 _conn.execute(
                     """INSERT INTO paper_fills(trade_id,signal_id,ts,leg,side,price,quantity,
@@ -1011,17 +1074,47 @@ def load_open_paper_positions():
     return q(
         """SELECT t.*, s.ref, s.ext, s.detail AS signal_detail,
                   COALESCE((SELECT SUM(f.fee) FROM paper_fills f
-                            WHERE f.trade_id=t.id AND f.leg='entry'), 0) AS entry_fees
+                            WHERE f.trade_id=t.id AND f.leg='entry'), 0) AS entry_fees,
+                  -- Durable path state: without it the first post-restart sample
+                  -- reuses sequence 1, collides with history, and is silently
+                  -- dropped by the partial unique index.
+                  COALESCE((SELECT MAX(p.sample_seq) FROM bid_path_samples p
+                            WHERE p.trade_id=t.id), 0) AS path_max_seq,
+                  COALESCE((SELECT COUNT(*) FROM bid_path_samples p
+                            WHERE p.trade_id=t.id), 0) AS path_rows_durable,
+                  COALESCE((SELECT MAX(p.terminal) FROM bid_path_samples p
+                            WHERE p.trade_id=t.id), 0) AS path_has_terminal
              FROM trades t LEFT JOIN signals s ON s.id=t.signal_id
             WHERE t.status='open' AND t.mode=? ORDER BY t.id""",
         (_mode,),
     )
 
 
-def close_trade(tid, exit_px, reason, gross, fees, net, mae, shadow_stop_px):
-    ex("""UPDATE trades SET exit_ts=?, exit_px=?, exit_reason=?, gross=?, fees=?, net=?,
-          mae=?, shadow_stop_px=?, status='closed' WHERE id=?""",
-       (time.time(), exit_px, reason, gross, fees, net, mae, shadow_stop_px, tid))
+def close_trade(tid, exit_px, reason, gross, fees, net, mae, shadow_stop_px,
+                path_rows=None, truncated=False, dropped_samples=0):
+    """Close a simple (non-realistic) trade and its path in ONE transaction.
+
+    Same contract as `record_paper_exit`: path rows, terminal row, summary and
+    the closed-trade fields commit together or not at all.
+    """
+    with _lock:
+        try:
+            summary = _persist_path_in_transaction(
+                path_rows, "trade_id", tid,
+                truncated=truncated, dropped_samples=dropped_samples,
+            )
+            _conn.execute(
+                """UPDATE trades SET exit_ts=?, exit_px=?, exit_reason=?, gross=?,
+                       fees=?, net=?, mae=?, shadow_stop_px=?, bid_path_summary=?,
+                       status='closed' WHERE id=?""",
+                (time.time(), exit_px, reason, gross, fees, net, mae, shadow_stop_px,
+                 json.dumps(summary, separators=(",", ":")) if summary else None,
+                 tid),
+            )
+            _conn.commit()
+        except Exception:
+            _conn.rollback()
+            raise
 
 
 def _paper_fill_integrity(trade):
