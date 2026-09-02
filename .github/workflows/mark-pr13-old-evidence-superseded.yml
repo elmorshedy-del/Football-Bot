@@ -1,0 +1,64 @@
+name: Mark PR13 old evidence superseded
+
+on:
+  push:
+    branches:
+      - claude/binding-handoff-review-0ajqcl
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: claude/binding-handoff-review-0ajqcl
+          fetch-depth: 0
+      - name: Mark historical evidence and fix hash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          old = Path('docs/evidence/pr13/0cbf651/EVIDENCE_INDEX.md')
+          text = old.read_text()
+          text = text.replace(
+              '# PR 13 evidence index — candidate `0cbf651`\n',
+              '# HISTORICAL — PR 13 evidence index — candidate `0cbf651`\n\n'
+              '> **Superseded for current hand-back.** Use '
+              '`docs/evidence/pr13/cb273b4/EVIDENCE_INDEX.md` for the final validated '
+              'candidate and CI record. The values below are retained as historical evidence.\n',
+              1,
+          )
+          text = text.replace(
+              '`f23dc040ab7455634e94be5bb58e05cb8b76d044368e63a72743562aa110d9c3`',
+              '`7bc6b04d5bc35b7cdd641eaae69c9aad3dd5bfa71dfab878370323adbeaa67e7`',
+              1,
+          )
+          old.write_text(text)
+
+          log = Path('docs/DUAL_SLEEVE_CHANGELOG.md')
+          text = log.read_text()
+          text = text.replace(
+              '**Note on draft state.** PR #13 is currently **not** a draft. §3.4 requires it to stay draft, and\n'
+              'the implementer has not changed the PR\'s state. It needs converting to draft before review.',
+              '**Historical note on draft state.** At this earlier hand-back PR #13 was **not** a draft. '
+              'It was subsequently converted back to draft; the final evidence refresh below records the current state.',
+              1,
+          )
+          log.write_text(text)
+          PY
+          grep -q 'Superseded for current hand-back' docs/evidence/pr13/0cbf651/EVIDENCE_INDEX.md
+          grep -q '7bc6b04d5bc35b7cdd641eaae69c9aad3dd5bfa71dfab878370323adbeaa67e7' docs/evidence/pr13/0cbf651/EVIDENCE_INDEX.md
+          grep -q 'Historical note on draft state' docs/DUAL_SLEEVE_CHANGELOG.md
+          rm .github/workflows/mark-pr13-old-evidence-superseded.yml
+          git diff --check
+      - name: Commit cleanup
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/evidence/pr13/0cbf651/EVIDENCE_INDEX.md docs/DUAL_SLEEVE_CHANGELOG.md .github/workflows/mark-pr13-old-evidence-superseded.yml
+          git commit -m "Mark stale PR13 evidence as superseded"
+          git push origin HEAD:claude/binding-handoff-review-0ajqcl
