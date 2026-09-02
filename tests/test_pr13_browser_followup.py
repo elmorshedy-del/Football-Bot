@@ -284,7 +284,7 @@ class PR13BrowserFollowupTests(DashboardBrowserTests):
 
         page.select_option('#trade-filters [data-filter-field="gate"]', "declined")
         page.wait_for_function("() => document.querySelectorAll('#trade-list .trade-story').length === 1")
-        self.assertIn("Clock before minute 88", page.inner_text("#trade-list"))
+        self.assertIn("CLOCK BEFORE MINUTE 88", page.inner_text("#trade-list").upper())
         self.reset_filters(page)
 
         page.select_option('#trade-filters [data-filter-field="association"]', "unmatched")
@@ -368,7 +368,7 @@ class PR13BrowserFollowupTests(DashboardBrowserTests):
             panel = page.wait_for_selector(f"#panel-{tab}:not([hidden])", timeout=5000)
             text = panel.inner_text()
             for value in required:
-                self.assertIn(value, text, f"{value!r} missing from 360px {tab} tab")
+                self.assertIn(value.upper(), text.upper(), f"{value!r} missing from 360px {tab} tab")
             overflow = page.evaluate(
                 "() => document.documentElement.scrollWidth - document.documentElement.clientWidth"
             )

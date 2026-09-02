@@ -231,7 +231,7 @@ class SignalPathOwnershipTests(unittest.TestCase):
 
     def test_failed_startup_rebuild_retains_retry_owner_then_recovers(self):
         sid = self.signal()
-        with patch("app.engine.store.finalize_signal_path_with_rows",
+        with patch("app.engine.store.finalize_signal_path",
                    side_effect=OSError("disk full")):
             rebuilt = self.engine.rebuild_signal_paths()
 
@@ -255,14 +255,14 @@ class SignalPathOwnershipTests(unittest.TestCase):
     def test_one_success_cannot_clear_another_failed_watch_fault(self):
         failed_sid = self.signal()
         successful_sid = self.signal()
-        real_finalize = store.finalize_signal_path_with_rows
+        real_finalize = store.finalize_signal_path
 
         def selective(signal_id, *args, **kwargs):
             if signal_id == failed_sid:
                 raise OSError("failed owner")
             return real_finalize(signal_id, *args, **kwargs)
 
-        with patch("app.engine.store.finalize_signal_path_with_rows", side_effect=selective):
+        with patch("app.engine.store.finalize_signal_path", side_effect=selective):
             rebuilt = self.engine.rebuild_signal_paths()
 
         self.assertEqual(rebuilt, 1)
