@@ -1,18 +1,52 @@
 """SQLite persistence + aggregate stats (event-clustered bootstrap, kill conditions)."""
+import asyncio
 import json
 import os
 import random
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
 
 from . import config
 from . import match_clock
 from . import match_events
 from .match_events import normalize_match_event
 
+# The single writer.  Every INSERT/UPDATE/DELETE and the collector's own reads
+# go through `_conn` under `_lock`, which serialises writes and preserves the
+# careful per-write transactions below.  Dashboard/API reads do NOT take this
+# lock: they run on their own read-only connections (see `_reader`) so a slow
+# analytics scan can never stall a live collector write, and vice versa.  WAL
+# (enabled in `init`) lets those readers see a consistent snapshot concurrently
+# with the writer.
 _lock = threading.Lock()
 _conn = None
+
+# Per-thread read-only connection pool.  API reads are dispatched onto worker
+# threads (see `read`) so they never block the event loop; each worker keeps one
+# read-only connection, recycled when the database is (re)initialised.
+_read_state = threading.local()
+_db_generation = 0
+
+# When true on the current thread, `q` uses a read-only connection instead of
+# the writer.  Set only inside `read`, so the collector/event-loop path is
+# byte-for-byte unchanged and only dispatched API reads are isolated.
+_read_ctx = threading.local()
+
+# Deterministic aggregate cache.  `stats` recomputes an event-clustered
+# bootstrap over the whole study on every call; the dashboard, the WebSocket
+# hello and the 5s broadcast all ask for it, so multiple tabs plus a reconnect
+# storm used to recompute the same numbers many times a second.  The cache is
+# keyed on the writer's total change count, so it is returned only while the
+# underlying rows are unchanged and is invalidated the instant anything is
+# written -- it can never serve a stale study.
+_stats_cache = {}
+
+# Lightweight read timing so the API layer can report SQLite wait+exec time
+# separately from Python transform and serialisation time (see main._perf).
+_perf_lock = threading.Lock()
+_read_perf = {"count": 0, "total_ms": 0.0, "max_ms": 0.0, "recent_ms": []}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS markets(
@@ -34,12 +68,27 @@ CREATE TABLE IF NOT EXISTS trades(
   exit_qty REAL DEFAULT 0, exit_vwap_num REAL DEFAULT 0,
   fee_type TEXT, fee_multiplier REAL, strategy TEXT,
   max_executable_bid REAL, max_executable_bid_ts REAL, mfe_c REAL);
+-- stats() joins every signal to its trade (signals LEFT JOIN trades ON
+-- t.signal_id=s.id) and /api/signals and /api/trades look trades up by
+-- signal_id.  Without this index that join is O(signals x trades) -- a full
+-- trades scan per signal -- so an ordinary stats refresh degraded quadratically
+-- as the study grew.  status scoping backs the open/closed splits.
+CREATE INDEX IF NOT EXISTS idx_trades_signal_id ON trades(signal_id);
+CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status);
 CREATE TABLE IF NOT EXISTS paper_fills(
   id INTEGER PRIMARY KEY AUTOINCREMENT, trade_id INTEGER, signal_id INTEGER,
   ts REAL, leg TEXT, side TEXT, price REAL, quantity REAL, notional REAL,
   fee REAL, reason TEXT, mode TEXT);
+-- Open-position recovery and fill integrity sum fees per trade_id; without this
+-- each was a full paper_fills scan.
+CREATE INDEX IF NOT EXISTS idx_paper_fills_trade ON paper_fills(trade_id);
 CREATE TABLE IF NOT EXISTS latency(
   ts REAL, kind TEXT, ms REAL);
+-- Readiness summaries and /api/latency both fetch the newest rows per kind
+-- (WHERE kind IN (...) ORDER BY ts DESC LIMIT n).  latency grows fast (a
+-- feed_lag row per frame), so without this index every summary full-scanned the
+-- whole table -- eight scans per status() call, on the event loop.
+CREATE INDEX IF NOT EXISTS idx_latency_kind_ts ON latency(kind, ts);
 CREATE TABLE IF NOT EXISTS eventlog(
   ts REAL, kind TEXT, text TEXT);
 CREATE TABLE IF NOT EXISTS goal_latency_observations(
@@ -370,6 +419,13 @@ def init():
                  event, fingerprint, COALESCE(mode, 'legacy_unknown'));"""
     )
     _conn.commit()
+    # A fresh database (new process, or a test's temp dir) invalidates every
+    # pooled read connection and every cached aggregate.  Bumping the generation
+    # makes each worker lazily reopen its read connection against the new file
+    # the next time it reads.
+    global _db_generation
+    _db_generation += 1
+    _stats_cache.clear()
 
 
 def set_mode(m):
@@ -403,11 +459,102 @@ def ex(sql, args=()):
         return cur
 
 
+def _reader():
+    """Return this thread's read-only connection, opening it if needed.
+
+    Each worker thread keeps its own connection so reads run concurrently under
+    WAL without taking the writer's lock.  `isolation_level=None` keeps every
+    SELECT in autocommit, so a read never pins an old WAL snapshot or blocks the
+    writer's checkpoint; `query_only` makes an accidental write fail loudly
+    rather than corrupt the study.
+    """
+    entry = getattr(_read_state, "entry", None)
+    if entry is not None:
+        conn, generation = entry
+        if generation == _db_generation:
+            return conn
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+    conn = sqlite3.connect(
+        database_path(), check_same_thread=False, timeout=30.0, isolation_level=None,
+    )
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA query_only=ON")
+    _read_state.entry = (conn, _db_generation)
+    return conn
+
+
+def _record_read_perf(elapsed_ms):
+    with _perf_lock:
+        _read_perf["count"] += 1
+        _read_perf["total_ms"] += elapsed_ms
+        _read_perf["max_ms"] = max(_read_perf["max_ms"], elapsed_ms)
+        recent = _read_perf["recent_ms"]
+        recent.append(round(elapsed_ms, 3))
+        if len(recent) > 200:
+            del recent[0]
+
+
 def q(sql, args=()):
+    """Read rows as dicts.
+
+    On the collector/event-loop path this uses the writer connection under
+    `_lock`, exactly as before.  Inside a dispatched API read (`read`), it uses a
+    lock-free read-only connection so dashboard scans never contend with live
+    writes.
+    """
+    if getattr(_read_ctx, "enabled", False):
+        started = time.perf_counter()
+        cur = _reader().execute(sql, args)
+        cols = [c[0] for c in cur.description]
+        rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        _record_read_perf((time.perf_counter() - started) * 1000.0)
+        return rows
     with _lock:
         cur = _conn.execute(sql, args)
         cols = [c[0] for c in cur.description]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+@contextmanager
+def _read_only():
+    prev = getattr(_read_ctx, "enabled", False)
+    _read_ctx.enabled = True
+    try:
+        yield
+    finally:
+        _read_ctx.enabled = prev
+
+
+async def read(fn, *args, **kwargs):
+    """Run a read-only DB function off the event loop on a read connection.
+
+    This is the seam that keeps the async application responsive: heavy dashboard
+    queries and aggregates run on a worker thread against a read-only connection,
+    so the event loop stays free to serve lightweight endpoints and the live
+    WebSocket even while a multi-second scan is in flight.
+    """
+    def runner():
+        with _read_only():
+            return fn(*args, **kwargs)
+
+    return await asyncio.to_thread(runner)
+
+
+def read_perf():
+    """Snapshot of read-connection timing for the operational perf endpoint."""
+    with _perf_lock:
+        count = _read_perf["count"]
+        recent = sorted(_read_perf["recent_ms"])
+        return {
+            "reads": count,
+            "avg_ms": round(_read_perf["total_ms"] / count, 3) if count else 0.0,
+            "max_ms": round(_read_perf["max_ms"], 3),
+            "p95_ms": _percentile(recent, 0.95) if recent else None,
+            "recent_sample": len(recent),
+        }
 
 
 def database_health():
@@ -1387,18 +1534,36 @@ def _signal_strategy(row):
 
 
 def _event_cluster_ci(closed):
-    """Deterministic event-clustered bootstrap interval for closed net per fill."""
+    """Deterministic event-clustered bootstrap interval for closed net per fill.
+
+    Each iteration resamples ``len(evs)`` whole event clusters (with replacement)
+    and takes the mean net over every fill in the resample.  That mean is
+    identically ``sum(chosen cluster sums) / sum(chosen cluster counts)``, so the
+    per-cluster (sum, count) is precomputed and the iteration is O(clusters)
+    rather than O(fills): the old form rebuilt a flat list of every resampled
+    fill 2,000 times, which cost seconds on a full study.  ``rnd.choice`` is
+    called the same number of times in the same order over an equal-length
+    sequence, so the seeded draw -- and therefore the interval -- is byte-for-byte
+    unchanged (see test_event_cluster_ci_matches_reference).
+    """
     by_ev = {}
     for t in closed:
         by_ev.setdefault(t["event"], []).append(t["net"] or 0)
     evs = list(by_ev.values())
     ci = None
     if len(evs) >= 5:
+        clusters = [(sum(group), len(group)) for group in evs]
+        k = len(clusters)
         rnd = random.Random(7)
         means = []
         for _ in range(2000):
-            flat = [x for _ in range(len(evs)) for x in rnd.choice(evs)]
-            means.append(sum(flat) / len(flat))
+            total = 0.0
+            count = 0
+            for _ in range(k):
+                cluster_sum, cluster_n = rnd.choice(clusters)
+                total += cluster_sum
+                count += cluster_n
+            means.append(total / count)
         means.sort()
         ci = [round(means[int(0.025 * len(means))], 2), round(means[int(0.975 * len(means))], 2)]
     return ci
@@ -1494,6 +1659,26 @@ def _strategy_summary(closed, open_t, signals, latency_evidence):
 
 
 def stats(mode=None):
+    """Aggregate the study for one capture mode (the active mode by default).
+
+    The result is memoised on the writer's total change count (see
+    `_stats_cache`): concurrent dashboard/WebSocket callers share one
+    computation while the study is unchanged, and any write invalidates it, so
+    the numbers are never served stale.  The expensive event-clustered bootstrap
+    in `_compute_stats` therefore runs at most once per change, not once per
+    poll -- collapsing multi-tab refreshes and reconnect storms onto one pass.
+    """
+    key = _mode if mode is None else mode
+    version = _conn.total_changes if _conn is not None else -1
+    cached = _stats_cache.get(key)
+    if cached is not None and cached[0] == version:
+        return cached[1]
+    result = _compute_stats(mode)
+    _stats_cache[key] = (version, result)
+    return result
+
+
+def _compute_stats(mode=None):
     """Aggregate the study for one capture mode (the active mode by default).
 
     Isolation is enforced here rather than by deleting rows at startup, so demo

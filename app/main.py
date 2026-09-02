@@ -1,14 +1,16 @@
 """Football-Bot — FastAPI app: dashboard, REST API, live WebSocket feed."""
 import asyncio
 import json
+import logging
 import os
 import re
 import secrets
 import threading
 import time
+from collections import deque
 from contextlib import asynccontextmanager, suppress
 
-from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
@@ -36,6 +38,20 @@ _export_lock = threading.Lock()
 _raw_download_token = secrets.token_urlsafe(32)
 EXPORT_JOB_TTL_S = 3600
 _RANGE_SPEC = re.compile(r"bytes=(\d*)-(\d*)\Z")
+
+log = logging.getLogger("footballbot.perf")
+
+# Per-request server timing.  The dashboard's 20-second failures were an
+# event-loop starvation cascade, and the only signal the old system exposed was
+# the browser-observed total duration -- which cannot tell edge/network time
+# from time the request actually spent being served.  This ring buffer plus the
+# `Server-Timing` header (added in `_timing_middleware`) make the server's own
+# view measurable: how long each endpoint took to serve, distinct from the
+# read-connection SQLite time tracked in `store.read_perf`.
+_PERF_HISTORY = 256
+_SLOW_REQUEST_MS = 1000.0
+_perf_lock = threading.Lock()
+_request_perf = deque(maxlen=_PERF_HISTORY)
 
 
 def _mode_selector(value=None):
@@ -129,7 +145,59 @@ async def lifespan(_app):
         await engine.client.close()
 
 
+def _record_request_perf(method, path, elapsed_ms, status):
+    with _perf_lock:
+        _request_perf.append({
+            "ts": time.time(), "method": method, "path": path,
+            "ms": round(elapsed_ms, 1), "status": status,
+        })
+
+
+class _TimingMiddleware:
+    """Pure-ASGI request timing.
+
+    Deliberately not a `BaseHTTPMiddleware`: this must wrap the export
+    `StreamingResponse`/`FileResponse` downloads without buffering their bodies
+    or dropping their background lease-release tasks.  It stamps a
+    `Server-Timing` header at response start -- so a browser can separate server
+    processing time from edge/network time -- and records the time-to-first-byte
+    (server processing, not client download speed) for `/api/perf`.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        started = time.perf_counter()
+        stamped = False
+
+        async def send_wrapper(message):
+            nonlocal stamped
+            if message["type"] == "http.response.start" and not stamped:
+                stamped = True
+                elapsed_ms = (time.perf_counter() - started) * 1000.0
+                message.setdefault("headers", [])
+                message["headers"].append(
+                    (b"server-timing", f"app;dur={elapsed_ms:.1f}".encode()))
+                path = scope.get("path", "")
+                if path.startswith("/api/"):
+                    method = scope.get("method", "GET")
+                    _record_request_perf(method, path, elapsed_ms, message["status"])
+                    if elapsed_ms >= _SLOW_REQUEST_MS:
+                        log.warning(
+                            "slow request %s %s served in %.0fms (status %s)",
+                            method, path, elapsed_ms, message["status"],
+                        )
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+
 app = FastAPI(title="Football-Bot", lifespan=lifespan)
+app.add_middleware(_TimingMiddleware)
 
 
 def _human_identifier(value):
@@ -271,6 +339,26 @@ async def health():
     return {"ok": True, "mode": engine.mode if engine else "starting"}
 
 
+@app.get("/api/perf")
+async def perf():
+    """Server-side timing so responsiveness is measurable, not inferred.
+
+    Separates what the old system could not: per-endpoint server processing time
+    (`requests`/`slowest`, from the timing middleware) from read-connection
+    SQLite wait+exec time (`db_reads`).  A browser additionally sees per-request
+    server time via the `Server-Timing` header, isolating edge/network latency.
+    """
+    with _perf_lock:
+        recent = list(_request_perf)
+    slowest = sorted(recent, key=lambda row: row["ms"], reverse=True)[:10]
+    return {
+        "slow_threshold_ms": _SLOW_REQUEST_MS,
+        "requests": recent[-50:],
+        "slowest": slowest,
+        "db_reads": store.read_perf(),
+    }
+
+
 @app.get("/api/status")
 async def status():
     return engine.status()
@@ -325,192 +413,228 @@ async def matches():
 async def signals(limit: int = 60, mode: str | None = None):
     limit = max(1, min(limit, 500))
     selector = _mode_selector(mode)
-    scope, scope_args = store.mode_clause("s", selector=selector)
-    rows = store.q(
-        f"""SELECT s.*,m.title AS market_title,m.display_game AS market_game,
-                  m.display_leg AS market_leg,m.close_time AS expected_expiration_time
-             FROM signals s
-             LEFT JOIN markets m ON m.ticker=s.market
-            WHERE 1=1{scope}
-            ORDER BY s.id DESC LIMIT ?""",
-        (*scope_args, limit),
-    )
-    _label_modes(rows)
-    trades_by_signal = _trades_by_signal_id(
-        (row["id"] for row in rows), mode=selector)
-    observations_by_event = _observations_by_event(
-        _event_observations(rows, mode=selector)
-    )
-    for row in rows:
-        _decorate_signal(
-            row,
-            observations_by_event.get(row.get("event"), ()),
-            trades_by_signal.get(row["id"]),
+
+    def _load():
+        scope, scope_args = store.mode_clause("s", selector=selector)
+        rows = store.q(
+            f"""SELECT s.*,m.title AS market_title,m.display_game AS market_game,
+                      m.display_leg AS market_leg,m.close_time AS expected_expiration_time
+                 FROM signals s
+                 LEFT JOIN markets m ON m.ticker=s.market
+                WHERE 1=1{scope}
+                ORDER BY s.id DESC LIMIT ?""",
+            (*scope_args, limit),
         )
-        row["forward_path_summary"] = json_object(row.get("forward_path_summary")) or None
-        row["forward_path_url"] = f"/api/signals/{row['id']}/path?mode={selector}"
-    return rows
+        _label_modes(rows)
+        trades_by_signal = _trades_by_signal_id(
+            (row["id"] for row in rows), mode=selector)
+        observations_by_event = _observations_by_event(
+            _event_observations(rows, mode=selector)
+        )
+        for row in rows:
+            _decorate_signal(
+                row,
+                observations_by_event.get(row.get("event"), ()),
+                trades_by_signal.get(row["id"]),
+            )
+            row["forward_path_summary"] = json_object(row.get("forward_path_summary")) or None
+            row["forward_path_url"] = f"/api/signals/{row['id']}/path?mode={selector}"
+        return rows
+
+    return await store.read(_load)
 
 
 @app.get("/api/trades")
 async def trades(limit: int = 200, mode: str | None = None):
     limit = max(1, min(limit, 500))
     selector = _mode_selector(mode)
-    scope, scope_args = store.mode_clause(selector=selector)
-    open_rows = store.q(
-        f"SELECT * FROM trades WHERE status='open'{scope} ORDER BY id",
-        scope_args,
-    )
-    closed_rows = store.q(
-        f"SELECT * FROM trades WHERE status='closed'{scope} ORDER BY id DESC LIMIT ?",
-        (*scope_args, limit),
-    )
-    rows = open_rows + closed_rows
-    _label_modes(rows)
+    # Snapshot live in-memory marks on the event loop before dispatching the DB
+    # work: the paper desk opens and closes positions on this loop, so iterating
+    # `engine.desk.positions` from a worker thread could race a mutation.
+    engine_mode = engine.mode if engine is not None else None
     live_marks = {}
-    if engine is not None and selector in {engine.mode, "all"}:
+    if engine is not None and selector in {engine_mode, "all"}:
         live_marks = {
             p.tid: engine.desk.pos_dict(p, p.best_bid)
             for p in engine.desk.positions.values()
         }
-    signal_rows = _rows_by_signal_id(
-        [row.get("signal_id") for row in rows], mode=selector,
-    )
-    observations_by_event = _observations_by_event(
-        _event_observations(signal_rows.values(), mode=selector)
-    )
-    for r in rows:
-        r.pop("book_at_entry", None)
-        signal = signal_rows.get(r.get("signal_id"))
-        r.update(_display_names(
-            r.get("market"), r.get("event"),
-            (signal or {}).get("market_title"), (signal or {}).get("market_leg"),
-            (signal or {}).get("market_game"),
-        ))
-        if signal:
-            signal["detail"] = json_object(signal.get("detail"))
-            signal["strategy"] = r.get("strategy") or signal_strategy(signal)
-            r["trigger"] = build_trigger(signal)
-            r["timing"] = timing_fields(signal, r)
-            r["schedule_window"] = schedule_window(signal)
-            r["matched_event"] = match_signal_event(
-                signal, observations_by_event.get(signal.get("event"), ())
-            )
-            r["match_clock"] = parse_stored_stamp(signal.get("match_clock_snapshot"))
-        r["high_after_entry_s"] = (
-            round(r["max_executable_bid_ts"] - r["entry_ts"], 3)
-            if isinstance(r.get("max_executable_bid_ts"), (int, float))
-            and isinstance(r.get("entry_ts"), (int, float)) else None
+
+    def _load():
+        scope, scope_args = store.mode_clause(selector=selector)
+        open_rows = store.q(
+            f"SELECT * FROM trades WHERE status='open'{scope} ORDER BY id",
+            scope_args,
         )
-        if r.get("mfe_c") is None and r.get("max_executable_bid") is not None \
-                and r.get("entry_px") is not None:
-            r["mfe_c"] = max(0.0, r["max_executable_bid"] - r["entry_px"])
-        # Read the summary persisted at close.  Fetching samples per row here
-        # meant up to 500 extra queries and millions of rows per refresh; the
-        # full path is served by /api/trades/{id}/path on demand.
-        r["bid_path_summary"] = json_object(r.get("bid_path_summary")) or None
-        r["bid_path_url"] = f"/api/trades/{r['id']}/path?mode={selector}"
-        mark = live_marks.get(r["id"])
-        if r.get("status") == "open" and mark and r.get("mode") == engine.mode:
-            # Storage is the selector source of truth; in-memory state may only
-            # enrich the matching active-mode parent, never select rows.
-            for key in ("bid", "upnl", "size", "initial_size",
-                        "max_executable_bid", "max_executable_bid_ts",
-                        "mfe_c", "high_after_entry_s"):
-                if key in mark:
-                    r[key] = mark[key]
-    return {
-        "open": [r for r in rows if r["status"] == "open"],
-        "closed": [r for r in rows if r["status"] == "closed"],
-    }
+        closed_rows = store.q(
+            f"SELECT * FROM trades WHERE status='closed'{scope} ORDER BY id DESC LIMIT ?",
+            (*scope_args, limit),
+        )
+        rows = open_rows + closed_rows
+        _label_modes(rows)
+        signal_rows = _rows_by_signal_id(
+            [row.get("signal_id") for row in rows], mode=selector,
+        )
+        observations_by_event = _observations_by_event(
+            _event_observations(signal_rows.values(), mode=selector)
+        )
+        for r in rows:
+            r.pop("book_at_entry", None)
+            signal = signal_rows.get(r.get("signal_id"))
+            r.update(_display_names(
+                r.get("market"), r.get("event"),
+                (signal or {}).get("market_title"), (signal or {}).get("market_leg"),
+                (signal or {}).get("market_game"),
+            ))
+            if signal:
+                signal["detail"] = json_object(signal.get("detail"))
+                signal["strategy"] = r.get("strategy") or signal_strategy(signal)
+                r["trigger"] = build_trigger(signal)
+                r["timing"] = timing_fields(signal, r)
+                r["schedule_window"] = schedule_window(signal)
+                r["matched_event"] = match_signal_event(
+                    signal, observations_by_event.get(signal.get("event"), ())
+                )
+                r["match_clock"] = parse_stored_stamp(signal.get("match_clock_snapshot"))
+            r["high_after_entry_s"] = (
+                round(r["max_executable_bid_ts"] - r["entry_ts"], 3)
+                if isinstance(r.get("max_executable_bid_ts"), (int, float))
+                and isinstance(r.get("entry_ts"), (int, float)) else None
+            )
+            if r.get("mfe_c") is None and r.get("max_executable_bid") is not None \
+                    and r.get("entry_px") is not None:
+                r["mfe_c"] = max(0.0, r["max_executable_bid"] - r["entry_px"])
+            # Read the summary persisted at close.  Fetching samples per row here
+            # meant up to 500 extra queries and millions of rows per refresh; the
+            # full path is served by /api/trades/{id}/path on demand.
+            r["bid_path_summary"] = json_object(r.get("bid_path_summary")) or None
+            r["bid_path_url"] = f"/api/trades/{r['id']}/path?mode={selector}"
+            mark = live_marks.get(r["id"])
+            if r.get("status") == "open" and mark and r.get("mode") == engine_mode:
+                # Storage is the selector source of truth; in-memory state may only
+                # enrich the matching active-mode parent, never select rows.
+                for key in ("bid", "upnl", "size", "initial_size",
+                            "max_executable_bid", "max_executable_bid_ts",
+                            "mfe_c", "high_after_entry_s"):
+                    if key in mark:
+                        r[key] = mark[key]
+        return {
+            "open": [r for r in rows if r["status"] == "open"],
+            "closed": [r for r in rows if r["status"] == "closed"],
+        }
+
+    return await store.read(_load)
 
 
 @app.get("/api/stats")
 async def stats(mode: str | None = None):
-    return store.stats(mode=_mode_selector(mode))
+    selector = _mode_selector(mode)
+    return await store.read(store.stats, mode=selector)
 
 
 @app.get("/api/equity")
 async def equity(mode: str | None = None):
-    scope, scope_args = store.mode_clause(selector=_mode_selector(mode))
-    rows = store.q(
-        f"""SELECT exit_ts,net,strategy FROM trades
-             WHERE status='closed'{scope} ORDER BY exit_ts,id""",
-        scope_args,
-    )
-    cumulative = {"combined": 0.0, "gate_a": 0.0, "price_only_late_score": 0.0}
-    out = {key: [] for key in cumulative}
-    for r in rows:
-        strategy = ("price_only_late_score" if r.get("strategy") in {
-            "price_only_late_score", "price_only_late_score_v1",
-        } else "gate_a")
-        ts_ms = int((r["exit_ts"] or 0) * 1000)
-        cumulative[strategy] += r["net"] or 0
-        cumulative["combined"] += r["net"] or 0
-        out[strategy].append([ts_ms, round(cumulative[strategy], 2)])
-        out["combined"].append([ts_ms, round(cumulative["combined"], 2)])
-    return out
+    selector = _mode_selector(mode)
+
+    def _load():
+        scope, scope_args = store.mode_clause(selector=selector)
+        rows = store.q(
+            f"""SELECT exit_ts,net,strategy FROM trades
+                 WHERE status='closed'{scope} ORDER BY exit_ts,id""",
+            scope_args,
+        )
+        cumulative = {"combined": 0.0, "gate_a": 0.0, "price_only_late_score": 0.0}
+        out = {key: [] for key in cumulative}
+        for r in rows:
+            strategy = ("price_only_late_score" if r.get("strategy") in {
+                "price_only_late_score", "price_only_late_score_v1",
+            } else "gate_a")
+            ts_ms = int((r["exit_ts"] or 0) * 1000)
+            cumulative[strategy] += r["net"] or 0
+            cumulative["combined"] += r["net"] or 0
+            out[strategy].append([ts_ms, round(cumulative[strategy], 2)])
+            out["combined"].append([ts_ms, round(cumulative["combined"], 2)])
+        return out
+
+    return await store.read(_load)
 
 
 @app.get("/api/latency")
 async def latency(mode: str | None = None):
     selector = _mode_selector(mode)
-    readiness = store.latency_readiness(mode=selector)
-    scope, scope_args = store.mode_clause(selector=selector)
-    out = {}
-    for kind, summary in readiness.items():
-        hist_aliases = store.LATENCY_KIND_ALIASES.get(kind, (kind,))
-        marks = ",".join("?" for _ in hist_aliases)
-        hist_rows = store.q(
-            f"""SELECT ms FROM latency WHERE kind IN ({marks}){scope}
-                 ORDER BY ts DESC LIMIT 200""",
-            (*hist_aliases, *scope_args),
-        )
-        out[kind] = {
-            **summary,
-            "hist": [row["ms"] for row in reversed(hist_rows)
-                     if isinstance(row.get("ms"), (int, float))],
-        }
-    return out
+
+    def _load():
+        readiness = store.latency_readiness(mode=selector)
+        scope, scope_args = store.mode_clause(selector=selector)
+        out = {}
+        for kind, summary in readiness.items():
+            hist_aliases = store.LATENCY_KIND_ALIASES.get(kind, (kind,))
+            marks = ",".join("?" for _ in hist_aliases)
+            hist_rows = store.q(
+                f"""SELECT ms FROM latency WHERE kind IN ({marks}){scope}
+                     ORDER BY ts DESC LIMIT 200""",
+                (*hist_aliases, *scope_args),
+            )
+            out[kind] = {
+                **summary,
+                "hist": [row["ms"] for row in reversed(hist_rows)
+                         if isinstance(row.get("ms"), (int, float))],
+            }
+        return out
+
+    return await store.read(_load)
 
 
 @app.get("/api/goal-latency")
 async def goal_latency(limit: int = 100, mode: str | None = None):
     limit = max(1, min(limit, 500))
-    scope, scope_args = store.mode_clause(selector=_mode_selector(mode))
-    rows = _label_modes(store.q(
-        f"SELECT * FROM goal_latency_observations WHERE 1=1{scope}"
-        " ORDER BY id DESC LIMIT ?", (*scope_args, limit),
-    ))
-    for row in rows:
-        for field in ("score_before", "score_after", "normalized_event", "detail"):
-            try:
-                row[field] = json.loads(row[field])
-            except (TypeError, json.JSONDecodeError):
-                pass
-        row["normalized_event"] = current_normalized_event(row)
-        row.update(_display_names("", row.get("event")))
-    return rows
+    selector = _mode_selector(mode)
+
+    def _load():
+        scope, scope_args = store.mode_clause(selector=selector)
+        rows = _label_modes(store.q(
+            f"SELECT * FROM goal_latency_observations WHERE 1=1{scope}"
+            " ORDER BY id DESC LIMIT ?", (*scope_args, limit),
+        ))
+        for row in rows:
+            for field in ("score_before", "score_after", "normalized_event", "detail"):
+                try:
+                    row[field] = json.loads(row[field])
+                except (TypeError, json.JSONDecodeError):
+                    pass
+            row["normalized_event"] = current_normalized_event(row)
+            row.update(_display_names("", row.get("event")))
+        return rows
+
+    return await store.read(_load)
 
 
 @app.get("/api/eventlog")
 async def eventlog(limit: int = 80):
-    return store.q("SELECT * FROM eventlog ORDER BY rowid DESC LIMIT ?", (limit,))
+    return await store.read(
+        store.q, "SELECT * FROM eventlog ORDER BY rowid DESC LIMIT ?", (limit,),
+    )
 
 
 @app.get("/api/match-clocks")
 async def match_clocks(limit: int = 100, mode: str | None = None):
     limit = max(1, min(limit, 500))
-    scope, scope_args = store.mode_clause(selector=_mode_selector(mode))
-    rows = _label_modes(store.q(
-        f"SELECT * FROM match_clock_observations WHERE 1=1{scope}"
-        " ORDER BY id DESC LIMIT ?", (*scope_args, limit),
-    ))
-    for row in rows:
-        try:
-            row["raw_context"] = json.loads(row["raw_context"])
-        except (TypeError, json.JSONDecodeError):
-            pass
+    selector = _mode_selector(mode)
+
+    def _load():
+        scope, scope_args = store.mode_clause(selector=selector)
+        rows = _label_modes(store.q(
+            f"SELECT * FROM match_clock_observations WHERE 1=1{scope}"
+            " ORDER BY id DESC LIMIT ?", (*scope_args, limit),
+        ))
+        for row in rows:
+            try:
+                row["raw_context"] = json.loads(row["raw_context"])
+            except (TypeError, json.JSONDecodeError):
+                pass
+        return rows
+
+    rows = await store.read(_load)
+    # Clock coverage is live in-memory tracker state, read on the event loop.
     coverage = (
         engine.clock_tracker.coverage(engine.watched_events)
         if engine and getattr(engine, "clock_tracker", None) else {}
@@ -528,12 +652,16 @@ async def trade_bid_path(trade_id: int, limit: int = 2000,
     """
     limit = max(1, min(limit, store.BID_PATH_MAX_SAMPLES))
     selector = _mode_selector(mode)
-    if not store.row_exists_in_mode("trades", trade_id, mode=selector):
-        raise HTTPException(status_code=404, detail="Trade not found in this mode")
-    samples = store.bid_path_for_trade(trade_id, limit=limit, mode=selector)
-    return {"trade_id": trade_id, "mode": selector, "samples": samples,
-            "summary": store.bid_path_summary(samples),
-            "truncated": len(samples) >= limit}
+
+    def _load():
+        if not store.row_exists_in_mode("trades", trade_id, mode=selector):
+            raise HTTPException(status_code=404, detail="Trade not found in this mode")
+        samples = store.bid_path_for_trade(trade_id, limit=limit, mode=selector)
+        return {"trade_id": trade_id, "mode": selector, "samples": samples,
+                "summary": store.bid_path_summary(samples),
+                "truncated": len(samples) >= limit}
+
+    return await store.read(_load)
 
 
 @app.get("/api/signals/{signal_id}/path")
@@ -542,30 +670,39 @@ async def signal_forward_path(signal_id: int, limit: int = 2000,
     """Forward price path recorded after one signal, accepted or declined."""
     limit = max(1, min(limit, store.BID_PATH_MAX_SAMPLES))
     selector = _mode_selector(mode)
-    if not store.row_exists_in_mode("signals", signal_id, mode=selector):
-        raise HTTPException(status_code=404, detail="Signal not found in this mode")
-    samples = store.bid_path_for_signal(signal_id, limit=limit, mode=selector)
-    return {"signal_id": signal_id, "mode": selector, "samples": samples,
-            "summary": store.bid_path_summary(samples),
-            "truncated": len(samples) >= limit}
+
+    def _load():
+        if not store.row_exists_in_mode("signals", signal_id, mode=selector):
+            raise HTTPException(status_code=404, detail="Signal not found in this mode")
+        samples = store.bid_path_for_signal(signal_id, limit=limit, mode=selector)
+        return {"signal_id": signal_id, "mode": selector, "samples": samples,
+                "summary": store.bid_path_summary(samples),
+                "truncated": len(samples) >= limit}
+
+    return await store.read(_load)
 
 
 @app.get("/api/provider-events")
 async def provider_events(limit: int = 100, mode: str | None = None):
     limit = max(1, min(limit, 500))
-    scope, scope_args = store.mode_clause(selector=_mode_selector(mode))
-    rows = _label_modes(store.q(
-        f"SELECT * FROM provider_match_events WHERE 1=1{scope}"
-        " ORDER BY id DESC LIMIT ?", (*scope_args, limit),
-    ))
-    for row in rows:
-        for field in ("normalized_event", "raw_payload"):
-            try:
-                row[field] = json.loads(row[field])
-            except (TypeError, json.JSONDecodeError):
-                pass
-        row.update(_display_names("", row.get("event")))
-    return rows
+    selector = _mode_selector(mode)
+
+    def _load():
+        scope, scope_args = store.mode_clause(selector=selector)
+        rows = _label_modes(store.q(
+            f"SELECT * FROM provider_match_events WHERE 1=1{scope}"
+            " ORDER BY id DESC LIMIT ?", (*scope_args, limit),
+        ))
+        for row in rows:
+            for field in ("normalized_event", "raw_payload"):
+                try:
+                    row[field] = json.loads(row[field])
+                except (TypeError, json.JSONDecodeError):
+                    pass
+            row.update(_display_names("", row.get("event")))
+        return rows
+
+    return await store.read(_load)
 
 
 def _remove_export(path):
@@ -1046,8 +1183,12 @@ async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     _clients.add(ws)
     try:
+        # The study aggregate is computed off the event loop so a reconnect
+        # storm (each socket used to recompute the full bootstrap inline on
+        # accept) cannot stall the loop that serves every other client.
+        stats = await store.read(store.stats)
         await ws.send_text(json.dumps({"type": "hello", "status": engine.status(),
-                                       "stats": store.stats()}))
+                                       "stats": stats}))
         while True:
             await ws.receive_text()  # keepalive/no-op
     except (WebSocketDisconnect, Exception):

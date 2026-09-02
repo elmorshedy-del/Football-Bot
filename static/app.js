@@ -17,6 +17,13 @@ let socketConnected = false;
 let reconnectTimer = null;
 let refreshTimer = null;
 let refreshInFlight = false;
+let lastRefreshStart = 0;
+// A live event must not trigger a fresh 12-endpoint reload every few hundred
+// milliseconds during an active match.  WebSocket-driven refreshes are coalesced
+// to at most one per this interval; stats/status still arrive live on every
+// socket message, and the 30s safety poll and direct refreshAll() calls are
+// unaffected.
+const REFRESH_MIN_INTERVAL_MS = 3000;
 let soundEnabled = false;
 let killEnabled = false;
 let toastTimer = null;
@@ -842,6 +849,7 @@ function renderAll() {
 async function refreshAll() {
   if (refreshInFlight) return;
   refreshInFlight = true;
+  lastRefreshStart = Date.now();
   const requests = [["status", "/api/status"], ["config", "/api/config"], ["matches", "/api/matches"], ["trades", "/api/trades?limit=500"], ["signals", "/api/signals?limit=500"], ["stats", "/api/stats"], ["events", "/api/goal-latency?limit=200"], ["latency", "/api/latency"], ["equity", "/api/equity"], ["activity", "/api/eventlog?limit=100"], ["clocks", "/api/match-clocks?limit=60"], ["providerEvents", "/api/provider-events?limit=120"]];
   try {
     const results = await Promise.allSettled(requests.map(([, path]) => apiJson(path)));
@@ -857,7 +865,11 @@ async function refreshAll() {
 }
 function scheduleRefresh(delay = 250) {
   clearTimeout(refreshTimer);
-  refreshTimer = setTimeout(() => refreshAll().catch(error => recordClientError("dashboard refresh", error)), delay);
+  // Coalesce bursts: never fire a full refresh sooner than REFRESH_MIN_INTERVAL_MS
+  // after the last one started, so a stream of live events collapses into one.
+  const sinceLast = Date.now() - lastRefreshStart;
+  const wait = Math.max(delay, REFRESH_MIN_INTERVAL_MS - sinceLast);
+  refreshTimer = setTimeout(() => refreshAll().catch(error => recordClientError("dashboard refresh", error)), wait);
 }
 function connectWebSocket() {
   clearTimeout(reconnectTimer);
