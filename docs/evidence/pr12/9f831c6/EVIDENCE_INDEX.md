@@ -30,7 +30,7 @@ every reviewed finding still applied unchanged. Work is stacked on `5f546fe`.
 
 | Commit | Work package | Sections |
 |---|---|---|
-| `4fbb79d` | Clock publication and current health | §3, §4 |
+| `c9f490a` | Clock publication and current health | §3, §4 |
 | `f3d3de0` | Evidence modes and provider-event lineage | §5, §6 |
 | `00d41f8` | Non-blocking export and captured failures | §7 |
 | `9f831c6` | Gap-aware paths and a working chart | §8.3, §8.4, part of §8.2 |

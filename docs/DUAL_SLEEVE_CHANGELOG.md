@@ -1115,7 +1115,7 @@ clean. Zero tracebacks; zero unretrieved task exceptions.
 ```text
 Candidate head/tree:            9f831c6af3b3366451393421ad10666ae655570a
                                 e9515218dda9c574a122bdbb9c526d916213268e
-Commits by work package:        4fbb79d  §3-4  clock publication + current health
+Commits by work package:        c9f490a  §3-4  clock publication + current health
                                 f3d3de0  §5-6  evidence modes + provider lineage
                                 00d41f8  §7    non-blocking export + captured failures
                                 9f831c6  §8.3-8.4 gap-aware paths + working chart
@@ -1147,7 +1147,7 @@ Known limitations:              §8.2 transactional final-close ownership NOT im
                                 selector outstanding; MATCH_CLOCK_MAX_AGE_MS still a
                                 default not a measurement; store.ex() per-statement commit
                                 on the event loop still unaddressed (own PR)
-Exact rollback command:         git revert 9f831c6 00d41f8 f3d3de0 4fbb79d
+Exact rollback command:         git revert 9f831c6 00d41f8 f3d3de0 c9f490a
                                 Migrations add only nullable columns and two partial
                                 indexes; reverting drops no collected data. Back up
                                 footballbot.db first: reverting f3d3de0 restores the
@@ -1165,3 +1165,144 @@ Requested final-review decision: BLOCKED
 `BR-05` cannot be satisfied without an authorised deployment; and `BR-07` forbids the
 implementer from self-approving. Per §1, the exact incomplete items are marked `BLOCKED` above
 rather than relabeled as limitations, and PR 12 stays draft.
+
+# PR 13 independent review — remediation pass
+
+Applies `docs/PR13_INDEPENDENT_REVIEW.md` to the stack at reviewed head `d69f5a4`.
+Baseline red for every reproduced failure:
+`docs/evidence/pr13/baseline-d69f5a4/baseline-red-tests.txt`.
+
+## §1.1 / §1.2 — close ownership and restart recovery (`6571ecf`)
+
+**Before.** Reproduced exactly as the review described: forcing `insert_bid_path` to raise
+during a simple final close left `status='closed'` with `position_still_owned: false` and one
+buffered row with no retry owner (`'closed' != 'open'`). Restart discarded durable path state
+(`0 != 2`), so the first post-restart sample reused sequence 1 and was silently ignored, and
+`insert_bid_path` returned the input length for a batch that wrote nothing (`1 != 0`).
+
+**Change.** Realistic exit, simple close and settlement share one transaction covering
+remaining rows, exactly one terminal row, the summary, the final fill and progress, and the
+closed-trade fields. The summary is derived inside the transaction from rows actually on disk.
+On failure everything rolls back, the shadow book is restored, the terminal row is retracted so
+a retry appends exactly one, the position and pending exit stay owned, and nothing is broadcast
+or logged. Open positions load durable `MAX(sample_seq)` and row count and resume at max + 1;
+the last-observation signature is deliberately not restored so the first post-restart quote is
+recorded rather than deduplicated away. `insert_bid_path` returns the durable count and a short
+write is reported as a fault.
+
+## §1.3 — signal watch ownership (`58860ff`)
+
+**Before.** Expiry and eviction both `popleft()` before persisting (`the watch was popped even
+though its final write failed`). Decline rows had no sequence key, no-ladder observations were
+skipped entirely, rows and summary were separate commits, and there was no durable marker, no
+restart rebuild and no current fault.
+
+**Change.** Finalization is one transaction over rows, summary and a durable
+`forward_path_finalized` marker. Expiry and eviction peek, finalize, then pop only after commit;
+on failure the watch is retained and a latched `signal_path_persistence_failed` fault appears on
+the System panel until a retry succeeds. Decline rows carry `sample_seq` and `availability`; the
+first no-ladder observation after a quote records one gap, repeats are suppressed, and a resumed
+quote starts a new segment. `signals` gains `forward_path_finalized` and `path_incomplete_reason`.
+On startup, watches whose process died mid-window are finalized and labelled
+`in_memory_tail_lost_on_restart` rather than presented as complete.
+
+## §1.4 — mode-scoped APIs and exports (`ec780ae`)
+
+**Before.** With the active mode `live`, `/api/signals` returned `["live","demo"]` and legacy
+rows (`signals leaked another mode`). An audit bundle labelled `live` carried demo and legacy
+rows in CSV, JSONL and the SQLite snapshot, with no per-mode counts.
+
+**Change.** One validated selector (`live`, `demo`, `legacy_unknown`, `all`) defaults to the
+active mode and is refused with 400 if unknown. It reaches every study endpoint and every nested
+decoration query, so a live trade cannot be annotated by a demo signal or event. Path access is
+authorised through the parent trade or signal: a mismatch is 404, not a leak. Null provenance is
+presented as `legacy_unknown`. The snapshot copy is trimmed to the requested mode before it is
+read or archived, so CSV, JSONL and the shipped database agree with the manifest. The manifest
+records requested modes, the selector, per-table per-mode counts, rows removed from the snapshot,
+and a reconciliation block proving no orphan fill or orphan trade. All-mode export requires an
+explicit archival request.
+
+## §1.5 — real browser acceptance and CI (`0cbf651`)
+
+**Before.** The browser test never loaded the dashboard: it extracted helpers into synthetic
+HTML and called `pathSparkline()` directly, so it never clicked, never requested, and never
+exercised error state. CI run `33561327860` was green with all three tests skipped.
+
+**Change.** The shipped `index.html`, `app.js` and `style.css` are served over HTTP and driven
+with real clicks; only the API layer is intercepted. Tests cover the real click to a visible
+chart, an independent visible-error case, gapped rendering with no cross-gap line, 360px overflow
+on every tab, required trade fields without ellipsis or clipping, and filter/league/download
+flows. The synthetic file and the remaining source-text frontend assertions are deleted. CI
+installs Chromium, proves it launches, sets `REQUIRE_BROWSER_TESTS=1` so a missing browser fails
+rather than skips, and adds `node --check`, `git diff --check` against the base branch,
+`-W error::RuntimeWarning`, and a grep for skipped browser tests and unretrieved task exceptions.
+
+**Mutation.** Reintroducing the numeric cache key, the flat `d`, and a renamed `.path-error`
+class failed the real browser tests with `no chart rendered`, a cross-gap assertion, and a
+missing visible error. Reverted; not committed.
+
+## §1.6 — evidence corrections
+
+- `4fbb79d` does not exist in the PR history. It is an unreferenced artifact of an amend that
+  stripped an accidentally committed `.venv`; the real commit is `c9f490a`. Every citation in the
+  checklist, changelog and PR 12 evidence index is corrected.
+- The documented rollback was also wrong in **form**: reverting the work packages sequentially
+  conflicts, verified by dry run. The correct, verified command is
+  `git revert --no-commit c9f490a^..HEAD && git commit`.
+- Trailing whitespace in two evidence files failed `git diff --check`; stripped, and captured
+  output is now filtered at capture time.
+- Evidence relabelled for **PR #13** at the correct candidate head and tree.
+
+## §13 implementer hand-back
+
+```text
+Candidate head/tree:            0cbf65192f867d7a749d93ddd461002fcc3a5788
+                                3b82cf2d479b171aa9d1ec0b6fb8b357df70482a
+Pull request:                   #13 (draft required; see note below)
+Reviewed head:                  d69f5a4c512fddf55d30cb79079a69e0fa6a1651
+Commits by work package:        6571ecf  §1.1-1.2  close ownership + restart recovery
+                                58860ff  §1.3      signal watch ownership
+                                ec780ae  §1.4      mode-scoped APIs and exports
+                                0cbf651  §1.5      real browser acceptance + CI
+                                (this)   §1.6      evidence corrections
+Baseline red-test artifact:     docs/evidence/pr13/baseline-d69f5a4/baseline-red-tests.txt
+Targeted test results:          per section above; all OK
+Full local results:             298 tests OK, twice, -X dev -W error::RuntimeWarning
+                                zero tracebacks, zero unretrieved task exceptions,
+                                zero skipped browser tests
+                                docs/evidence/pr13/0cbf651/local-validation-gate.txt
+CI:                             workflow updated with Chromium, REQUIRE_BROWSER_TESTS=1,
+                                node --check, git diff --check, strict RuntimeWarning.
+                                Not yet run on this head; URL to be recorded once green.
+Migration-from-production:      tests/test_production_migration.py, 5 tests, twice, no loss
+Review deployment id/service:   BLOCKED - no authorised target, no deploy access
+Machine-readable evidence:      docs/evidence/pr13/0cbf651/EVIDENCE_INDEX.md
+Rendered evidence:              6 real-browser acceptance tests incl. 360px;
+                                screenshots BLOCKED (§11.8)
+Mode/table reconciliation:      manifest per-mode counts + orphan-fill reconciliation,
+                                proven locally; production run BLOCKED
+Accepted clock-id reconciliation: local invariant proven; production BLOCKED (§11.7)
+Export concurrency p50/p95/max: local 250ms bound proven; production BLOCKED (§11.5)
+Known limitations:              MATCH_CLOCK_MAX_AGE_MS is still a default, not a
+                                measurement; store.ex() per-statement commit on the
+                                event loop is still unaddressed and deserves its own PR;
+                                §11 production evidence is entirely outstanding
+Exact rollback command:         git revert --no-commit c9f490a^..HEAD && git commit
+                                (verified by dry run; sequential revert conflicts)
+                                Back up footballbot.db first - reverting f3d3de0
+                                restores the destructive purge_non_live().
+Paper-only proof:               no live-order endpoint or call added; Gate A detection,
+                                confirmation, sizing, entry, exit, fees, lockout and
+                                settlement unchanged. Runtime proof BLOCKED (§11.9)
+kalchi-kill untouched proof:    no file in this diff references the service; no Railway
+                                configuration modified
+Requested final-review decision: BLOCKED
+```
+
+**Note on draft state.** PR #13 is currently **not** a draft. §3.4 requires it to stay draft, and
+the implementer has not changed the PR's state. It needs converting to draft before review.
+
+**Why `BLOCKED`.** `BR-05` cannot be satisfied without an authorised deployment, and `BR-07`
+forbids the implementer from self-approving. Every §1.x code and behavioral-test requirement in
+the review is implemented and green; production evidence is not, and is marked `BLOCKED` rather
+than relabelled.

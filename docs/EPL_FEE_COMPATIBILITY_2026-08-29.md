@@ -1,6 +1,6 @@
 # EPL fee compatibility remediation
 
-Date: 2026-08-29  
+Date: 2026-08-29
 Scope: realistic paper execution (`PAPER_EXECUTION_V2=true`) only
 
 ## Incident

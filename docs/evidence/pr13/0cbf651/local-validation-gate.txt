@@ -1,13 +1,15 @@
-# BR-LOCAL — section 10 validation gate
-# Candidate head: 9f831c6af3b3366451393421ad10666ae655570a
-# Tree:           e9515218dda9c574a122bdbb9c526d916213268e
+# PR 13 — section 10 validation gate
+# Candidate head: 0cbf65192f867d7a749d93ddd461002fcc3a5788
+# Candidate tree: 3b82cf2d479b171aa9d1ec0b6fb8b357df70482a
 # Base:           main / 8b6a8a8e736f8eb59cec7383a51b38c857947816
-# Date (UTC):     2026-09-01T21:10:09Z
+# Reviewed head:  d69f5a4c512fddf55d30cb79079a69e0fa6a1651 (PR 13 review)
+# Date (UTC):     2026-09-02T00:40:11Z
 # Python:         Python 3.11.15
-# Dependencies:   requirements-dev.lock
 # Chromium:       Chromium 141.0.7390.37
+# NOTE: trailing whitespace is stripped from captured output so that
+#       git diff --check passes. No assertion or result is altered.
 
-=== RUN 1 of 2 — fresh databases (every test builds its own temp DB) ===
+=== RUN 1 of 2 — fresh databases ===
 $ python -X dev -W error::RuntimeWarning -m unittest discover -s tests -v
 test_audit_helpers_do_not_replace_stored_market_or_event_names (test_audit.TriggerEventAuditTests.test_audit_helpers_do_not_replace_stored_market_or_event_names) ... ok
 test_expiration_proxy_is_explicit_and_auditable (test_audit.TriggerEventAuditTests.test_expiration_proxy_is_explicit_and_auditable) ... ok
@@ -39,9 +41,6 @@ test_summary_of_empty_or_unpriced_path_is_none (test_bid_path.BidPathStoreTests.
 test_summary_reports_path_efficiency_and_excursions (test_bid_path.BidPathStoreTests.test_summary_reports_path_efficiency_and_excursions) ... ok
 test_unchanged_quotes_do_not_grow_the_path (test_bid_path.ExecPathRecordingTests.test_unchanged_quotes_do_not_grow_the_path) ... ok
 test_vwap_is_only_reported_when_the_held_size_is_fillable (test_bid_path.ExecPathRecordingTests.test_vwap_is_only_reported_when_the_held_size_is_fillable) ... ok
-test_cache_keys_are_normalized_to_strings (test_bid_path.FrontendPathCacheTests.test_cache_keys_are_normalized_to_strings)
-A string DOM id stored, then read with a numeric trade.id, missed. ... ok
-test_chart_starts_a_new_subpath_at_every_gap (test_bid_path.FrontendPathCacheTests.test_chart_starts_a_new_subpath_at_every_gap) ... ok
 test_a_resumed_quote_starts_a_new_segment (test_bid_path.GapAwareSummaryTests.test_a_resumed_quote_starts_a_new_segment) ... ok
 test_gap_summary_never_bridges_unavailable_quotes (test_bid_path.GapAwareSummaryTests.test_gap_summary_never_bridges_unavailable_quotes)
 The exact fixture and required result from section 8.3. ... ok
@@ -54,6 +53,21 @@ test_recording_quotes_performs_no_database_writes (test_bid_path.HotPathWriteCos
 test_a_no_ladder_observation_records_one_gap_and_does_not_flood (test_bid_path.PathCapTests.test_a_no_ladder_observation_records_one_gap_and_does_not_flood) ... ok
 test_path_cap_is_4000_including_one_terminal_row (test_bid_path.PathCapTests.test_path_cap_is_4000_including_one_terminal_row) ... ok
 test_terminal_row_is_labelled_and_not_a_book_quote (test_bid_path.PathCapTests.test_terminal_row_is_labelled_and_not_a_book_quote) ... ok
+test_a_committed_close_writes_path_summary_and_closed_fields_together (test_close_ownership.CloseOwnershipTests.test_a_committed_close_writes_path_summary_and_closed_fields_together) ... ok
+test_an_ignored_collision_does_not_clear_the_buffer (test_close_ownership.CloseOwnershipTests.test_an_ignored_collision_does_not_clear_the_buffer)
+INSERT OR IGNORE returning cleanly is not proof of durability. ... ok
+test_final_trade_path_failure_keeps_position_then_retries_exactly_once (test_close_ownership.CloseOwnershipTests.test_final_trade_path_failure_keeps_position_then_retries_exactly_once) ... ok
+test_realistic_exit_rolls_back_path_fill_and_close_as_one_unit (test_close_ownership.CloseOwnershipTests.test_realistic_exit_rolls_back_path_fill_and_close_as_one_unit)
+The final fill must not survive a failed path write. ... ok
+test_restored_position_resumes_at_durable_max_sequence (test_close_ownership.CloseOwnershipTests.test_restored_position_resumes_at_durable_max_sequence) ... ok
+test_settlement_rolls_back_and_keeps_the_position_owned (test_close_ownership.CloseOwnershipTests.test_settlement_rolls_back_and_keeps_the_position_owned) ... ok
+test_uncommitted_final_close_restores_open_trade_after_restart (test_close_ownership.CloseOwnershipTests.test_uncommitted_final_close_restores_open_trade_after_restart) ... ok
+test_a_failed_path_request_leaves_a_visible_error (test_dashboard_browser.DashboardBrowserTests.test_a_failed_path_request_leaves_a_visible_error) ... ok
+test_a_gapped_path_draws_multiple_subpaths_and_no_cross_gap_line (test_dashboard_browser.DashboardBrowserTests.test_a_gapped_path_draws_multiple_subpaths_and_no_cross_gap_line) ... ok
+test_clicking_show_path_loads_and_renders_a_visible_chart (test_dashboard_browser.DashboardBrowserTests.test_clicking_show_path_loads_and_renders_a_visible_chart) ... ok
+test_filters_league_view_and_download_control_respond (test_dashboard_browser.DashboardBrowserTests.test_filters_league_view_and_download_control_respond) ... ok
+test_mobile_360_has_no_horizontal_overflow_on_any_tab (test_dashboard_browser.DashboardBrowserTests.test_mobile_360_has_no_horizontal_overflow_on_any_tab) ... ok
+test_mobile_360_shows_required_trade_fields_without_truncation (test_dashboard_browser.DashboardBrowserTests.test_mobile_360_shows_required_trade_fields_without_truncation) ... ok
 test_draw_subtitle_is_normalized_without_changing_raw_title (test_display_names.DisplayNameTests.test_draw_subtitle_is_normalized_without_changing_raw_title) ... ok
 test_matchup_can_be_derived_from_provider_rules_when_title_is_leg_only (test_display_names.DisplayNameTests.test_matchup_can_be_derived_from_provider_rules_when_title_is_leg_only) ... ok
 test_provider_match_question_and_contract_subtitle_are_human_readable (test_display_names.DisplayNameTests.test_provider_match_question_and_contract_subtitle_are_human_readable) ... ok
@@ -125,10 +139,6 @@ test_trade_and_signal_surface_persisted_clock_and_high (test_frontend_contract.F
 test_trade_card_renders_the_execution_path_not_just_the_peak (test_frontend_contract.FrontendContractTests.test_trade_card_renders_the_execution_path_not_just_the_peak)
 A scalar peak cannot show whether it was a spike or a plateau. ... ok
 test_trade_event_timeline_and_timing_proxy_are_visible (test_frontend_contract.FrontendContractTests.test_trade_event_timeline_and_timing_proxy_are_visible) ... ok
-test_a_gapped_path_draws_one_subpath_per_segment_and_never_bridges (test_frontend_path_browser.ShowPathBrowserTests.test_a_gapped_path_draws_one_subpath_per_segment_and_never_bridges) ... ok
-test_a_numeric_trade_id_renders_a_visible_svg (test_frontend_path_browser.ShowPathBrowserTests.test_a_numeric_trade_id_renders_a_visible_svg)
-The cache is written by a string id and read by trade.id. ... ok
-test_the_gap_is_reported_to_the_reader (test_frontend_path_browser.ShowPathBrowserTests.test_the_gap_is_reported_to_the_reader) ... ok
 test_failed_clock_insert_retries_identical_next_poll (test_goal_latency.ClockPersistenceHandoffTests.test_failed_clock_insert_retries_identical_next_poll)
 A failed insert must leave the identity uncommitted so it retries. ... ok
 test_persistence_failure_is_reported_as_a_current_fault (test_goal_latency.ClockPersistenceHandoffTests.test_persistence_failure_is_reported_as_a_current_fault) ... ok
@@ -235,6 +245,32 @@ test_nested_total_score_beats_period_score_and_clock_can_be_missing (test_match_
 test_ordinary_goal_and_correction_types (test_match_events.MatchEventNormalizationTests.test_ordinary_goal_and_correction_types) ... ok
 test_provider_event_ledger_covers_penalty_var_card_and_unknown (test_match_events.MatchEventNormalizationTests.test_provider_event_ledger_covers_penalty_var_card_and_unknown) ... ok
 test_score_decrease_is_an_explicit_correction (test_match_events.MatchEventNormalizationTests.test_score_decrease_is_an_explicit_correction) ... ok
+test_all_selector_returns_every_mode (test_mode_scoped_api.ModeScopedApiTests.test_all_selector_returns_every_mode) ... ok
+test_an_unknown_selector_is_rejected (test_mode_scoped_api.ModeScopedApiTests.test_an_unknown_selector_is_rejected) ... ok
+test_demo_selector_returns_only_demo (test_mode_scoped_api.ModeScopedApiTests.test_demo_selector_returns_only_demo) ... ok
+test_equity_and_latency_exclude_other_modes (test_mode_scoped_api.ModeScopedApiTests.test_equity_and_latency_exclude_other_modes) ... ok
+test_every_endpoint_accepts_the_four_safe_selectors (test_mode_scoped_api.ModeScopedApiTests.test_every_endpoint_accepts_the_four_safe_selectors) ... ok
+test_every_study_endpoint_defaults_to_the_active_mode (test_mode_scoped_api.ModeScopedApiTests.test_every_study_endpoint_defaults_to_the_active_mode) ... ok
+test_legacy_rows_are_presented_as_legacy_unknown (test_mode_scoped_api.ModeScopedApiTests.test_legacy_rows_are_presented_as_legacy_unknown) ... ok
+test_nested_decoration_cannot_cross_modes (test_mode_scoped_api.ModeScopedApiTests.test_nested_decoration_cannot_cross_modes)
+A live trade must not be decorated by a demo signal or event. ... ok
+test_path_access_is_scoped_through_its_parent (test_mode_scoped_api.ModeScopedApiTests.test_path_access_is_scoped_through_its_parent) ... ok
+test_signal_path_access_is_scoped_through_its_parent (test_mode_scoped_api.ModeScopedApiTests.test_signal_path_access_is_scoped_through_its_parent) ... ok
+test_all_selector_returns_every_mode (test_mode_scoped_api.ModeScopedExportTests.test_all_selector_returns_every_mode) ... ok
+test_an_explicit_archival_export_may_include_every_mode (test_mode_scoped_api.ModeScopedExportTests.test_an_explicit_archival_export_may_include_every_mode) ... ok
+test_an_unknown_selector_is_rejected (test_mode_scoped_api.ModeScopedExportTests.test_an_unknown_selector_is_rejected) ... ok
+test_demo_selector_returns_only_demo (test_mode_scoped_api.ModeScopedExportTests.test_demo_selector_returns_only_demo) ... ok
+test_equity_and_latency_exclude_other_modes (test_mode_scoped_api.ModeScopedExportTests.test_equity_and_latency_exclude_other_modes) ... ok
+test_every_endpoint_accepts_the_four_safe_selectors (test_mode_scoped_api.ModeScopedExportTests.test_every_endpoint_accepts_the_four_safe_selectors) ... ok
+test_every_study_endpoint_defaults_to_the_active_mode (test_mode_scoped_api.ModeScopedExportTests.test_every_study_endpoint_defaults_to_the_active_mode) ... ok
+test_legacy_rows_are_presented_as_legacy_unknown (test_mode_scoped_api.ModeScopedExportTests.test_legacy_rows_are_presented_as_legacy_unknown) ... ok
+test_live_export_excludes_demo_and_legacy_everywhere (test_mode_scoped_api.ModeScopedExportTests.test_live_export_excludes_demo_and_legacy_everywhere) ... ok
+test_manifest_records_requested_modes_and_per_mode_counts (test_mode_scoped_api.ModeScopedExportTests.test_manifest_records_requested_modes_and_per_mode_counts) ... ok
+test_nested_decoration_cannot_cross_modes (test_mode_scoped_api.ModeScopedExportTests.test_nested_decoration_cannot_cross_modes)
+A live trade must not be decorated by a demo signal or event. ... ok
+test_path_access_is_scoped_through_its_parent (test_mode_scoped_api.ModeScopedExportTests.test_path_access_is_scoped_through_its_parent) ... ok
+test_reconciliation_reports_no_orphan_fill (test_mode_scoped_api.ModeScopedExportTests.test_reconciliation_reports_no_orphan_fill) ... ok
+test_signal_path_access_is_scoped_through_its_parent (test_mode_scoped_api.ModeScopedExportTests.test_signal_path_access_is_scoped_through_its_parent) ... ok
 test_historical_provenance_is_not_rewritten (test_production_migration.ProductionSchemaMigrationTests.test_historical_provenance_is_not_rewritten) ... ok
 test_legacy_rows_survive_a_live_boot (test_production_migration.ProductionSchemaMigrationTests.test_legacy_rows_survive_a_live_boot) ... ok
 test_migration_adds_the_new_columns_without_duplicating_any (test_production_migration.ProductionSchemaMigrationTests.test_migration_adds_the_new_columns_without_duplicating_any) ... ok
@@ -275,6 +311,12 @@ test_unsubscribe_clears_sequence_for_reused_sid (test_sequence.KalshiWSRecoveryT
 test_duplicate_is_dropped_without_advancing (test_sequence.SubscriptionSequenceTrackerTests.test_duplicate_is_dropped_without_advancing) ... ok
 test_forward_gap_and_reset_both_require_recovery (test_sequence.SubscriptionSequenceTrackerTests.test_forward_gap_and_reset_both_require_recovery) ... ok
 test_interleaved_markets_share_one_subscription_sequence (test_sequence.SubscriptionSequenceTrackerTests.test_interleaved_markets_share_one_subscription_sequence) ... ok
+test_a_cleanly_finalized_signal_is_not_rebuilt (test_signal_path_ownership.SignalPathOwnershipTests.test_a_cleanly_finalized_signal_is_not_rebuilt) ... ok
+test_decline_rows_carry_sequences_and_record_one_gap (test_signal_path_ownership.SignalPathOwnershipTests.test_decline_rows_carry_sequences_and_record_one_gap) ... ok
+test_eviction_over_max_tracked_also_keeps_the_watch_on_failure (test_signal_path_ownership.SignalPathOwnershipTests.test_eviction_over_max_tracked_also_keeps_the_watch_on_failure) ... ok
+test_final_signal_path_failure_keeps_watch_then_retries_exactly_once (test_signal_path_ownership.SignalPathOwnershipTests.test_final_signal_path_failure_keeps_watch_then_retries_exactly_once) ... ok
+test_retry_never_duplicates_a_decline_row (test_signal_path_ownership.SignalPathOwnershipTests.test_retry_never_duplicates_a_decline_row) ... ok
+test_unfinalized_watch_is_rebuilt_and_marked_incomplete_on_restart (test_signal_path_ownership.SignalPathOwnershipTests.test_unfinalized_watch_is_rebuilt_and_marked_incomplete_on_restart) ... ok
 test_agents_file_requires_the_notes_before_the_specification (test_spec_corrections.SpecCorrectionsAreDiscoverableTests.test_agents_file_requires_the_notes_before_the_specification) ... ok
 test_every_recorded_item_is_still_present (test_spec_corrections.SpecCorrectionsAreDiscoverableTests.test_every_recorded_item_is_still_present)
 Entries may be resolved, but not quietly dropped. ... ok
@@ -307,14 +349,11 @@ test_restart_restores_stored_high_and_continues (test_trade_highs.TradeHighTests
 test_rising_bid_updates_high_falling_does_not (test_trade_highs.TradeHighTests.test_rising_bid_updates_high_falling_does_not) ... ok
 
 ----------------------------------------------------------------------
-Ran 260 tests in 11.386s
+Ran 298 tests in 12.682s
 
 OK
 
-=== RUN 2 of 2 — re-run, including the production-schema migration suite ===
-# tests/test_production_migration.py builds a database with the deployed
-# pre-PR schema, migrates it twice, and asserts no loss, no duplicate
-# columns or indexes, and unchanged historical provenance (BR-04).
+=== RUN 2 of 2 — includes the production-schema migration fixture ===
 $ python -X dev -W error::RuntimeWarning -m unittest discover -s tests -v
 test_audit_helpers_do_not_replace_stored_market_or_event_names (test_audit.TriggerEventAuditTests.test_audit_helpers_do_not_replace_stored_market_or_event_names) ... ok
 test_expiration_proxy_is_explicit_and_auditable (test_audit.TriggerEventAuditTests.test_expiration_proxy_is_explicit_and_auditable) ... ok
@@ -346,9 +385,6 @@ test_summary_of_empty_or_unpriced_path_is_none (test_bid_path.BidPathStoreTests.
 test_summary_reports_path_efficiency_and_excursions (test_bid_path.BidPathStoreTests.test_summary_reports_path_efficiency_and_excursions) ... ok
 test_unchanged_quotes_do_not_grow_the_path (test_bid_path.ExecPathRecordingTests.test_unchanged_quotes_do_not_grow_the_path) ... ok
 test_vwap_is_only_reported_when_the_held_size_is_fillable (test_bid_path.ExecPathRecordingTests.test_vwap_is_only_reported_when_the_held_size_is_fillable) ... ok
-test_cache_keys_are_normalized_to_strings (test_bid_path.FrontendPathCacheTests.test_cache_keys_are_normalized_to_strings)
-A string DOM id stored, then read with a numeric trade.id, missed. ... ok
-test_chart_starts_a_new_subpath_at_every_gap (test_bid_path.FrontendPathCacheTests.test_chart_starts_a_new_subpath_at_every_gap) ... ok
 test_a_resumed_quote_starts_a_new_segment (test_bid_path.GapAwareSummaryTests.test_a_resumed_quote_starts_a_new_segment) ... ok
 test_gap_summary_never_bridges_unavailable_quotes (test_bid_path.GapAwareSummaryTests.test_gap_summary_never_bridges_unavailable_quotes)
 The exact fixture and required result from section 8.3. ... ok
@@ -361,6 +397,21 @@ test_recording_quotes_performs_no_database_writes (test_bid_path.HotPathWriteCos
 test_a_no_ladder_observation_records_one_gap_and_does_not_flood (test_bid_path.PathCapTests.test_a_no_ladder_observation_records_one_gap_and_does_not_flood) ... ok
 test_path_cap_is_4000_including_one_terminal_row (test_bid_path.PathCapTests.test_path_cap_is_4000_including_one_terminal_row) ... ok
 test_terminal_row_is_labelled_and_not_a_book_quote (test_bid_path.PathCapTests.test_terminal_row_is_labelled_and_not_a_book_quote) ... ok
+test_a_committed_close_writes_path_summary_and_closed_fields_together (test_close_ownership.CloseOwnershipTests.test_a_committed_close_writes_path_summary_and_closed_fields_together) ... ok
+test_an_ignored_collision_does_not_clear_the_buffer (test_close_ownership.CloseOwnershipTests.test_an_ignored_collision_does_not_clear_the_buffer)
+INSERT OR IGNORE returning cleanly is not proof of durability. ... ok
+test_final_trade_path_failure_keeps_position_then_retries_exactly_once (test_close_ownership.CloseOwnershipTests.test_final_trade_path_failure_keeps_position_then_retries_exactly_once) ... ok
+test_realistic_exit_rolls_back_path_fill_and_close_as_one_unit (test_close_ownership.CloseOwnershipTests.test_realistic_exit_rolls_back_path_fill_and_close_as_one_unit)
+The final fill must not survive a failed path write. ... ok
+test_restored_position_resumes_at_durable_max_sequence (test_close_ownership.CloseOwnershipTests.test_restored_position_resumes_at_durable_max_sequence) ... ok
+test_settlement_rolls_back_and_keeps_the_position_owned (test_close_ownership.CloseOwnershipTests.test_settlement_rolls_back_and_keeps_the_position_owned) ... ok
+test_uncommitted_final_close_restores_open_trade_after_restart (test_close_ownership.CloseOwnershipTests.test_uncommitted_final_close_restores_open_trade_after_restart) ... ok
+test_a_failed_path_request_leaves_a_visible_error (test_dashboard_browser.DashboardBrowserTests.test_a_failed_path_request_leaves_a_visible_error) ... ok
+test_a_gapped_path_draws_multiple_subpaths_and_no_cross_gap_line (test_dashboard_browser.DashboardBrowserTests.test_a_gapped_path_draws_multiple_subpaths_and_no_cross_gap_line) ... ok
+test_clicking_show_path_loads_and_renders_a_visible_chart (test_dashboard_browser.DashboardBrowserTests.test_clicking_show_path_loads_and_renders_a_visible_chart) ... ok
+test_filters_league_view_and_download_control_respond (test_dashboard_browser.DashboardBrowserTests.test_filters_league_view_and_download_control_respond) ... ok
+test_mobile_360_has_no_horizontal_overflow_on_any_tab (test_dashboard_browser.DashboardBrowserTests.test_mobile_360_has_no_horizontal_overflow_on_any_tab) ... ok
+test_mobile_360_shows_required_trade_fields_without_truncation (test_dashboard_browser.DashboardBrowserTests.test_mobile_360_shows_required_trade_fields_without_truncation) ... ok
 test_draw_subtitle_is_normalized_without_changing_raw_title (test_display_names.DisplayNameTests.test_draw_subtitle_is_normalized_without_changing_raw_title) ... ok
 test_matchup_can_be_derived_from_provider_rules_when_title_is_leg_only (test_display_names.DisplayNameTests.test_matchup_can_be_derived_from_provider_rules_when_title_is_leg_only) ... ok
 test_provider_match_question_and_contract_subtitle_are_human_readable (test_display_names.DisplayNameTests.test_provider_match_question_and_contract_subtitle_are_human_readable) ... ok
@@ -432,10 +483,6 @@ test_trade_and_signal_surface_persisted_clock_and_high (test_frontend_contract.F
 test_trade_card_renders_the_execution_path_not_just_the_peak (test_frontend_contract.FrontendContractTests.test_trade_card_renders_the_execution_path_not_just_the_peak)
 A scalar peak cannot show whether it was a spike or a plateau. ... ok
 test_trade_event_timeline_and_timing_proxy_are_visible (test_frontend_contract.FrontendContractTests.test_trade_event_timeline_and_timing_proxy_are_visible) ... ok
-test_a_gapped_path_draws_one_subpath_per_segment_and_never_bridges (test_frontend_path_browser.ShowPathBrowserTests.test_a_gapped_path_draws_one_subpath_per_segment_and_never_bridges) ... ok
-test_a_numeric_trade_id_renders_a_visible_svg (test_frontend_path_browser.ShowPathBrowserTests.test_a_numeric_trade_id_renders_a_visible_svg)
-The cache is written by a string id and read by trade.id. ... ok
-test_the_gap_is_reported_to_the_reader (test_frontend_path_browser.ShowPathBrowserTests.test_the_gap_is_reported_to_the_reader) ... ok
 test_failed_clock_insert_retries_identical_next_poll (test_goal_latency.ClockPersistenceHandoffTests.test_failed_clock_insert_retries_identical_next_poll)
 A failed insert must leave the identity uncommitted so it retries. ... ok
 test_persistence_failure_is_reported_as_a_current_fault (test_goal_latency.ClockPersistenceHandoffTests.test_persistence_failure_is_reported_as_a_current_fault) ... ok
@@ -542,6 +589,32 @@ test_nested_total_score_beats_period_score_and_clock_can_be_missing (test_match_
 test_ordinary_goal_and_correction_types (test_match_events.MatchEventNormalizationTests.test_ordinary_goal_and_correction_types) ... ok
 test_provider_event_ledger_covers_penalty_var_card_and_unknown (test_match_events.MatchEventNormalizationTests.test_provider_event_ledger_covers_penalty_var_card_and_unknown) ... ok
 test_score_decrease_is_an_explicit_correction (test_match_events.MatchEventNormalizationTests.test_score_decrease_is_an_explicit_correction) ... ok
+test_all_selector_returns_every_mode (test_mode_scoped_api.ModeScopedApiTests.test_all_selector_returns_every_mode) ... ok
+test_an_unknown_selector_is_rejected (test_mode_scoped_api.ModeScopedApiTests.test_an_unknown_selector_is_rejected) ... ok
+test_demo_selector_returns_only_demo (test_mode_scoped_api.ModeScopedApiTests.test_demo_selector_returns_only_demo) ... ok
+test_equity_and_latency_exclude_other_modes (test_mode_scoped_api.ModeScopedApiTests.test_equity_and_latency_exclude_other_modes) ... ok
+test_every_endpoint_accepts_the_four_safe_selectors (test_mode_scoped_api.ModeScopedApiTests.test_every_endpoint_accepts_the_four_safe_selectors) ... ok
+test_every_study_endpoint_defaults_to_the_active_mode (test_mode_scoped_api.ModeScopedApiTests.test_every_study_endpoint_defaults_to_the_active_mode) ... ok
+test_legacy_rows_are_presented_as_legacy_unknown (test_mode_scoped_api.ModeScopedApiTests.test_legacy_rows_are_presented_as_legacy_unknown) ... ok
+test_nested_decoration_cannot_cross_modes (test_mode_scoped_api.ModeScopedApiTests.test_nested_decoration_cannot_cross_modes)
+A live trade must not be decorated by a demo signal or event. ... ok
+test_path_access_is_scoped_through_its_parent (test_mode_scoped_api.ModeScopedApiTests.test_path_access_is_scoped_through_its_parent) ... ok
+test_signal_path_access_is_scoped_through_its_parent (test_mode_scoped_api.ModeScopedApiTests.test_signal_path_access_is_scoped_through_its_parent) ... ok
+test_all_selector_returns_every_mode (test_mode_scoped_api.ModeScopedExportTests.test_all_selector_returns_every_mode) ... ok
+test_an_explicit_archival_export_may_include_every_mode (test_mode_scoped_api.ModeScopedExportTests.test_an_explicit_archival_export_may_include_every_mode) ... ok
+test_an_unknown_selector_is_rejected (test_mode_scoped_api.ModeScopedExportTests.test_an_unknown_selector_is_rejected) ... ok
+test_demo_selector_returns_only_demo (test_mode_scoped_api.ModeScopedExportTests.test_demo_selector_returns_only_demo) ... ok
+test_equity_and_latency_exclude_other_modes (test_mode_scoped_api.ModeScopedExportTests.test_equity_and_latency_exclude_other_modes) ... ok
+test_every_endpoint_accepts_the_four_safe_selectors (test_mode_scoped_api.ModeScopedExportTests.test_every_endpoint_accepts_the_four_safe_selectors) ... ok
+test_every_study_endpoint_defaults_to_the_active_mode (test_mode_scoped_api.ModeScopedExportTests.test_every_study_endpoint_defaults_to_the_active_mode) ... ok
+test_legacy_rows_are_presented_as_legacy_unknown (test_mode_scoped_api.ModeScopedExportTests.test_legacy_rows_are_presented_as_legacy_unknown) ... ok
+test_live_export_excludes_demo_and_legacy_everywhere (test_mode_scoped_api.ModeScopedExportTests.test_live_export_excludes_demo_and_legacy_everywhere) ... ok
+test_manifest_records_requested_modes_and_per_mode_counts (test_mode_scoped_api.ModeScopedExportTests.test_manifest_records_requested_modes_and_per_mode_counts) ... ok
+test_nested_decoration_cannot_cross_modes (test_mode_scoped_api.ModeScopedExportTests.test_nested_decoration_cannot_cross_modes)
+A live trade must not be decorated by a demo signal or event. ... ok
+test_path_access_is_scoped_through_its_parent (test_mode_scoped_api.ModeScopedExportTests.test_path_access_is_scoped_through_its_parent) ... ok
+test_reconciliation_reports_no_orphan_fill (test_mode_scoped_api.ModeScopedExportTests.test_reconciliation_reports_no_orphan_fill) ... ok
+test_signal_path_access_is_scoped_through_its_parent (test_mode_scoped_api.ModeScopedExportTests.test_signal_path_access_is_scoped_through_its_parent) ... ok
 test_historical_provenance_is_not_rewritten (test_production_migration.ProductionSchemaMigrationTests.test_historical_provenance_is_not_rewritten) ... ok
 test_legacy_rows_survive_a_live_boot (test_production_migration.ProductionSchemaMigrationTests.test_legacy_rows_survive_a_live_boot) ... ok
 test_migration_adds_the_new_columns_without_duplicating_any (test_production_migration.ProductionSchemaMigrationTests.test_migration_adds_the_new_columns_without_duplicating_any) ... ok
@@ -582,6 +655,12 @@ test_unsubscribe_clears_sequence_for_reused_sid (test_sequence.KalshiWSRecoveryT
 test_duplicate_is_dropped_without_advancing (test_sequence.SubscriptionSequenceTrackerTests.test_duplicate_is_dropped_without_advancing) ... ok
 test_forward_gap_and_reset_both_require_recovery (test_sequence.SubscriptionSequenceTrackerTests.test_forward_gap_and_reset_both_require_recovery) ... ok
 test_interleaved_markets_share_one_subscription_sequence (test_sequence.SubscriptionSequenceTrackerTests.test_interleaved_markets_share_one_subscription_sequence) ... ok
+test_a_cleanly_finalized_signal_is_not_rebuilt (test_signal_path_ownership.SignalPathOwnershipTests.test_a_cleanly_finalized_signal_is_not_rebuilt) ... ok
+test_decline_rows_carry_sequences_and_record_one_gap (test_signal_path_ownership.SignalPathOwnershipTests.test_decline_rows_carry_sequences_and_record_one_gap) ... ok
+test_eviction_over_max_tracked_also_keeps_the_watch_on_failure (test_signal_path_ownership.SignalPathOwnershipTests.test_eviction_over_max_tracked_also_keeps_the_watch_on_failure) ... ok
+test_final_signal_path_failure_keeps_watch_then_retries_exactly_once (test_signal_path_ownership.SignalPathOwnershipTests.test_final_signal_path_failure_keeps_watch_then_retries_exactly_once) ... ok
+test_retry_never_duplicates_a_decline_row (test_signal_path_ownership.SignalPathOwnershipTests.test_retry_never_duplicates_a_decline_row) ... ok
+test_unfinalized_watch_is_rebuilt_and_marked_incomplete_on_restart (test_signal_path_ownership.SignalPathOwnershipTests.test_unfinalized_watch_is_rebuilt_and_marked_incomplete_on_restart) ... ok
 test_agents_file_requires_the_notes_before_the_specification (test_spec_corrections.SpecCorrectionsAreDiscoverableTests.test_agents_file_requires_the_notes_before_the_specification) ... ok
 test_every_recorded_item_is_still_present (test_spec_corrections.SpecCorrectionsAreDiscoverableTests.test_every_recorded_item_is_still_present)
 Entries may be resolved, but not quietly dropped. ... ok
@@ -614,7 +693,7 @@ test_restart_restores_stored_high_and_continues (test_trade_highs.TradeHighTests
 test_rising_bid_updates_high_falling_does_not (test_trade_highs.TradeHighTests.test_rising_bid_updates_high_falling_does_not) ... ok
 
 ----------------------------------------------------------------------
-Ran 260 tests in 11.855s
+Ran 298 tests in 12.780s
 
 OK
 
@@ -625,9 +704,27 @@ $ ruff check --select E9,F63,F7,F82 app tests
 All checks passed!
 $ node --check static/app.js
 OK
-$ git diff --check
+$ git diff --check origin/main...HEAD
+docs/evidence/pr12/9f831c6/local-validation-gate.txt:8: trailing whitespace.
++# Chromium:       Chromium 141.0.7390.37
+docs/evidence/pr12/baseline-cd4d36e/baseline-red-tests.txt:21: trailing whitespace.
++An id-less observation must never reach 88+ acceptance. ...
+
+=== BROWSER ACCEPTANCE (mandatory mode) ===
+$ REQUIRE_BROWSER_TESTS=1 python -m unittest tests.test_dashboard_browser
+test_a_failed_path_request_leaves_a_visible_error (tests.test_dashboard_browser.DashboardBrowserTests.test_a_failed_path_request_leaves_a_visible_error) ... ok
+test_a_gapped_path_draws_multiple_subpaths_and_no_cross_gap_line (tests.test_dashboard_browser.DashboardBrowserTests.test_a_gapped_path_draws_multiple_subpaths_and_no_cross_gap_line) ... ok
+test_clicking_show_path_loads_and_renders_a_visible_chart (tests.test_dashboard_browser.DashboardBrowserTests.test_clicking_show_path_loads_and_renders_a_visible_chart) ... ok
+test_filters_league_view_and_download_control_respond (tests.test_dashboard_browser.DashboardBrowserTests.test_filters_league_view_and_download_control_respond) ... ok
+test_mobile_360_has_no_horizontal_overflow_on_any_tab (tests.test_dashboard_browser.DashboardBrowserTests.test_mobile_360_has_no_horizontal_overflow_on_any_tab) ... ok
+test_mobile_360_shows_required_trade_fields_without_truncation (tests.test_dashboard_browser.DashboardBrowserTests.test_mobile_360_shows_required_trade_fields_without_truncation) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 3.614s
+
 OK
 
-=== UNHANDLED-EXCEPTION / WARNING SCAN ===
-Traceback occurrences in the run above: 0
-'never retrieved' occurrences:          0
+=== SCAN ===
+Tracebacks:              0
+'never retrieved':       0
+Skipped browser tests:   0

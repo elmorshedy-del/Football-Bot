@@ -18,7 +18,7 @@ A database row alone is not a fresh live confirmation. ... FAIL
 test_unchanged_poll_preserves_id_and_uses_latest_confirmation_interval (tests.test_match_clock.TwoPhaseClockPublicationTests.test_unchanged_poll_preserves_id_and_uses_latest_confirmation_interval)
 Receipts 10.00/10.25/10.50 keep one id and report +250ms, never -250. ... ERROR
 test_unpersisted_clock_fails_closed_before_minute_logic (tests.test_match_clock.TwoPhaseClockPublicationTests.test_unpersisted_clock_fails_closed_before_minute_logic)
-An id-less observation must never reach 88+ acceptance. ... 
+An id-less observation must never reach 88+ acceptance. ...
   test_unpersisted_clock_fails_closed_before_minute_logic (tests.test_match_clock.TwoPhaseClockPublicationTests.test_unpersisted_clock_fails_closed_before_minute_logic) (observation_id=None)
 An id-less observation must never reach 88+ acceptance. ... FAIL
   test_unpersisted_clock_fails_closed_before_minute_logic (tests.test_match_clock.TwoPhaseClockPublicationTests.test_unpersisted_clock_fails_closed_before_minute_logic) (observation_id=0)
