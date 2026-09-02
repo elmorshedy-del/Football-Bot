@@ -299,7 +299,7 @@ class GapAwareSummaryTests(unittest.TestCase):
             self.row(0.0, 90.0), self.row(500.0, 80.0),
             self.row(1000.0, None, availability="gap"),
             self.row(2000.0, 70.0),
-            self.row(2500.0, 72.0, availability="terminal", terminal=1),
+            self.row(2500.0, None, availability="terminal", terminal=1),
         ])
         for field in (
             "samples_total", "samples_priced", "segments", "gap_count",
@@ -311,7 +311,7 @@ class GapAwareSummaryTests(unittest.TestCase):
             with self.subTest(field=field):
                 self.assertIn(field, summary)
         self.assertEqual(summary["samples_total"], 5)
-        self.assertEqual(summary["samples_priced"], 4)
+        self.assertEqual(summary["samples_priced"], 3)
 
     def test_travel_accumulates_only_inside_a_segment(self):
         summary = store.bid_path_summary([

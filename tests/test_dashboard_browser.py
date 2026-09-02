@@ -306,8 +306,15 @@ class DashboardBrowserTests(unittest.TestCase):
             button.click()
         page.wait_for_selector("#trade-list svg.bid-path-svg", timeout=10000)
 
-        terminal = page.wait_for_selector("#trade-list .bid-path-terminal", timeout=5000)
-        self.assertTrue(terminal.is_visible(), "terminal timestamp has no end marker")
+        # A vertical SVG line has a zero-width bounding box, so Playwright's
+        # is_visible() reports false even when its stroke is rendered.  Assert
+        # attachment plus computed stroke instead of using HTML-box visibility.
+        terminal = page.wait_for_selector(
+            "#trade-list .bid-path-terminal", state="attached", timeout=5000,
+        )
+        stroke = page.evaluate("el => getComputedStyle(el).stroke", terminal)
+        self.assertNotIn(stroke, ("", "none", "rgba(0, 0, 0, 0)"),
+                         "terminal timestamp marker has no rendered stroke")
         path_d = page.get_attribute("#trade-list path.bid-path-line", "d") or ""
         terminal_x = float(terminal.get_attribute("x1"))
         last_path_x = max(float(token.split(",")[0][1:]) for token in path_d.split())
