@@ -1019,7 +1019,8 @@ class Engine:
     async def start(self):
         store.set_mode(self.mode)
         if self.mode == "live":
-            store.purge_non_live()  # clean demo/legacy rows so live P&L starts fresh
+            # Mode-scoped queries isolate live evidence; deleting demo/legacy
+            # rows here would make the explicit all-mode archival export lie.
             if config.PAPER_EXECUTION_V2:
                 self.desk.restore_open_positions(store.load_open_paper_positions())
             # Signal collection is independent of realistic paper execution.
@@ -1052,6 +1053,13 @@ class Engine:
                 asyncio.create_task(self.goal_latency.run())
             store.log_event("sys", "engine started in LIVE mode")
         else:
+            rebuilt = self.rebuild_signal_paths()
+            if rebuilt:
+                store.log_event(
+                    "paper",
+                    f"rebuilt {rebuilt} unfinalized signal forward path(s) "
+                    "as incomplete after restart",
+                )
             from .replay import DemoReplay
             asyncio.create_task(DemoReplay(self).run())
             self.ws_state = "demo"

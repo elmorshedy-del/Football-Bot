@@ -42,6 +42,7 @@ class SignalPathOwnershipTests(unittest.TestCase):
         eng.books = {}
         eng._record_error = lambda kind, exc: self.errors.append((kind, str(exc)))
         eng.signal_path_fault = None
+        eng._signal_path_failed_owners = set()
         self.engine = eng
 
     def tearDown(self):
@@ -54,6 +55,7 @@ class SignalPathOwnershipTests(unittest.TestCase):
             "ts_ms": 1, "local_ts": 1000.0, "market": "KXGAME-YES", "event": "KXGAME",
             "series": "KXGAME", "dir": 1, "dl": 1.0, "levels": 5, "size": 200.0,
             "ref": 40.0, "ext": 60.0, "outcome": "unconfirmed", "detail": {},
+            "forward_path_started_ts": 1000.0,
         })
 
     def watch(self, sid, rows=1):

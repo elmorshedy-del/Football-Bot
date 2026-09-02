@@ -260,16 +260,13 @@ class CloseOwnershipTests(unittest.TestCase):
             "retry left more than one terminal row",
         )
 
-    def test_an_ignored_collision_does_not_clear_the_buffer(self):
-        """INSERT OR IGNORE returning cleanly is not proof of durability."""
+    def test_conflicting_trade_sequence_rolls_back_close_and_keeps_position(self):
+        """A same-key/different-payload retry is corruption, never success."""
         pos = self.open_trade()
         self.desk._record_exec_path(pos, live_book(no={49.0: 100.0}), 51.0, 1001.0)
         self.desk._flush_exec_path(pos)
         self.assertEqual(len(self.path_rows(pos.tid)), 1)
 
-        # Re-buffer a row that collides with the durable sequence key.
-        collision = dict(pos.exec_path_last_row) if hasattr(
-            pos, "exec_path_last_row") else None
         pos.exec_path = [{
             "kind": "position", "trade_id": pos.tid, "signal_id": pos.signal_id,
             "event": pos.event, "market": pos.market, "side": pos.side,
@@ -277,13 +274,14 @@ class CloseOwnershipTests(unittest.TestCase):
             "bid": 99.0, "bid_size": 1.0, "exec_px": 99.0, "qty": 1.0,
             "sample_seq": 1, "availability": "quote", "terminal": 0,
         }]
-        _ = collision
+        before = list(pos.exec_path)
 
-        written = store.insert_bid_path(list(pos.exec_path))
-        self.assertEqual(
-            written, 0,
-            "a fully ignored batch must report zero durable rows, not the input length",
-        )
+        self.assertFalse(self.desk.close(pos, 60.0, "target"))
+        self.assertEqual(self.trade_row(pos.tid)["status"], "open")
+        self.assertIn(pos.tid, self.desk.positions)
+        self.assertEqual(pos.exec_path, before, "the conflicting buffer lost ownership")
+        self.assertEqual(len(self.path_rows(pos.tid)), 1, "conflict committed a partial close")
+        self.assertTrue(any("path_sequence_conflict" in message for _, message in self.errors))
 
 
 if __name__ == "__main__":

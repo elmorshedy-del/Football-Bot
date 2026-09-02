@@ -415,8 +415,9 @@ function pathSparkline(trade) {
   const segments = segmentsFromSamples(samples);
   const priced = segments.flat();
   if (priced.length < 2) return "";
+  const allTimes = samples.map(row => row.dt_ms).filter(finite);
   const xs = priced.map(row => row.dt_ms), ys = priced.map(row => row.bid);
-  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minX = Math.min(...allTimes), maxX = Math.max(...allTimes);
   const minY = Math.min(...ys, trade.entry_px), maxY = Math.max(...ys, trade.entry_px);
   const spanX = maxX - minX || 1, spanY = maxY - minY || 1;
   const px = value => pad + (value - minX) / spanX * (width - pad * 2);
@@ -431,13 +432,16 @@ function pathSparkline(trade) {
     ? ` · truncated, ${integer(summary.dropped_samples)} dropped` : "";
   const entryY = py(trade.entry_px).toFixed(1);
   const peakX = px(summary.peak_dt_ms).toFixed(1), peakY = py(summary.peak_bid).toFixed(1);
+  const terminal = [...samples].reverse().find(row => row.terminal || row.availability === "terminal");
+  const terminalX = terminal && finite(terminal.dt_ms) ? px(terminal.dt_ms).toFixed(1) : null;
+  const terminalMarker = terminalX == null ? "" : `<line class="bid-path-terminal" x1="${terminalX}" x2="${terminalX}" y1="${pad}" y2="${height - pad}"/>`;
   const reachable = finite(summary.peak_exec_px) && finite(summary.peak_bid)
     ? `${cents(summary.peak_exec_px)} for ${integer(trade.size)}`
     : "size not fillable at peak";
   const efficiency = finite(summary.path_efficiency)
     ? `${(summary.path_efficiency * 100).toFixed(0)}% direct`
     : "path efficiency unavailable";
-  return `<div class="bid-path"><div class="bid-path-head"><span>Executable bid path</span><strong>${integer(summary.samples)} quotes over ${escapeHtml(duration((summary.span_ms || 0) / 1000))}${gapNote}${truncatedNote}</strong></div><svg class="bid-path-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="Held-side executable bid from entry to exit"><line class="bid-path-entry" x1="${pad}" x2="${width - pad}" y1="${entryY}" y2="${entryY}"/><path class="bid-path-line" d="${d}"/><circle class="bid-path-peak" cx="${peakX}" cy="${peakY}" r="3.5"/></svg><div class="bid-path-facts"><div><span>Peak held</span><strong>${escapeHtml(relativeMs(summary.ms_at_peak))}</strong></div><div><span>Fillable at peak</span><strong>${escapeHtml(reachable)}</strong></div><div><span>Round trip</span><strong>${cents(summary.path_travelled_c)} · ${escapeHtml(efficiency)}</strong></div></div></div>`;
+  return `<div class="bid-path"><div class="bid-path-head"><span>Executable bid path</span><strong>${integer(summary.samples)} quotes over ${escapeHtml(duration((summary.span_ms || 0) / 1000))}${gapNote}${truncatedNote}</strong></div><svg class="bid-path-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="Held-side executable bid path with entry, peak, gaps and end-of-availability"><line class="bid-path-entry" x1="${pad}" x2="${width - pad}" y1="${entryY}" y2="${entryY}"/>${terminalMarker}<path class="bid-path-line" d="${d}"/><circle class="bid-path-peak" cx="${peakX}" cy="${peakY}" r="3.5"/></svg><div class="bid-path-legend" aria-label="Path chart legend"><span><i class="legend-entry"></i>Entry price</span><span><i class="legend-path"></i>Executable bid</span><span><i class="legend-peak"></i>Peak executable bid</span><span><i class="legend-terminal"></i>End of availability</span></div><p class="bid-path-note">The terminal marker is time only; the exit price is not plotted as a bid.</p><div class="bid-path-facts"><div><span>Peak held</span><strong>${escapeHtml(relativeMs(summary.ms_at_peak))}</strong></div><div><span>Fillable at peak</span><strong>${escapeHtml(reachable)}</strong></div><div><span>Round trip</span><strong>${cents(summary.path_travelled_c)} · ${escapeHtml(efficiency)}</strong></div></div></div>`;
 }
 function lossPath(trade) {
   // Losing trades expose entry → high → exit so the missed profit is legible.

@@ -559,7 +559,7 @@ td.numeric, th.numeric { text-align: right; font-variant-numeric: tabular-nums; 
 @media (max-width: 360px) {
   .header-main, .primary-tabs, .page-shell { width: min(100% - 12px, 1480px); }
   .header-actions, .export-actions { grid-template-columns: 1fr; display: grid; }
-  .export-actions .button, #export-button, #export-audit-button, #export-full-button, #export-cancel-button {
+  .export-actions .button, #export-button, #export-audit-button, #export-full-button, #export-archive-button, #export-cancel-button {
     width: 100%;
     min-height: 44px;
   }
@@ -586,7 +586,15 @@ td.numeric, th.numeric { text-align: right; font-variant-numeric: tabular-nums; 
 .bid-path-svg { display: block; width: 100%; height: auto; overflow: visible; }
 .bid-path-line { fill: none; stroke: var(--blue); stroke-width: 1.6; }
 .bid-path-entry { stroke: var(--subtle); stroke-width: 1; stroke-dasharray: 3 3; }
+.bid-path-terminal { stroke: var(--yellow); stroke-width: 1; stroke-dasharray: 2 3; }
 .bid-path-peak { fill: var(--green); }
+.bid-path-legend { display: flex; flex-wrap: wrap; gap: 6px 12px; margin-top: 8px; color: var(--subtle); font-size: .72rem; }
+.bid-path-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.bid-path-legend i { display: inline-block; width: 14px; height: 2px; background: var(--blue); }
+.bid-path-legend .legend-entry { background: var(--subtle); border-top: 1px dashed var(--subtle); }
+.bid-path-legend .legend-peak { width: 7px; height: 7px; border-radius: 50%; background: var(--green); }
+.bid-path-legend .legend-terminal { background: var(--yellow); border-top: 1px dashed var(--yellow); }
+.bid-path-note { margin: 6px 0 0; color: var(--subtle); font-size: .72rem; }
 .bid-path-facts {
   display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px; margin-top: 8px;

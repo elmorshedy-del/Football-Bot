@@ -81,17 +81,17 @@ GAPPED_SAMPLES = [
      "availability": "gap", "terminal": 0, "sample_seq": 2},
     {"dt_ms": 2000.0, "bid": 70.0, "bid_size": 30.0, "exec_px": 70.0, "qty": 10.0,
      "availability": "quote", "terminal": 0, "sample_seq": 3},
-    {"dt_ms": 2500.0, "bid": 72.0, "bid_size": None, "exec_px": None, "qty": 10.0,
+    {"dt_ms": 2500.0, "bid": None, "bid_size": None, "exec_px": None, "qty": 10.0,
      "availability": "terminal", "terminal": 1, "sample_seq": 4},
 ]
 
 PATH_SUMMARY = {
-    "samples": 3, "samples_total": 4, "samples_priced": 3, "segments": 2,
+    "samples": 2, "samples_total": 4, "samples_priced": 2, "segments": 2,
     "gap_count": 1, "gap_duration_ms": 1000, "unknown_gap_duration_ms": 0,
-    "first_bid": 90.0, "last_bid": 72.0, "peak_bid": 90.0, "peak_dt_ms": 0.0,
+    "first_bid": 90.0, "last_bid": 70.0, "peak_bid": 90.0, "peak_dt_ms": 0.0,
     "peak_bid_size": 40.0, "peak_exec_px": 90.0, "ms_at_peak": 1000,
-    "trough_bid": 70.0, "trough_dt_ms": 2000.0, "path_travelled_c": 2.0,
-    "displacement_c": 18.0, "path_efficiency": None, "span_ms": 2500,
+    "trough_bid": 70.0, "trough_dt_ms": 2000.0, "path_travelled_c": 0.0,
+    "displacement_c": 20.0, "path_efficiency": None, "span_ms": 2500,
     "truncated": False, "dropped_samples": 0,
 }
 
@@ -297,6 +297,29 @@ class DashboardBrowserTests(unittest.TestCase):
             "L", first_segment,
             f"the pre-gap point was joined across the outage; d={d!r}",
         )
+
+    def test_terminal_is_time_only_and_chart_legend_explains_markers(self):
+        page = self.open_dashboard()
+        self.show_trades_tab(page)
+        button = page.wait_for_selector("[data-load-path]", timeout=10000)
+        with page.expect_request(lambda r: "/path" in r.url, timeout=10000):
+            button.click()
+        page.wait_for_selector("#trade-list svg.bid-path-svg", timeout=10000)
+
+        terminal = page.wait_for_selector("#trade-list .bid-path-terminal", timeout=5000)
+        self.assertTrue(terminal.is_visible(), "terminal timestamp has no end marker")
+        path_d = page.get_attribute("#trade-list path.bid-path-line", "d") or ""
+        terminal_x = float(terminal.get_attribute("x1"))
+        last_path_x = max(float(token.split(",")[0][1:]) for token in path_d.split())
+        self.assertGreater(terminal_x, last_path_x,
+                           "terminal time was plotted as a price point instead of an end marker")
+
+        legend = page.wait_for_selector("#trade-list .bid-path-legend", timeout=5000)
+        text = legend.inner_text()
+        for label in ("Entry price", "Executable bid", "Peak executable bid", "End of availability"):
+            self.assertIn(label, text)
+        note = page.inner_text("#trade-list .bid-path-note")
+        self.assertIn("exit price is not plotted as a bid", note)
 
     # -------------------------------------------------------------- responsive
 
