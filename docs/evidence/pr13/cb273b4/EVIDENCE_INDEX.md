@@ -42,4 +42,4 @@ Browser acceptance executed on the runner with `REQUIRE_BROWSER_TESTS=1`; the gu
 
 All implementation/local/CI remediation requested by the PR 13 follow-up review is represented by the validated candidate and its green run above. Production section 11 remains **BLOCKED** because no authorised deployment target/live `ADMIN_TOKEN` was supplied. BR-07 remains an independent-review requirement and is not self-approved here.
 
-This evidence refresh is documentation-only. The validated runtime candidate is the exact clean head `cb273b465f6a086d910366056a17987db377d0cf` that run `33581738642` tested.
+This evidence refresh and the later supersession labels are documentation-only. They do not change the runtime candidate or test code, so the immutable validation subject remains the exact clean head `cb273b465f6a086d910366056a17987db377d0cf` that run `33581738642` tested.
