@@ -1,0 +1,23 @@
+PR #13 final CI validation evidence
+Validated candidate head: cb273b465f6a086d910366056a17987db377d0cf
+Validated candidate tree: f24518e4b7b07c50611a5cc3df2ce586fd3ef4b8
+Base: main / 8b6a8a8e736f8eb59cec7383a51b38c857947816
+Reviewed head: d69f5a4c512fddf55d30cb79079a69e0fa6a1651
+Workflow run: https://github.com/elmorshedy-del/Football-Bot/actions/runs/33581738642
+Job: test (100097262004)
+Conclusion: success
+Python: 3.12.14
+Chromium: 151.0.7922.34
+REQUIRE_BROWSER_TESTS: 1
+Strict suite: python -X dev -W error::RuntimeWarning -m unittest discover -s tests -v
+Strict suite result: Ran 331 tests; OK
+Browser/async skip guard suite: Ran 331 tests; OK
+Browser acceptance: executed; no browser skip marker
+Unretrieved async exception guard: passed
+Byte-compile: passed
+Ruff E9,F63,F7,F82: passed
+JavaScript syntax: passed
+Whitespace/conflict checks: passed
+PR state at hand-back: draft, open, unmerged
+Deployment: not performed; section 11 production evidence remains BLOCKED
+Independent approval: required; implementer does not self-approve

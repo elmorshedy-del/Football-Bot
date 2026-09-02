@@ -1306,3 +1306,15 @@ the implementer has not changed the PR's state. It needs converting to draft bef
 forbids the implementer from self-approving. Every §1.x code and behavioral-test requirement in
 the review is implemented and green; production evidence is not, and is marked `BLOCKED` rather
 than relabelled.
+
+## PR 13 final hand-back evidence refresh
+
+Documentation-only refresh after the final remediation CI. It supersedes the stale §13 evidence pointers above without rewriting the historical remediation record.
+
+- Validated candidate head/tree: `cb273b465f6a086d910366056a17987db377d0cf` / `f24518e4b7b07c50611a5cc3df2ce586fd3ef4b8`.
+- Exact green CI: run `33581738642`, job `100097262004`, Chromium 151.0.7922.34.
+- Strict unit/browser suite: **331 tests, OK**; mandatory browser/async guard rerun: **331 tests, OK**.
+- `compileall`, Ruff `E9,F63,F7,F82`, `node --check static/app.js`, and both diff checks passed.
+- Final machine-readable evidence: `docs/evidence/pr13/cb273b4/EVIDENCE_INDEX.md`.
+- The old `docs/evidence/pr13/0cbf651/EVIDENCE_INDEX.md` is historical and must not be used as the current hand-back index.
+- PR remains draft/open/unmerged. No deployment was performed. §11 production evidence remains BLOCKED and BR-07 still requires independent review.
