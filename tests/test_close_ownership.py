@@ -209,6 +209,27 @@ class CloseOwnershipTests(unittest.TestCase):
         self.assertEqual(seqs, [1, 2, 3], "the post-restart quote was silently dropped")
         self.assertIn(60.0, bids, "the new observation never became durable")
 
+    def test_incremental_trade_collision_keeps_buffer(self):
+        pos = self.open_trade()
+        self.desk._record_exec_path(pos, live_book(no={49.0: 100.0}), 51.0, 1001.0)
+        self.desk._flush_exec_path(pos)
+        self.assertEqual([row["sample_seq"] for row in self.path_rows(pos.tid)], [1])
+
+        conflict = {
+            "kind": "position", "trade_id": pos.tid, "signal_id": pos.signal_id,
+            "event": pos.event, "market": pos.market, "side": pos.side,
+            "strategy": pos.strategy, "anchor_ts": pos.entry_ts, "dt_ms": 1000.0,
+            "bid": 99.0, "bid_size": 1.0, "exec_px": 99.0, "qty": pos.remaining,
+            "sample_seq": 1, "availability": "quote", "terminal": 0,
+        }
+        pos.exec_path = [conflict]
+        self.desk._flush_exec_path(pos)
+
+        self.assertEqual(pos.exec_path, [conflict], "incremental conflict cleared the buffer")
+        self.assertTrue(pos.exec_path_flush_failed)
+        self.assertTrue(any("path_sequence_conflict" in message for _, message in self.errors))
+        self.assertEqual(self.path_rows(pos.tid)[0]["bid"], 51.0)
+
     def test_realistic_exit_rolls_back_path_fill_and_close_as_one_unit(self):
         """The final fill must not survive a failed path write."""
         pos = self.open_trade()
