@@ -414,34 +414,10 @@ class PathCapTests(unittest.TestCase):
         self.assertEqual(len(resumed), 2, "a resumed quote starts a new segment")
 
 
-class FrontendPathCacheTests(unittest.TestCase):
-    """Handoff section 8.4: clicking Show path must render or show an error."""
-
-    def setUp(self):
-        self.js = (ROOT / "static" / "app.js").read_text()
-
-    def test_cache_keys_are_normalized_to_strings(self):
-        """A string DOM id stored, then read with a numeric trade.id, missed."""
-        for call in ("pathCache.has(", "pathCache.get(", "pathCache.set("):
-            index = 0
-            while True:
-                index = self.js.find(call, index)
-                if index == -1:
-                    break
-                argument = self.js[index + len(call):index + len(call) + 40]
-                self.assertTrue(
-                    argument.startswith("String(") or argument.startswith("pathKey("),
-                    f"{call}{argument.split(')')[0]}) is not key-normalized",
-                )
-                index += len(call)
-
-    def test_chart_starts_a_new_subpath_at_every_gap(self):
-        self.assertIn("segmentsFromSamples", self.js)
-        self.assertNotIn(
-            'const priced = samples.filter(row => finite(row.bid));\n  if (priced.length < 2) return "";\n  const xs = priced.map',
-            self.js,
-            "the chart still flattens every priced sample into one line",
-        )
+# The frontend contract is asserted behaviourally in
+# tests/test_dashboard_browser.py, against the shipped dashboard in a real
+# browser.  The source-text assertions that used to live here are removed:
+# reading the bundle for a substring is not proof that a click renders a chart.
 
 
 if __name__ == "__main__":
