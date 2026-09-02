@@ -244,3 +244,284 @@ The implementer must add and pass all of these. Source-text assertions do not co
 ## 4. Decision
 
 **BLOCKED.** The current green unit/continuous-integration result is useful but does not satisfy `BR-01`, `BR-02`, `BR-03`, `BR-05`, `BR-06`, or `BR-07`. No merge or deployment is approved.
+
+## 5. Follow-up independent review at `59010d2` — still BLOCKED
+
+This section supersedes the implementation-status conclusions above, but not the
+requirements. It reviews the implementer's remediation of sections 1.1–1.6.
+
+| Field | Value |
+|---|---|
+| Reviewed head | `59010d28a0c7dbb1d8110c29c90a915cc3a61e52` |
+| Reviewed tree | `670e833bfbf546774a396a7f69cb692020ba28e0` |
+| Base | `main` at `8b6a8a8e736f8eb59cec7383a51b38c857947816` |
+| Current CI | Run `33577130477`, job `100083455260`, success |
+| PR state | Draft, open, unmerged |
+| Reviewer decision | **BLOCKED** |
+
+The current CI result is genuine: Chromium launched, all 298 tests ran, no
+browser test skipped, and compile, Ruff, JavaScript, and diff-whitespace checks
+passed. Two independent local strict runs passed the 292 non-browser tests; the
+browser class skipped locally only because this review host could not download
+Chromium. The current branch also fixes the original forced-write rollback cases
+for ordinary simple close, realistic final exit, settlement, and signal expiry.
+
+Those passes do not close `BR-PATH`, `BR-MODE`, `BR-AUDIT`, or `BR-LOCAL`. The
+suite misses the behavioral failures below, and the checked-in evidence does not
+reconcile to the current candidate.
+
+### 5.1 A sequence-key collision still discards evidence and falsely closes/finalizes
+
+`store._persist_path_in_transaction()` uses `INSERT OR IGNORE` and never verifies
+that an ignored row is byte-for-byte the already-durable retry. Both final-close
+paths then commit and release their owner. The incremental trade and signal
+flushers report a short write but still slice the entire buffer and mark it
+successful.
+
+Independent trade reproduction: durable sequence 1 is `51c`; the buffer contains
+a different `99c` observation at sequence 1, followed by close.
+
+```json
+{
+  "buffer_rows": 0,
+  "close_result": true,
+  "durable_path": [
+    {"bid": 51.0, "sample_seq": 1, "terminal": 0},
+    {"bid": 60.0, "sample_seq": 2, "terminal": 1}
+  ],
+  "errors": [],
+  "position_owned": false,
+  "trade_status": "closed"
+}
+```
+
+Independent signal reproduction: the same conflicting sequence is silently
+ignored, the watch is popped, the signal is marked finalized, and no health
+fault remains.
+
+```json
+{
+  "buffer_rows": 0,
+  "durable_rows": [{"bid": 51.0, "sample_seq": 1}],
+  "errors": [],
+  "fault": null,
+  "watch_owned": false
+}
+```
+
+Required implementation:
+
+1. Centralize strict path insertion for incremental flushes and final
+   transactions. An ignored key is an idempotent retry only when every persisted
+   field matches: owner ids, kind, event, market, side, strategy, anchor, offset,
+   bid/depth/executable price/quantity, mode, sequence, availability, and
+   terminal flag.
+2. A same-key/different-payload row raises a stable sequence-conflict error. In
+   a final transaction it rolls back rows, summary, fill/progress, and close. In
+   every caller it leaves the buffer and owner intact and raises a current health
+   fault.
+3. Clear a buffer only after every row was newly inserted or proved to be an
+   exact durable retry. Logging a collision and then clearing is forbidden.
+
+Required behavioral tests:
+
+- `test_conflicting_trade_sequence_rolls_back_close_and_keeps_position`
+- `test_conflicting_signal_sequence_keeps_watch_unfinalized`
+- `test_incremental_trade_collision_keeps_buffer`
+- `test_incremental_signal_collision_keeps_buffer`
+- `test_identical_trade_and_signal_retries_are_idempotent`
+
+The existing `test_an_ignored_collision_does_not_clear_the_buffer` does not test
+its name: it calls `store.insert_bid_path()` directly and never asserts that a
+desk/watch buffer remains owned.
+
+### 5.2 Restart recovery misses watches with zero durable rows and drops failed rebuilds
+
+Every signal starts an in-memory forward watch, but
+`store.unfinalized_signal_paths()` inner-joins `bid_path_samples`. A process that
+dies before the first quote row reaches SQLite is therefore invisible at
+restart:
+
+```json
+{
+  "watch_existed_before_crash": 1,
+  "durable_rebuild_candidates": [],
+  "marker_after_restart_scan": {
+    "forward_path_finalized": null,
+    "path_incomplete_reason": null
+  }
+}
+```
+
+When a watch does have durable rows, a failed `rebuild_signal_paths()` call
+creates only a local dictionary. On failure that dictionary is discarded rather
+than retained for retry:
+
+```json
+{
+  "fault": "signal_path_persistence_failed",
+  "rebuilt": 0,
+  "retry_owner_count": 0,
+  "still_unfinalized": [1]
+}
+```
+
+Required implementation:
+
+1. Add an additive nullable `forward_path_started_ts` marker and write it in the
+   existing signal insert transaction when forward collection is enabled. Do
+   not add a second hot-path commit; legacy rows remain null.
+2. Rebuild from `started IS NOT NULL AND finalized IS NULL`, including signals
+   with zero durable samples. Mark the lost tail explicitly.
+3. A failed startup finalization must be placed in the engine's owned retry
+   queue. The fault stays latched until all failed owners commit; success for a
+   different watch must not clear it.
+4. Run rebuild independently of `PAPER_EXECUTION_V2`; signal collection itself
+   is not conditional on realistic paper execution.
+
+Required behavioral tests:
+
+- `test_restart_marks_zero_row_watch_incomplete`
+- `test_failed_startup_rebuild_retains_retry_owner_then_recovers`
+- `test_one_success_cannot_clear_another_failed_watch_fault`
+- `test_signal_rebuild_runs_when_paper_execution_v2_is_disabled`
+
+### 5.3 Terminal rows are still treated as executable quotes, and restart can exceed the cap
+
+`PaperDesk._record_exec_terminal()` stores the executed exit price in `bid`.
+`store._path_segments()` treats every numeric `bid` as an observed quote, so a
+settlement at 100c can become the recorded path peak, alter travel/efficiency,
+and inflate `samples_priced` even though no 100c bid existed. Setting only
+`bid_size` and `exec_px` to null does not satisfy the contract that execution is
+not relabeled as a book quote.
+
+The restart cap also has no final guard. Starting with 4,000 durable
+non-terminal rows, restore and close produced:
+
+```json
+{
+  "bounded_has_terminal": false,
+  "bounded_rows": 4000,
+  "close_result": true,
+  "durable": {"max_seq": 4001, "n": 4001, "terminals": 1}
+}
+```
+
+Required implementation:
+
+1. New terminal rows have `availability="terminal"`, `terminal=1`, and
+   `bid/bid_size/exec_px=null`. The trade's exit price remains on `trades`.
+2. Summary and frontend segmentation treat a terminal as the end time of the
+   current availability segment, never as a priced observation or a gap.
+   Terminal rows do not affect peak, trough, travel, displacement, efficiency,
+   or `samples_priced`.
+3. Enforce the 4,000-row invariant inside the final transaction using durable
+   state, not only the in-memory counter. An impossible pre-existing exhausted
+   path must fail closed with an explicit fault/incompleteness reason; it may not
+   write row 4,001 and then hide the terminal behind a read limit.
+
+Required behavioral tests:
+
+- `test_settlement_terminal_cannot_become_executable_peak`
+- `test_terminal_closes_peak_duration_but_is_not_priced`
+- `test_restart_at_3999_rows_closes_with_exactly_4000_including_terminal`
+- `test_exhausted_legacy_path_never_writes_row_4001_or_releases_owner`
+
+### 5.4 Mode scoping is incomplete for open trades, path links, and archival download
+
+`/api/trades?mode=demo` always constructs `open` from the active engine's
+in-memory positions. An independently reproduced demo response contained the
+active live position:
+
+```json
+[{"event":"LIVE","id":99,"signal_id":2,"strategy":"gate_a"}]
+```
+
+Also, signal/trade list responses generate path URLs without the selected mode.
+A consumer of `?mode=demo` follows the supplied URL and silently falls back to
+the active live mode, normally receiving 404. Finally, `all_modes=True` exists
+only as a direct Python exporter argument: `/api/export/prepare` and the frontend
+offer no explicit archival all-mode product, so the preserved demo/legacy data
+is not actually downloadable from the dashboard.
+
+Required implementation:
+
+1. Build open-trade output from the selected database rows. Merge live
+   in-memory marks only into matching parent ids in the active mode; never use
+   the active engine list as the selector's source of truth.
+2. Preserve the validated selector in every returned path URL.
+3. Expose one admin-protected explicit archival all-mode export option through
+   prepare, job state, manifest, and frontend. Default audit/full behavior stays
+   active-mode only. Validate the same four selectors and never accept arbitrary
+   SQL-like values.
+
+Required behavioral tests:
+
+- `test_demo_trade_endpoint_never_returns_live_open_position`
+- `test_demo_open_trade_is_returned_from_demo_storage`
+- `test_mode_scoped_path_urls_are_followable_without_mode_drift`
+- `test_frontend_all_mode_archive_reconciles_and_is_labelled`
+
+### 5.5 The required runtime N+1 regression is still a source-text assertion
+
+The handoff explicitly required runtime query counting. Instead,
+`test_list_endpoints_do_not_embed_full_paths` reads `app/main.py` as text and
+searches for function names. Rename/replace it with the specified behavioral
+test: seed at least 25 signals and trades, execute both list endpoints, count
+real SQLite queries, assert query count is constant with row count, and assert
+that no full path-sample query occurs. Static source inspection is not proof.
+
+Required test name:
+
+- `test_trade_and_signal_list_endpoints_do_not_query_paths_per_row`
+
+### 5.6 Browser acceptance is real but materially narrower than the contract
+
+The six Playwright tests do load the shipped page and the path click cases are
+valid. The rest does not prove the claimed full acceptance:
+
+- mobile content asserts only `2026`, `90+5`, and `Arsenal`; it does not assert
+  reason, high timing, visible errors, signal fields, league values, or download
+  states;
+- the signal fixture is empty and the league fixture has no league results;
+- only the free-text filter is exercised;
+- the download test checks `is_visible()` and never clicks prepare, observes
+  queued/preparing/progress/ready, follows the native download, cancels, or
+  renders a server/network error;
+- health waiting/fault/recovered states are never rendered or asserted.
+
+Extend the real-browser suite with non-empty signal, league, latency, and health
+fixtures and actual interaction tests for all filters/reset, health
+fault/recovery, audit/full/all-mode prepare and progress, cancel, native
+download request, and visible error. Repeat the required content and error
+assertions at 360 px and retain the overflow/clipping checks.
+
+### 5.7 Checked-in evidence does not reconcile to the candidate
+
+`docs/evidence/pr13/0cbf651/EVIDENCE_INDEX.md` names candidate `0cbf651` and CI
+run `33576969178` at `3f1f8e3`, while the reviewed head is `59010d2` and current
+run is `33577130477`. Its claimed validation hash is
+`f23dc040...`, but the committed file hashes to `7bc6b04d...`. That validation
+file also contains a failing `git diff --check` excerpt while the index describes
+the gate as clean. Regenerate the artifact and index only after the final code
+head is fixed and CI is green; record the exact candidate head/tree, current
+run/job, exact hashes, and commands without contradictory stale output.
+
+### 5.8 One-round hand-back gate
+
+Before returning again, the implementer must:
+
+1. Add every named behavioral test in sections 5.1–5.6 and show each fails on
+   `59010d2` for the reproduced reason.
+2. Implement the contracts without strategy tuning, Gate A changes, live-order
+   code, synchronous per-quote commits, historical rewriting, or deployment.
+3. Run the strict suite twice, mandatory Chromium acceptance, migration twice,
+   compile, Ruff, JavaScript, and both diff checks from a clean checkout.
+4. Regenerate self-consistent evidence at the final candidate and leave PR #13
+   draft.
+5. Request independent review. Do not mark `BR-PROD` or `BR-REVIEW` passed.
+
+This is a multi-file data-integrity, API, rendered-acceptance, and evidence pass,
+not a safe small reviewer patch. After it passes code review, overall merge
+approval will still remain blocked until the owner authorizes the section 11
+deployment and production proof. No deployment is authorized by this review.
