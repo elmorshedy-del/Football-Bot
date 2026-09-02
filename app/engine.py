@@ -877,8 +877,11 @@ class Engine:
                 self.broadcast({"type": "prices", "prices": dirty})
             if now - last_stats > 5:
                 last_stats = now
-                lat = sorted(self.feed_lag)
-                self.broadcast({"type": "stats", "stats": store.stats(),
+                # The event-clustered bootstrap in store.stats() is computed off
+                # the event loop; running it inline here stalled live collection
+                # and every dashboard request for its whole duration every 5s.
+                stats = await store.read(store.stats)
+                self.broadcast({"type": "stats", "stats": stats,
                                 "status": self.status()})
 
     async def paper_execution_task(self):
