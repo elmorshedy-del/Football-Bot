@@ -460,8 +460,12 @@ class Engine:
         """Persist remaining rows, summary and the durable finalized marker.
 
         One transaction.  The caller releases the watch only when this returns
-        True, so a failed write always leaves an owner to retry.
+        True, so a failed write always leaves an owner to retry.  Recovery
+        metadata belongs to the watch owner as well: a failed first attempt
+        must not lose the reason when the same watch retries later.
         """
+        if incomplete_reason is None:
+            incomplete_reason = watch.get("incomplete_reason")
         try:
             store.finalize_signal_path(
                 watch["signal_id"],
@@ -510,10 +514,9 @@ class Engine:
                 "signal_id": row["id"], "rows": [], "dropped": 0,
                 "market": row.get("market"), "event": row.get("event"),
                 "expires_at": 0.0, "retry_only": True,
+                "incomplete_reason": "in_memory_tail_lost_on_restart",
             }
-            if self._finalize_signal_path(
-                watch, incomplete_reason="in_memory_tail_lost_on_restart",
-            ):
+            if self._finalize_signal_path(watch):
                 rebuilt += 1
             else:
                 # Startup failure must retain an owned retry object.  A local
