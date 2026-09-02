@@ -32,46 +32,44 @@ _CHROMIUM_CANDIDATES = (
 )
 
 
-def chromium_path():
-    """Resolve a Chromium binary, or None.
+class _ExplicitBrowserMissing(Exception):
+    """CHROMIUM_EXECUTABLE names a binary that is not there."""
 
-    An explicitly configured CHROMIUM_EXECUTABLE is authoritative: if it is set
-    and missing, that is an error, not a reason to quietly fall back to some
-    other browser the operator did not ask for.
+
+def chromium_path():
+    """Return an explicit Chromium path, or None to let Playwright resolve one.
+
+    This deliberately does NOT start a driver to look one up.  Doing that span
+    a throwaway `sync_playwright()` whose `initialize()` future was abandoned
+    when the context manager exited, which asyncio reported as
+    "Future exception was never retrieved" -- indistinguishable from a real
+    leak, and it only surfaced on hosts without a preinstalled binary.
     """
     configured = os.environ.get("CHROMIUM_EXECUTABLE")
     if configured:
-        return configured if os.path.isfile(configured) else None
+        # An explicitly named browser is authoritative: if it is missing, that
+        # is an error, not a reason to silently use a different one.
+        if not os.path.isfile(configured):
+            raise _ExplicitBrowserMissing(configured)
+        return configured
     for candidate in _CHROMIUM_CANDIDATES:
         if os.path.isfile(candidate):
             return candidate
-    # Playwright's own managed download, used by `playwright install` in CI.
-    if sync_playwright is not None:
-        try:
-            with sync_playwright() as play:
-                return play.chromium.executable_path
-        except Exception:  # noqa: BLE001 - absence is the answer we want
-            return None
     return None
 
 
-def _browser_unavailable():
-    if sync_playwright is None:
-        return "playwright is not installed"
-    if chromium_path() is None:
-        return "chromium is not available"
-    return None
+def _mandatory():
+    return os.environ.get("REQUIRE_BROWSER_TESTS") == "1"
 
 
-def _skip_or_fail():
-    """Skip locally, but fail loudly where the browser is mandatory."""
-    reason = _browser_unavailable()
-    if reason and os.environ.get("REQUIRE_BROWSER_TESTS") == "1":
+def _unavailable(reason):
+    """Fail loudly where the browser is mandatory; skip otherwise."""
+    if _mandatory():
         raise AssertionError(
             f"browser acceptance is mandatory here but {reason}. "
             "Provision Chromium or unset REQUIRE_BROWSER_TESTS."
         )
-    return reason
+    raise unittest.SkipTest(reason)
 
 
 # --------------------------------------------------------------------------- fixtures
@@ -159,16 +157,31 @@ class DashboardBrowserTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        reason = _skip_or_fail()
-        if reason:
-            raise unittest.SkipTest(reason)
+        if sync_playwright is None:
+            _unavailable("playwright is not installed")
+        try:
+            executable = chromium_path()
+        except _ExplicitBrowserMissing as exc:
+            _unavailable(f"CHROMIUM_EXECUTABLE {exc} does not exist")
+
         cls.server = ThreadingHTTPServer(
             ("127.0.0.1", 0), partial(_Handler, directory=str(STATIC)))
         cls.port = cls.server.server_address[1]
         cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
         cls.thread.start()
+
+        # One driver for the whole class. Launching is itself the availability
+        # check: if no browser can start, that is the answer, and it is
+        # reported without ever leaving a half-initialised driver behind.
         cls._play = sync_playwright().start()
-        cls.browser = cls._play.chromium.launch(executable_path=chromium_path())
+        try:
+            cls.browser = cls._play.chromium.launch(
+                **({"executable_path": executable} if executable else {}))
+        except Exception as exc:  # noqa: BLE001 - absence or breakage both count
+            cls._play.stop()
+            cls.server.shutdown()
+            cls.server.server_close()
+            _unavailable(f"chromium could not be launched: {exc}")
 
     @classmethod
     def tearDownClass(cls):
