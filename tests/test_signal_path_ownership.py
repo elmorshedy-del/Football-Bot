@@ -3,6 +3,7 @@
 Expiry and eviction used to `popleft()` before persisting, so a failed write
 destroyed the only owner of the buffered rows.
 """
+import asyncio
 import tempfile
 import unittest
 from collections import deque
@@ -227,6 +228,78 @@ class SignalPathOwnershipTests(unittest.TestCase):
         self.assertEqual(store.unfinalized_signal_paths(), [])
         self.assertIsNone(self.signal_row(sid)["path_incomplete_reason"])
 
+
+    def test_failed_startup_rebuild_retains_retry_owner_then_recovers(self):
+        sid = self.signal()
+        with patch("app.engine.store.finalize_signal_path_with_rows",
+                   side_effect=OSError("disk full")):
+            rebuilt = self.engine.rebuild_signal_paths()
+
+        self.assertEqual(rebuilt, 0)
+        self.assertEqual(len(self.engine._signal_paths), 1)
+        watch = self.engine._signal_paths[0]
+        self.assertTrue(watch.get("retry_only"))
+        self.assertEqual(watch["signal_id"], sid)
+        self.assertEqual(self.engine.signal_path_fault, "signal_path_persistence_failed")
+        self.assertIsNone(self.signal_row(sid)["forward_path_finalized"])
+
+        self.engine._expire_signal_paths(1.0)
+        self.assertEqual(len(self.engine._signal_paths), 0)
+        self.assertIsNotNone(self.signal_row(sid)["forward_path_finalized"])
+        self.assertEqual(
+            self.signal_row(sid)["path_incomplete_reason"],
+            "in_memory_tail_lost_on_restart",
+        )
+        self.assertIsNone(self.engine.signal_path_fault)
+
+    def test_one_success_cannot_clear_another_failed_watch_fault(self):
+        failed_sid = self.signal()
+        successful_sid = self.signal()
+        real_finalize = store.finalize_signal_path_with_rows
+
+        def selective(signal_id, *args, **kwargs):
+            if signal_id == failed_sid:
+                raise OSError("failed owner")
+            return real_finalize(signal_id, *args, **kwargs)
+
+        with patch("app.engine.store.finalize_signal_path_with_rows", side_effect=selective):
+            rebuilt = self.engine.rebuild_signal_paths()
+
+        self.assertEqual(rebuilt, 1)
+        self.assertEqual([w["signal_id"] for w in self.engine._signal_paths], [failed_sid])
+        self.assertIn(failed_sid, self.engine._signal_path_failed_owners)
+        self.assertNotIn(successful_sid, self.engine._signal_path_failed_owners)
+        self.assertEqual(self.engine.signal_path_fault, "signal_path_persistence_failed")
+
+        self.engine._expire_signal_paths(1.0)
+        self.assertEqual(len(self.engine._signal_paths), 0)
+        self.assertEqual(self.engine._signal_path_failed_owners, set())
+        self.assertIsNone(self.engine.signal_path_fault)
+
+    def test_signal_rebuild_runs_when_paper_execution_v2_is_disabled(self):
+        eng = engine_module.Engine.__new__(engine_module.Engine)
+        eng.mode = "demo"
+        eng.ws_state = ""
+        calls = []
+        eng.rebuild_signal_paths = lambda: calls.append("rebuild") or 0
+
+        class DummyReplay:
+            def __init__(self, _engine):
+                pass
+
+            async def run(self):
+                return None
+
+        def discard_task(coro):
+            coro.close()
+            return object()
+
+        with patch("app.engine.config.PAPER_EXECUTION_V2", False), \
+                patch("app.engine.asyncio.create_task", side_effect=discard_task), \
+                patch("app.replay.DemoReplay", DummyReplay):
+            asyncio.run(eng.start())
+
+        self.assertEqual(calls, ["rebuild"])
 
 if __name__ == "__main__":
     unittest.main()

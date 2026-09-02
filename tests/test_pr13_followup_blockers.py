@@ -210,5 +210,64 @@ class PR13FollowupBlockerTests(unittest.TestCase):
         self.assertIn('"archive"', js)
 
 
+    def test_trade_and_signal_list_endpoints_do_not_query_paths_per_row(self):
+        store.set_mode("demo")
+        demo_trade_ids = []
+        for index in range(25):
+            event = f"DEMO-{index:02d}"
+            sid = self.signal(event=event, started=False)
+            demo_trade_ids.append(self.trade(sid, event=event))
+        store.set_mode("live")
+        live_sid = self.signal(event="LIVE-LEAK", started=False)
+        self.trade(live_sid, event="LIVE-LEAK")
+
+        traced = []
+        store._conn.set_trace_callback(traced.append)
+        try:
+            trades = run(main.trades(mode="demo", limit=100))
+            signals = run(main.signals(mode="demo", limit=100))
+        finally:
+            store._conn.set_trace_callback(None)
+
+        self.assertEqual({row["id"] for row in trades["open"]}, set(demo_trade_ids))
+        self.assertEqual(len(signals), 25)
+        self.assertTrue(all(row["mode"] == "demo" for row in trades["open"]))
+        self.assertTrue(all(row["mode"] == "demo" for row in signals))
+        path_selects = [
+            sql for sql in traced
+            if sql.lstrip().upper().startswith("SELECT")
+            and "BID_PATH_SAMPLES" in sql.upper()
+        ]
+        self.assertEqual(
+            path_selects, [],
+            f"list endpoints performed path queries for 25-row result sets: {path_selects}",
+        )
+
+    def test_settlement_terminal_cannot_become_executable_peak(self):
+        rows = [
+            self.path_row(seq=1, bid=90.0),
+            self.path_row(seq=2, bid=None, terminal=1, availability="terminal"),
+        ]
+        rows[-1]["dt_ms"] = 2000.0
+        summary = store.bid_path_summary(rows)
+        self.assertEqual(summary["peak_bid"], 90.0)
+        self.assertEqual(summary["last_bid"], 90.0)
+        self.assertEqual(summary["samples_priced"], 1)
+
+    def test_terminal_closes_peak_duration_but_is_not_priced(self):
+        rows = [
+            self.path_row(seq=1, bid=90.0),
+            self.path_row(seq=2, bid=90.0),
+            self.path_row(seq=3, bid=None, terminal=1, availability="terminal"),
+        ]
+        rows[0]["dt_ms"] = 0.0
+        rows[1]["dt_ms"] = 1000.0
+        rows[2]["dt_ms"] = 2500.0
+        summary = store.bid_path_summary(rows)
+        self.assertEqual(summary["samples_total"], 3)
+        self.assertEqual(summary["samples_priced"], 2)
+        self.assertEqual(summary["ms_at_peak"], 2500.0)
+        self.assertEqual(summary["gap_count"], 0)
+
 if __name__ == "__main__":
     unittest.main()

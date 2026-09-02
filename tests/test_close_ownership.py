@@ -305,5 +305,54 @@ class CloseOwnershipTests(unittest.TestCase):
         self.assertTrue(any("path_sequence_conflict" in message for _, message in self.errors))
 
 
+    def _seed_position_path(self, pos, count):
+        rows = []
+        for seq in range(1, count + 1):
+            rows.append({
+                "kind": "position", "trade_id": pos.tid, "signal_id": pos.signal_id,
+                "event": pos.event, "market": pos.market, "side": pos.side,
+                "strategy": pos.strategy, "anchor_ts": pos.entry_ts,
+                "dt_ms": float(seq), "bid": 50.0, "bid_size": 100.0,
+                "exec_px": 50.0, "qty": pos.remaining, "sample_seq": seq,
+                "availability": "quote", "terminal": 0,
+            })
+        store.insert_bid_path(rows)
+
+    def _restart_owned_position(self, tid):
+        self.desk.positions = {}
+        self.desk.realistic = True
+        self.desk.restore_open_positions(store.load_open_paper_positions())
+        restored = self.desk.positions[tid]
+        self.desk.realistic = False
+        return restored
+
+    def test_restart_at_3999_rows_closes_with_exactly_4000_including_terminal(self):
+        pos = self.open_trade()
+        self._seed_position_path(pos, 3999)
+        restored = self._restart_owned_position(pos.tid)
+        self.assertEqual(restored.exec_path_total, 3999)
+
+        self.assertTrue(self.desk.close(restored, 60.0, "target"))
+        rows = self.path_rows(pos.tid)
+        self.assertEqual(len(rows), 4000)
+        self.assertEqual(max(row["sample_seq"] for row in rows), 4000)
+        self.assertEqual(sum(row["terminal"] for row in rows), 1)
+        self.assertNotIn(pos.tid, self.desk.positions)
+
+    def test_exhausted_legacy_path_never_writes_row_4001_or_releases_owner(self):
+        pos = self.open_trade()
+        self._seed_position_path(pos, 4000)
+        restored = self._restart_owned_position(pos.tid)
+        self.assertEqual(restored.exec_path_total, 4000)
+
+        self.assertFalse(self.desk.close(restored, 60.0, "target"))
+        rows = self.path_rows(pos.tid)
+        self.assertEqual(len(rows), 4000)
+        self.assertEqual(max(row["sample_seq"] for row in rows), 4000)
+        self.assertEqual(sum(row["terminal"] for row in rows), 0)
+        self.assertIn(pos.tid, self.desk.positions)
+        self.assertEqual(self.trade_row(pos.tid)["status"], "open")
+        self.assertTrue(any("path_sample_cap_exhausted" in message for _, message in self.errors))
+
 if __name__ == "__main__":
     unittest.main()
