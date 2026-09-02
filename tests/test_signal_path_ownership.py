@@ -153,6 +153,23 @@ class SignalPathOwnershipTests(unittest.TestCase):
             "a retry duplicated decline rows",
         )
 
+    def test_incremental_signal_collision_keeps_buffer(self):
+        sid = self.signal()
+        durable_watch = self.watch(sid)
+        store.insert_bid_path(durable_watch["rows"])
+
+        conflict_watch = self.watch(sid)
+        conflict_watch["rows"][0]["bid"] = 99.0
+        before = list(conflict_watch["rows"])
+        self.assertFalse(self.engine._flush_signal_path(conflict_watch))
+
+        self.assertEqual(conflict_watch["rows"], before,
+                         "incremental signal conflict cleared the buffer")
+        self.assertEqual(self.engine.signal_path_fault, "signal_path_persistence_failed")
+        self.assertIn(sid, self.engine._signal_path_failed_owners)
+        self.assertTrue(any("path_sequence_conflict" in message for _, message in self.errors))
+        self.assertEqual(self.durable(sid)[0]["bid"], 80.0)
+
     # ------------------------------------------------------------------- gaps
 
     def test_decline_rows_carry_sequences_and_record_one_gap(self):
