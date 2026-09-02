@@ -81,6 +81,12 @@ class PR13FollowupBlockerTests(unittest.TestCase):
         eng._record_error = lambda *_args, **_kwargs: None
         return eng
 
+    def test_schema_migration_is_idempotent_for_started_marker(self):
+        store.init()
+        store.init()
+        columns = {row["name"] for row in store.q("PRAGMA table_info(signals)")}
+        self.assertIn("forward_path_started_ts", columns)
+
     def test_identical_retry_is_idempotent_but_conflicting_sequence_raises(self):
         sid = self.signal()
         tid = self.trade(sid)
@@ -144,6 +150,7 @@ class PR13FollowupBlockerTests(unittest.TestCase):
             self.path_row(seq=3, bid=70.0),
             self.path_row(seq=4, bid=None, terminal=1, availability="terminal"),
         ]
+        self.assertIsNone(rows[-1]["bid"])
         summary = store.bid_path_summary(rows)
         self.assertEqual(summary["samples_total"], 4)
         self.assertEqual(summary["samples_priced"], 2)
