@@ -1299,8 +1299,7 @@ kalchi-kill untouched proof:    no file in this diff references the service; no 
 Requested final-review decision: BLOCKED
 ```
 
-**Note on draft state.** PR #13 is currently **not** a draft. §3.4 requires it to stay draft, and
-the implementer has not changed the PR's state. It needs converting to draft before review.
+**Historical note on draft state.** At this earlier hand-back PR #13 was **not** a draft. It was subsequently converted back to draft; the final evidence refresh below records the current state.
 
 **Why `BLOCKED`.** `BR-05` cannot be satisfied without an authorised deployment, and `BR-07`
 forbids the implementer from self-approving. Every §1.x code and behavioral-test requirement in

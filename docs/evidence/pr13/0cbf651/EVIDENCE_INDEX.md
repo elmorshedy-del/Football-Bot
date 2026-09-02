@@ -1,4 +1,6 @@
-# PR 13 evidence index — candidate `0cbf651`
+# HISTORICAL — PR 13 evidence index — candidate `0cbf651`
+
+> **Superseded for current hand-back.** Use `docs/evidence/pr13/cb273b4/EVIDENCE_INDEX.md` for the final validated candidate and CI record. The values below are retained as historical evidence.
 
 | Field | Value |
 |---|---|
@@ -47,7 +49,7 @@ Earlier packages, unchanged: `c9f490a` (§3-4), `f3d3de0` (§5-6), `00d41f8` (§
 | Artifact | Path | SHA-256 |
 |---|---|---|
 | PR 13 baseline red | `docs/evidence/pr13/baseline-d69f5a4/baseline-red-tests.txt` | `f7256b7d7dd84a447a1580048b5e8f77ae7e689cf90df8150c0d3e0ca39ba539` |
-| PR 13 validation gate | `docs/evidence/pr13/0cbf651/local-validation-gate.txt` | `f23dc040ab7455634e94be5bb58e05cb8b76d044368e63a72743562aa110d9c3` |
+| PR 13 validation gate | `docs/evidence/pr13/0cbf651/local-validation-gate.txt` | `7bc6b04d5bc35b7cdd641eaae69c9aad3dd5bfa71dfab878370323adbeaa67e7` |
 | PR 12 baseline red | `docs/evidence/pr12/baseline-cd4d36e/baseline-red-tests.txt` | `e5e62bf418984a4ced2cac121ffcb060c2c83899d0aa3d64ccea59e270c8fa9e` |
 
 ## Continuous integration
