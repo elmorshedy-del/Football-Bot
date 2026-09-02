@@ -50,6 +50,33 @@ Earlier packages, unchanged: `c9f490a` (§3-4), `f3d3de0` (§5-6), `00d41f8` (§
 | PR 13 validation gate | `docs/evidence/pr13/0cbf651/local-validation-gate.txt` | `f23dc040ab7455634e94be5bb58e05cb8b76d044368e63a72743562aa110d9c3` |
 | PR 12 baseline red | `docs/evidence/pr12/baseline-cd4d36e/baseline-red-tests.txt` | `e5e62bf418984a4ced2cac121ffcb060c2c83899d0aa3d64ccea59e270c8fa9e` |
 
+## Continuous integration
+
+| Field | Value |
+|---|---|
+| Run | https://github.com/elmorshedy-del/Football-Bot/actions/runs/33576969178 |
+| Job | `test` (`100082963919`) |
+| Validated head | `3f1f8e369deb9b88a3601a180c3f5bb80910889a` |
+| Conclusion | success |
+| Chromium | 151.0.7922.34, launched and verified before the suite |
+
+Browser acceptance **actually executed** on the runner. All six
+`test_dashboard_browser` tests appear by name in the job log, and the run
+contains **zero skip markers** — the failure mode of run `33561327860`, which was
+green with three skipped acceptance tests, cannot recur silently.
+
+Two earlier runs on this branch are part of the record and worth reading:
+
+- `33576470763` passed **while its own log contained** `Future exception was never
+  retrieved`. The guard at that commit matched only the `Task exception` wording, so
+  it reported green over a real leak.
+- `33576746007` went **red** once the guard matched both wordings. Root cause was in
+  the test file itself: `chromium_path()` entered and immediately exited a
+  `sync_playwright()` context manager purely to resolve a path, abandoning the
+  driver's `initialize()` future. It surfaced only on hosts without a preinstalled
+  binary, which is why CI saw it and local runs did not. The probe is removed in
+  `3f1f8e3`.
+
 ## Local results
 
 - Full suite **298 tests, OK**, run twice consecutively under
