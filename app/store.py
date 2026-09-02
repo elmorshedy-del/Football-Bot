@@ -138,6 +138,39 @@ def present_mode(value):
     return value if value else LEGACY_MODE
 
 
+# The only selectors an API caller may name.  Anything else is refused rather
+# than silently widened, so a typo cannot quietly mix evidence modes.
+SAFE_MODE_SELECTORS = ("live", "demo", LEGACY_MODE, "all")
+
+
+def resolve_mode_selector(value=None):
+    """Validate a caller-supplied mode selector; default to the active mode."""
+    if value is None:
+        return _mode
+    selector = str(value).strip().lower()
+    if selector not in SAFE_MODE_SELECTORS:
+        raise ValueError(
+            f"unknown mode selector {value!r};"
+            f" expected one of {', '.join(SAFE_MODE_SELECTORS)}"
+        )
+    return selector
+
+
+def row_exists_in_mode(table, row_id, mode=None):
+    """True when `row_id` exists in `table` within the requested mode.
+
+    Path access is authorised through the parent row so a caller scoped to one
+    mode cannot fetch another mode's samples by guessing an id.
+    """
+    if table not in {"trades", "signals"}:
+        raise ValueError(f"unsupported parent table {table!r}")
+    scope, scope_args = mode_clause(selector=mode)
+    return bool(q(
+        f"SELECT 1 FROM {table} WHERE id=?{scope} LIMIT 1",
+        (row_id, *scope_args),
+    ))
+
+
 def init():
     global _conn
     os.makedirs(config.DATA_DIR, exist_ok=True)
@@ -659,21 +692,23 @@ def unfinalized_signal_paths():
     )
 
 
-def bid_path_for_trade(trade_id, limit=BID_PATH_MAX_SAMPLES):
+def bid_path_for_trade(trade_id, limit=BID_PATH_MAX_SAMPLES, mode=None):
+    scope, scope_args = mode_clause(selector=mode)
     return q(
-        """SELECT dt_ms,bid,bid_size,exec_px,qty,availability,terminal,sample_seq
+        f"""SELECT dt_ms,bid,bid_size,exec_px,qty,availability,terminal,sample_seq
              FROM bid_path_samples
-             WHERE trade_id=? ORDER BY dt_ms LIMIT ?""",
-        (trade_id, limit),
+             WHERE trade_id=?{scope} ORDER BY dt_ms LIMIT ?""",
+        (trade_id, *scope_args, limit),
     )
 
 
-def bid_path_for_signal(signal_id, limit=BID_PATH_MAX_SAMPLES):
+def bid_path_for_signal(signal_id, limit=BID_PATH_MAX_SAMPLES, mode=None):
+    scope, scope_args = mode_clause(selector=mode)
     return q(
-        """SELECT dt_ms,bid,bid_size,exec_px,qty,availability,terminal,sample_seq
+        f"""SELECT dt_ms,bid,bid_size,exec_px,qty,availability,terminal,sample_seq
              FROM bid_path_samples
-             WHERE signal_id=? AND kind='decline' ORDER BY dt_ms LIMIT ?""",
-        (signal_id, limit),
+             WHERE signal_id=? AND kind='decline'{scope} ORDER BY dt_ms LIMIT ?""",
+        (signal_id, *scope_args, limit),
     )
 
 

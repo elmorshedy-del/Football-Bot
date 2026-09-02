@@ -62,10 +62,69 @@ def non_secret_config():
     return {name.lower(): getattr(config, name) for name in names}
 
 
-def _rows(connection, table):
+def _table_has_mode(connection, table):
+    return any(
+        row[1] == "mode"
+        for row in connection.execute(f'PRAGMA table_info("{table}")')
+    )
+
+
+def _rows(connection, table, selector=None):
+    """Read one table, scoped to a capture mode when the table records one.
+
+    A bundle labelled `live` used to carry demo and legacy rows in its CSV,
+    JSONL and SQLite snapshot, so its own manifest contradicted its contents.
+    """
     cursor = connection.execute(f'SELECT * FROM "{table}"')
     columns = [item[0] for item in cursor.description]
-    return columns, [dict(zip(columns, row)) for row in cursor.fetchall()]
+    rows = [dict(zip(columns, row)) for row in cursor.fetchall()]
+    if selector in (None, "all") or "mode" not in columns:
+        return columns, rows
+    if selector == store.LEGACY_MODE:
+        keep = [row for row in rows if row.get("mode") is None]
+    else:
+        keep = [row for row in rows if row.get("mode") == selector]
+    return columns, keep
+
+
+def _counts_by_mode(rows):
+    counts = {}
+    for row in rows:
+        label = store.present_mode(row.get("mode"))
+        counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
+def _scope_snapshot_to_mode(snapshot_path, selector):
+    """Delete out-of-mode rows from the SNAPSHOT COPY, never the live database.
+
+    The snapshot is a throwaway temp file created for this bundle, so trimming
+    it is what makes the shipped database agree with the manifest label.
+    """
+    if selector in (None, "all"):
+        return {}
+    removed = {}
+    connection = sqlite3.connect(snapshot_path)
+    try:
+        for table in TABLES:
+            if not _table_has_mode(connection, table):
+                continue
+            if selector == store.LEGACY_MODE:
+                cursor = connection.execute(
+                    f'DELETE FROM "{table}" WHERE mode IS NOT NULL')
+            else:
+                cursor = connection.execute(
+                    f'DELETE FROM "{table}" WHERE mode IS NULL OR mode<>?',
+                    (selector,),
+                )
+            if cursor.rowcount:
+                removed[table] = cursor.rowcount
+        connection.commit()
+        connection.execute("VACUUM")
+        connection.commit()
+    finally:
+        connection.close()
+    return removed
 
 
 def _csv_bytes(columns, rows):
@@ -228,7 +287,7 @@ def _capture_boundary(boundary):
 
 def build_study_bundle(output_path=None, mode=None, raw_paths=None, snapshot_path=None,
                        include_raw=True, progress=None, cancel_check=None, scope="full",
-                       boundary=None):
+                       boundary=None, all_modes=False):
     """Return ``(zip_path, manifest)`` for a consistent study snapshot.
 
     ``scope="audit"`` / ``include_raw=False`` builds the audit product: tables
@@ -252,6 +311,10 @@ def build_study_bundle(output_path=None, mode=None, raw_paths=None, snapshot_pat
     snapshot_path = snapshot_path or prepare_database_snapshot()
     try:
         _ensure_not_cancelled(cancel_check)
+        # Trim the snapshot copy to the requested mode BEFORE reading tables or
+        # archiving it, so every artifact in the bundle agrees with its label.
+        selector = "all" if all_modes else store.resolve_mode_selector(mode)
+        snapshot_removed = _scope_snapshot_to_mode(snapshot_path, selector)
         connection = sqlite3.connect(snapshot_path)
         try:
             schema_rows = connection.execute(
@@ -279,6 +342,12 @@ def build_study_bundle(output_path=None, mode=None, raw_paths=None, snapshot_pat
                 "schema": EXPORT_SCHEMA,
                 "created_at": datetime.now(timezone.utc).isoformat(),
                 "mode": mode or "unknown",
+                "requested_modes": [selector] if selector != "all" else list(
+                    store.SAFE_MODE_SELECTORS[:-1]
+                ),
+                "mode_selector": selector,
+                "all_mode_archival_export": bool(all_modes),
+                "snapshot_rows_removed_out_of_mode": snapshot_removed,
                 "scope": scope,
                 "include_raw": include_raw,
                 "paper_only": True,
@@ -323,9 +392,10 @@ def build_study_bundle(output_path=None, mode=None, raw_paths=None, snapshot_pat
                     "sha256": _sha256_bytes(schema_bytes),
                     "bytes": len(schema_bytes),
                 }
+                exported_rows = {}
                 for table in TABLES:
                     _ensure_not_cancelled(cancel_check)
-                    columns, rows = _rows(connection, table)
+                    columns, rows = _rows(connection, table, selector)
                     csv_name = f"tables/{table}.csv"
                     jsonl_name = f"tables/{table}.jsonl"
                     csv_content = _csv_bytes(columns, rows)
@@ -334,10 +404,12 @@ def build_study_bundle(output_path=None, mode=None, raw_paths=None, snapshot_pat
                     archive.writestr(jsonl_name, jsonl_content)
                     manifest["tables"][table] = {
                         "rows": len(rows),
+                        "counts_by_mode": _counts_by_mode(rows),
                         "columns": columns,
                         "csv": csv_name,
                         "jsonl": jsonl_name,
                     }
+                    exported_rows[table] = rows
                     for name, content in (
                         (csv_name, csv_content), (jsonl_name, jsonl_content),
                     ):
@@ -376,6 +448,34 @@ def build_study_bundle(output_path=None, mode=None, raw_paths=None, snapshot_pat
                 else:
                     for item in raw_inventory(selected_raw):
                         manifest["raw_feed"].append(item)
+                # Every exported fill must point at an exported trade of the
+                # same mode.  An orphan means the scoping dropped one side of a
+                # pair, which would silently corrupt any PnL reconstruction.
+                trade_ids = {
+                    row.get("id") for row in exported_rows.get("trades", [])
+                }
+                fills = exported_rows.get("paper_fills", [])
+                orphan_fills = [
+                    row.get("id") for row in fills
+                    if row.get("trade_id") is not None
+                    and row.get("trade_id") not in trade_ids
+                ]
+                signal_ids = {
+                    row.get("id") for row in exported_rows.get("signals", [])
+                }
+                orphan_trades = [
+                    row.get("id") for row in exported_rows.get("trades", [])
+                    if row.get("signal_id") is not None
+                    and row.get("signal_id") not in signal_ids
+                ]
+                manifest["reconciliation"] = {
+                    "mode_selector": selector,
+                    "trades": len(trade_ids),
+                    "paper_fills": len(fills),
+                    "orphan_fills": orphan_fills,
+                    "orphan_trades": orphan_trades,
+                    "reconciled": not orphan_fills and not orphan_trades,
+                }
                 _ensure_not_cancelled(cancel_check)
                 handoff = Path(__file__).resolve().parents[1] / "docs" / \
                     "PRICE_ONLY_BACKTEST_HANDOFF.md"
