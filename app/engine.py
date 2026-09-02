@@ -114,6 +114,7 @@ class Engine:
         # Current fault, latched until a finalization actually succeeds.  A
         # historical entry in `errors` decays; this does not.
         self.signal_path_fault = None
+        self._signal_path_failed_owners = set()
         self.errors = deque(maxlen=50)
         self._last_error_key = None
         self._last_error_ts = 0.0
@@ -378,6 +379,8 @@ class Engine:
 
     def _record_signal_paths(self, ticker, book, now):
         for watch in self._signal_paths:
+            if watch.get("retry_only"):
+                continue
             if watch["market"] != ticker:
                 continue
             try:
@@ -418,6 +421,16 @@ class Engine:
                 "terminal": 0,
             })
 
+    def _mark_signal_path_failure(self, signal_id, exc):
+        self._signal_path_failed_owners.add(signal_id)
+        self.signal_path_fault = "signal_path_persistence_failed"
+        self._record_error("signal_path", exc)
+
+    def _mark_signal_path_success(self, signal_id):
+        self._signal_path_failed_owners.discard(signal_id)
+        if not self._signal_path_failed_owners:
+            self.signal_path_fault = None
+
     def _flush_signal_path(self, watch, final=False):
         """Incremental flush. Returns True when the buffer is durable."""
         if final:
@@ -428,15 +441,19 @@ class Engine:
         try:
             written = store.insert_bid_path(rows)
         except Exception as exc:
-            # Keep the rows for the next attempt rather than dropping them.
-            self._record_error("signal_path", exc)
+            # Keep the rows and the owning watch. A sequence conflict is a
+            # current health fault until this exact owner later commits.
+            self._mark_signal_path_failure(watch["signal_id"], exc)
             return False
         if isinstance(written, int) and written < len(rows):
-            self._record_error("signal_path", RuntimeError(
-                f"signal {watch['signal_id']}: {len(rows) - written} of {len(rows)} "
-                "path rows collided with an existing sequence key",
-            ))
+            exc = RuntimeError(
+                f"signal {watch['signal_id']}: short path persistence "
+                f"{written}/{len(rows)}"
+            )
+            self._mark_signal_path_failure(watch["signal_id"], exc)
+            return False
         watch["rows"] = watch["rows"][len(rows):]
+        self._mark_signal_path_success(watch["signal_id"])
         return True
 
     def _finalize_signal_path(self, watch, incomplete_reason=None):
@@ -454,11 +471,10 @@ class Engine:
                 incomplete_reason=incomplete_reason,
             )
         except Exception as exc:
-            self.signal_path_fault = "signal_path_persistence_failed"
-            self._record_error("signal_path", exc)
+            self._mark_signal_path_failure(watch["signal_id"], exc)
             return False
         watch["rows"] = []
-        self.signal_path_fault = None
+        self._mark_signal_path_success(watch["signal_id"])
         return True
 
     def _release_finalized(self, index=0):
@@ -490,11 +506,19 @@ class Engine:
         """
         rebuilt = 0
         for row in store.unfinalized_signal_paths():
-            watch = {"signal_id": row["id"], "rows": [], "dropped": 0}
+            watch = {
+                "signal_id": row["id"], "rows": [], "dropped": 0,
+                "market": row.get("market"), "event": row.get("event"),
+                "expires_at": 0.0, "retry_only": True,
+            }
             if self._finalize_signal_path(
                 watch, incomplete_reason="in_memory_tail_lost_on_restart",
             ):
                 rebuilt += 1
+            else:
+                # Startup failure must retain an owned retry object.  A local
+                # dictionary that falls out of scope cannot ever recover.
+                self._signal_paths.append(watch)
         return rebuilt
 
     def on_book(self, ticker, synthetic=False):
@@ -577,6 +601,10 @@ class Engine:
             "conf_lag_ms": lag, "late": self.is_late(cand["ticker"]), "outcome": outcome,
             "detail": cand.get("detail") or {},
             "match_clock_snapshot": stamp,
+            "forward_path_started_ts": (
+                cand.get("local_ts") or time.time()
+                if config.SIGNAL_PATH_WINDOW_S else None
+            ),
         })
         age = stamp.get("age_ms")
         if isinstance(age, (int, float)):
@@ -827,6 +855,8 @@ class Engine:
             self.desk.check_timeouts()
             # expire stale pendings
             now = time.time()
+            # Also retries startup watches when no new book frame arrives.
+            self._expire_signal_paths(now)
             for p in [p for p in self.pending if now >= p["deadline"]]:
                 self.record_signal(p["cand"], None, "unconfirmed")
             self.pending = [p for p in self.pending if now < p["deadline"]]
@@ -992,16 +1022,16 @@ class Engine:
             store.purge_non_live()  # clean demo/legacy rows so live P&L starts fresh
             if config.PAPER_EXECUTION_V2:
                 self.desk.restore_open_positions(store.load_open_paper_positions())
-                # Watches whose process died inside their observation window
-                # are finalized and labelled incomplete, so no signal is left
-                # with a half-written forward path and no finalization marker.
-                rebuilt = self.rebuild_signal_paths()
-                if rebuilt:
-                    store.log_event(
-                        "paper",
-                        f"rebuilt {rebuilt} unfinalized signal forward path(s) "
-                        "as incomplete after restart",
-                    )
+            # Signal collection is independent of realistic paper execution.
+            # Always reconcile started-but-unfinalized forward watches.
+            rebuilt = self.rebuild_signal_paths()
+            if rebuilt:
+                store.log_event(
+                    "paper",
+                    f"rebuilt {rebuilt} unfinalized signal forward path(s) "
+                    "as incomplete after restart",
+                )
+            if config.PAPER_EXECUTION_V2:
                 for pos in self.desk.positions.values():
                     self._remember_fill({
                         "strategy": pos.strategy,

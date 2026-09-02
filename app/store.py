@@ -258,6 +258,13 @@ def init():
         _conn.execute("ALTER TABLE signals ADD COLUMN forward_path_finalized REAL")
     except sqlite3.OperationalError:
         pass
+    # Written in the same signal INSERT transaction when forward-path capture is
+    # enabled.  A started-but-unfinalized watch is recoverable even when the
+    # process died before its first quote row reached SQLite.
+    try:
+        _conn.execute("ALTER TABLE signals ADD COLUMN forward_path_started_ts REAL")
+    except sqlite3.OperationalError:
+        pass
     # Provider duplicate identity is mode-scoped.  The old (event,fingerprint)
     # unique index made a live observation collide with a demo one and silently
     # refresh it instead of recording it.  Replacing the index deletes no row
@@ -556,30 +563,39 @@ def latency_readiness(limit=500, now=None, mode=None):
 BID_PATH_MAX_SAMPLES = 4000
 
 
+class PathSequenceConflict(RuntimeError):
+    """A path sequence key already exists with a different durable payload."""
+
+
+class PathSampleCapExceeded(RuntimeError):
+    """Writing this path would exceed the durable 4,000-row invariant."""
+
+
 def insert_bid_path(rows):
-    """Persist one buffered path in a single transaction.
+    """Persist one buffered path atomically with strict retry validation.
 
-    The caller accumulates samples in memory for the life of a position or a
-    decline window and flushes once.  Committing per sample would add a
-    synchronous fsync to the asyncio hot path for every book update.
-
-    Returns the number of rows that actually became durable, which is NOT the
-    input length: `INSERT OR IGNORE` silently drops a row whose sequence key
-    already exists.  Returning the input length let a caller clear its buffer
-    on a batch that wrote nothing.
+    A duplicate sequence key is accepted only when every persisted field is
+    identical to the durable row.  Conflicting payloads raise a stable error,
+    leave the caller's buffer owned, and never turn a short write into success.
+    The return value is the number of input rows proven durable (new or exact
+    idempotent retries).
     """
     if not rows:
         return 0
-    payload = _bid_path_payload(rows)
     with _lock:
-        before = _conn.total_changes
-        _conn.executemany(_BID_PATH_INSERT, payload)
-        written = _conn.total_changes - before
-        _conn.commit()
-    return written
+        try:
+            pending = _validated_new_path_payloads(rows)
+            _enforce_path_caps(pending)
+            if pending:
+                _conn.executemany(_BID_PATH_INSERT, pending)
+            _conn.commit()
+        except Exception:
+            _conn.rollback()
+            raise
+    return len(rows)
 
 
-_BID_PATH_INSERT = """INSERT OR IGNORE INTO bid_path_samples(
+_BID_PATH_INSERT = """INSERT INTO bid_path_samples(
        kind,trade_id,signal_id,event,market,side,strategy,
        anchor_ts,dt_ms,bid,bid_size,exec_px,qty,mode,
        sample_seq,availability,terminal)
@@ -606,6 +622,106 @@ def _bid_path_payload(rows):
     ]
 
 
+_BID_PATH_FIELD_NAMES = (
+    "kind", "trade_id", "signal_id", "event", "market", "side", "strategy",
+    "anchor_ts", "dt_ms", "bid", "bid_size", "exec_px", "qty", "mode",
+    "sample_seq", "availability", "terminal",
+)
+_BID_PATH_FIELD_SQL = ",".join(_BID_PATH_FIELD_NAMES)
+
+
+def _payload_map(payload):
+    return dict(zip(_BID_PATH_FIELD_NAMES, payload))
+
+
+def _path_sequence_key(payload):
+    row = _payload_map(payload)
+    seq = row.get("sample_seq")
+    if seq is None:
+        return None
+    if row.get("trade_id") is not None:
+        return ("trade_id", row["trade_id"], row.get("kind"), seq)
+    if row.get("signal_id") is not None:
+        return ("signal_id", row["signal_id"], row.get("kind"), seq)
+    return None
+
+
+def _durable_payload_for_key(key):
+    if key is None:
+        return None
+    owner_column, owner_id, kind, seq = key
+    cursor = _conn.execute(
+        f"SELECT {_BID_PATH_FIELD_SQL} FROM bid_path_samples "
+        f"WHERE {owner_column}=? AND kind=? AND sample_seq=? LIMIT 1",
+        (owner_id, kind, seq),
+    )
+    return cursor.fetchone()
+
+
+def _sequence_conflict(key):
+    owner_column, owner_id, kind, seq = key
+    return PathSequenceConflict(
+        f"path_sequence_conflict: {owner_column}={owner_id} kind={kind!r} "
+        f"sample_seq={seq}"
+    )
+
+
+def _validated_new_path_payloads(rows):
+    """Return only genuinely new rows after proving duplicate keys idempotent."""
+    pending = []
+    pending_by_key = {}
+    for payload in _bid_path_payload(rows or []):
+        key = _path_sequence_key(payload)
+        if key is None:
+            pending.append(payload)
+            continue
+        durable = _durable_payload_for_key(key)
+        if durable is not None:
+            if tuple(durable) != tuple(payload):
+                raise _sequence_conflict(key)
+            continue
+        prior = pending_by_key.get(key)
+        if prior is not None:
+            if tuple(prior) != tuple(payload):
+                raise _sequence_conflict(key)
+            continue
+        pending_by_key[key] = payload
+        pending.append(payload)
+    return pending
+
+
+def _enforce_path_caps(payloads):
+    """Reject a batch before INSERT when its durable owner would exceed the cap."""
+    grouped = {}
+    for payload in payloads:
+        row = _payload_map(payload)
+        if row.get("trade_id") is not None:
+            key = ("trade_id", row["trade_id"], None)
+        elif row.get("signal_id") is not None:
+            # Signal ids also appear on position rows.  A decline watch owns only
+            # its own kind, so position history cannot consume the watch's cap.
+            key = ("signal_id", row["signal_id"], row.get("kind"))
+        else:
+            continue
+        grouped[key] = grouped.get(key, 0) + 1
+    for (owner_column, owner_id, kind), incoming in grouped.items():
+        if kind is None:
+            current = _conn.execute(
+                f"SELECT COUNT(*) FROM bid_path_samples WHERE {owner_column}=?",
+                (owner_id,),
+            ).fetchone()[0]
+        else:
+            current = _conn.execute(
+                f"SELECT COUNT(*) FROM bid_path_samples WHERE {owner_column}=? AND kind=?",
+                (owner_id, kind),
+            ).fetchone()[0]
+        if current + incoming > BID_PATH_MAX_SAMPLES:
+            raise PathSampleCapExceeded(
+                f"path_sample_cap_exhausted: {owner_column}={owner_id} "
+                f"durable={current} incoming={incoming} cap={BID_PATH_MAX_SAMPLES}"
+            )
+
+
 def _read_rows(cursor):
     columns = [column[0] for column in cursor.description]
     return [dict(zip(columns, row)) for row in cursor.fetchall()]
@@ -619,8 +735,15 @@ def _persist_path_in_transaction(rows, owner_column, owner_id, extra_where="",
     summary is read back after the inserts so it always describes exactly the
     rows on disk, never the caller's in-memory guess.
     """
-    if rows:
-        _conn.executemany(_BID_PATH_INSERT, _bid_path_payload(rows))
+    pending = _validated_new_path_payloads(rows or [])
+    for payload in pending:
+        if _payload_map(payload).get(owner_column) != owner_id:
+            raise ValueError(
+                f"path owner mismatch: expected {owner_column}={owner_id}"
+            )
+    _enforce_path_caps(pending)
+    if pending:
+        _conn.executemany(_BID_PATH_INSERT, pending)
     samples = _read_rows(_conn.execute(
         f"SELECT {_BID_PATH_COLUMNS} FROM bid_path_samples"
         f" WHERE {owner_column}=?{extra_where} ORDER BY dt_ms LIMIT ?",
@@ -677,17 +800,12 @@ def finalize_signal_path(signal_id, path_rows=None, truncated=False,
 
 
 def unfinalized_signal_paths():
-    """Signals that have forward-path rows but never recorded a finalization.
-
-    These are watches whose process died inside the observation window.  Their
-    in-memory tail is gone, so they are rebuilt and labelled incomplete rather
-    than presented as a complete path.
-    """
+    """Forward watches that started durably but never recorded finalization."""
     scope, scope_args = mode_clause("s")
     return q(
-        "SELECT DISTINCT s.id, s.local_ts FROM signals s"
-        " JOIN bid_path_samples p ON p.signal_id=s.id AND p.kind='decline'"
-        f" WHERE s.forward_path_finalized IS NULL{scope} ORDER BY s.id",
+        "SELECT s.id, s.local_ts, s.market, s.event FROM signals s"
+        f" WHERE s.forward_path_started_ts IS NOT NULL "
+        f"AND s.forward_path_finalized IS NULL{scope} ORDER BY s.id",
         scope_args,
     )
 
@@ -726,6 +844,14 @@ def _path_segments(rows):
     segments, gaps, current = [], [], None
     for row in rows:
         dt = row.get("dt_ms")
+        if row.get("terminal") or row.get("availability") == "terminal":
+            # A terminal is an end timestamp, not a quote and not an outage.
+            # It closes the current availability segment without contributing
+            # price, travel, peak/trough, or samples_priced.
+            if current is not None:
+                current["close_dt"] = dt
+                current = None
+            continue
         if _is_priced(row.get("bid")):
             if current is None:
                 current = {"points": [], "close_dt": None}
@@ -1018,12 +1144,14 @@ def _stamp_text(value):
 
 def insert_signal(s):
     cur = ex("""INSERT INTO signals(ts_ms,local_ts,market,event,series,dir,dl,levels,size,
-                ref,ext,conf_lag_ms,late,outcome,detail,mode,match_clock_snapshot)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                ref,ext,conf_lag_ms,late,outcome,detail,mode,match_clock_snapshot,
+                forward_path_started_ts)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
              (s["ts_ms"], s["local_ts"], s["market"], s["event"], s["series"], s["dir"],
               s["dl"], s["levels"], s["size"], s["ref"], s["ext"], s.get("conf_lag_ms"),
               1 if s.get("late") else 0, s["outcome"], json.dumps(s.get("detail") or {}), _mode,
-              _stamp_text(s.get("match_clock_snapshot"))))
+              _stamp_text(s.get("match_clock_snapshot")),
+              s.get("forward_path_started_ts")))
     return cur.lastrowid
 
 

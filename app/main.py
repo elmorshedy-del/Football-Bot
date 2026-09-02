@@ -332,7 +332,7 @@ async def signals(limit: int = 60, mode: str | None = None):
     for row in rows:
         _decorate_signal(row, observations, trades_by_signal.get(row["id"]))
         row["forward_path_summary"] = json_object(row.get("forward_path_summary")) or None
-        row["forward_path_url"] = f"/api/signals/{row['id']}/path"
+        row["forward_path_url"] = f"/api/signals/{row['id']}/path?mode={selector}"
     return rows
 
 
@@ -341,15 +341,24 @@ async def trades(limit: int = 200, mode: str | None = None):
     limit = max(1, min(limit, 500))
     selector = _mode_selector(mode)
     scope, scope_args = store.mode_clause(selector=selector)
-    rows = store.q(
-        f"SELECT * FROM trades WHERE 1=1{scope} ORDER BY id DESC LIMIT ?",
+    open_rows = store.q(
+        f"SELECT * FROM trades WHERE status='open'{scope} ORDER BY id",
+        scope_args,
+    )
+    closed_rows = store.q(
+        f"SELECT * FROM trades WHERE status='closed'{scope} ORDER BY id DESC LIMIT ?",
         (*scope_args, limit),
     )
+    rows = open_rows + closed_rows
     _label_modes(rows)
-    opens = [engine.desk.pos_dict(p, p.best_bid) for p in engine.desk.positions.values()]
+    live_marks = {}
+    if engine is not None and selector in {engine.mode, "all"}:
+        live_marks = {
+            p.tid: engine.desk.pos_dict(p, p.best_bid)
+            for p in engine.desk.positions.values()
+        }
     signal_rows = _rows_by_signal_id(
-        [row.get("signal_id") for row in rows] + [row.get("signal_id") for row in opens],
-        mode=selector,
+        [row.get("signal_id") for row in rows], mode=selector,
     )
     observations = _event_observations(signal_rows.values(), mode=selector)
     for r in rows:
@@ -380,23 +389,20 @@ async def trades(limit: int = 200, mode: str | None = None):
         # meant up to 500 extra queries and millions of rows per refresh; the
         # full path is served by /api/trades/{id}/path on demand.
         r["bid_path_summary"] = json_object(r.get("bid_path_summary")) or None
-        r["bid_path_url"] = f"/api/trades/{r['id']}/path"
-    for row in opens:
-        signal = signal_rows.get(row.get("signal_id"))
-        row.update(_display_names(
-            row.get("market"), row.get("event"),
-            (signal or {}).get("market_title"), (signal or {}).get("market_leg"),
-            (signal or {}).get("market_game"),
-        ))
-        if signal:
-            signal["detail"] = json_object(signal.get("detail"))
-            signal["strategy"] = row.get("strategy") or signal_strategy(signal)
-            row["trigger"] = build_trigger(signal)
-            row["timing"] = timing_fields(signal, row)
-            row["schedule_window"] = schedule_window(signal)
-            row["matched_event"] = match_signal_event(signal, observations)
-            row["match_clock"] = parse_stored_stamp(signal.get("match_clock_snapshot"))
-    return {"open": opens, "closed": [r for r in rows if r["status"] == "closed"]}
+        r["bid_path_url"] = f"/api/trades/{r['id']}/path?mode={selector}"
+        mark = live_marks.get(r["id"])
+        if r.get("status") == "open" and mark and r.get("mode") == engine.mode:
+            # Storage is the selector source of truth; in-memory state may only
+            # enrich the matching active-mode parent, never select rows.
+            for key in ("bid", "upnl", "size", "initial_size",
+                        "max_executable_bid", "max_executable_bid_ts",
+                        "mfe_c", "high_after_entry_s"):
+                if key in mark:
+                    r[key] = mark[key]
+    return {
+        "open": [r for r in rows if r["status"] == "open"],
+        "closed": [r for r in rows if r["status"] == "closed"],
+    }
 
 
 @app.get("/api/stats")
@@ -555,6 +561,8 @@ def _public_export_job(job):
     return {
         "job_id": job["job_id"],
         "scope": job.get("scope") or "full",
+        "mode_selector": job.get("mode_selector"),
+        "all_mode_archival_export": bool(job.get("all_modes")),
         "status": job["status"],
         "created_at": job["created_at"],
         "bytes": job.get("bytes"),
@@ -719,10 +727,10 @@ def _ranged_file_response(path, filename, media_type, range_header=None, backgro
     )
 
 
-def _new_export_job(scope, raw_paths):
+def _new_export_job(scope, raw_paths, mode_selector):
     total_bytes = 0
     total_segments = 0
-    if scope == "full":
+    if scope in {"full", "archive"}:
         for path in raw_paths:
             try:
                 total_bytes += os.path.getsize(path)
@@ -733,6 +741,8 @@ def _new_export_job(scope, raw_paths):
         "job_id": secrets.token_urlsafe(18),
         "download_token": secrets.token_urlsafe(32),
         "scope": scope,
+        "mode_selector": mode_selector,
+        "all_modes": scope == "archive",
         "status": "queued",
         "created_at": time.time(),
         "ready_at": None,
@@ -771,9 +781,11 @@ async def _build_export_job(job_id, mode, raw_paths, snapshot_path, scope,
         return current is None or bool(current.get("cancel_requested"))
 
     try:
+        exporter_scope = "full" if scope == "archive" else scope
         path, _manifest = await asyncio.to_thread(
             exporter.build_study_bundle, None, mode, raw_paths, snapshot_path,
-            scope == "full", progress, cancel_check, scope, boundary,
+            exporter_scope == "full", progress, cancel_check, exporter_scope, boundary,
+            scope == "archive",
         )
     except exporter.ExportCancelled:
         current = _lookup_job(job_id)
@@ -810,11 +822,18 @@ async def _build_export_job(job_id, mode, raw_paths, snapshot_path, scope,
 
 
 @app.post("/api/export/prepare", dependencies=[Depends(require_admin)], status_code=202)
-async def prepare_study_export(scope: str = "audit"):
+async def prepare_study_export(scope: str = "audit", mode: str | None = None):
     """Start one non-blocking export job and return a pollable identifier."""
     scope = (scope or "audit").lower()
-    if scope not in {"audit", "full"}:
-        raise HTTPException(status_code=400, detail="scope must be audit or full")
+    if scope not in {"audit", "full", "archive"}:
+        raise HTTPException(status_code=400, detail="scope must be audit, full, or archive")
+    selector = _mode_selector(mode)
+    if scope == "archive":
+        if mode is not None and selector != "all":
+            raise HTTPException(status_code=400, detail="archive scope requires mode=all")
+        selector = "all"
+    elif selector == "all":
+        raise HTTPException(status_code=400, detail="use scope=archive for all-mode export")
     _expire_export_jobs()
     if scope == "full":
         existing = _active_full_job()
@@ -835,7 +854,7 @@ async def prepare_study_export(scope: str = "audit"):
         boundary["db_snapshot_started_ts"] = time.time()
         snapshot_path = exporter.prepare_database_snapshot()
         boundary["db_snapshot_finished_ts"] = time.time()
-        return raw_paths, snapshot_path, _new_export_job(scope, raw_paths)
+        return raw_paths, snapshot_path, _new_export_job(scope, raw_paths, selector)
 
     try:
         raw_paths, snapshot_path, job = await asyncio.to_thread(_prepare_inputs)
@@ -848,7 +867,7 @@ async def prepare_study_export(scope: str = "audit"):
     _register_job(job)
     _track_export_task(
         asyncio.create_task(_build_export_job(
-            job["job_id"], engine.mode, raw_paths, snapshot_path, scope, boundary,
+            job["job_id"], selector, raw_paths, snapshot_path, scope, boundary,
         )),
         job_id=job["job_id"],
     )

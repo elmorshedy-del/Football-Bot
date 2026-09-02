@@ -543,9 +543,10 @@ class PaperDesk:
             "event": pos.event, "market": pos.market, "side": pos.side,
             "strategy": pos.strategy, "anchor_ts": pos.entry_ts,
             "dt_ms": round((now - pos.entry_ts) * 1000.0, 1),
-            # The executed exit price is not an observed book quote; bid_size
-            # and exec_px stay null so the two stay semantically distinct.
-            "bid": exit_px, "bid_size": None, "exec_px": None,
+            # The executed exit price belongs on trades.exit_px.  A terminal
+            # row is only the end timestamp for availability and must never be
+            # relabelled as an executable quote.
+            "bid": None, "bid_size": None, "exec_px": None,
             "qty": pos.remaining,
             "sample_seq": pos.exec_path_total, "availability": "terminal",
             "terminal": 1,

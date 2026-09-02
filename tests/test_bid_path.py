@@ -243,7 +243,7 @@ class ArchitectBlockerFourTests(unittest.TestCase):
         desk._record_exec_gap(pos, 2.0)
         desk._record_exec_terminal(pos, 70.0, 3.0)
         bids = [row["bid"] for row in pos.exec_path]
-        self.assertEqual(bids, [90.0, None, 70.0])
+        self.assertEqual(bids, [90.0, None, None])
         self.assertEqual(pos.exec_path[-1]["dt_ms"], 3000.0)
 
     def test_list_endpoints_do_not_embed_full_paths(self):

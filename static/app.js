@@ -903,6 +903,7 @@ const EXPORT_ORIGINAL_LABEL = {
   "export-button": "Download audit data",
   "export-audit-button": "Download audit bundle",
   "export-full-button": "Prepare full raw handoff",
+  "export-archive-button": "Prepare all-mode archive",
 };
 function exportProgressText(job) {
   const bits = [];
@@ -939,9 +940,10 @@ async function readExportError(response) {
   catch (error) { return `${response.status} ${response.statusText} (body unreadable: ${error.message})`; }
 }
 async function downloadExport(scope = "audit") {
-  scope = scope === "full" ? "full" : "audit";
+  scope = ["audit", "full", "archive"].includes(scope) ? scope : "audit";
   let token = sessionStorage.getItem("footballbot_admin_token");
-  if (!token) token = window.prompt(scope === "full" ?
+  if (!token) token = window.prompt(scope === "archive" ?
+    "Admin token for the all-mode archival handoff" : scope === "full" ?
     "Admin token for the full raw handoff (multi-GB export, cancellable)" :
     "Admin token for the audit bundle download");
   if (!token) return;
@@ -952,11 +954,11 @@ async function downloadExport(scope = "audit") {
   const progress = byId("export-progress"), errorLabel = byId("export-error");
   progress.hidden = true; errorLabel.hidden = true;
   setExportButtonsDisabled(true);
-  if (scope === "full" && cancelButton) cancelButton.hidden = false;
+  if (scope !== "audit" && cancelButton) cancelButton.hidden = false;
   const headers = {"X-Admin-Token": token};
-  const buttonId = scope === "full" ? "export-full-button" : "export-audit-button";
+  const buttonId = scope === "archive" ? "export-archive-button" : scope === "full" ? "export-full-button" : "export-audit-button";
   const button = byId(buttonId) || byId("export-button");
-  const scopeLabel = scope === "full" ? "Full raw handoff" : "Audit bundle";
+  const scopeLabel = scope === "archive" ? "All-mode archive" : scope === "full" ? "Full raw handoff" : "Audit bundle";
   try {
     const started = await timedFetch(`/api/export/prepare?scope=${encodeURIComponent(scope)}`, {method: "POST", headers, signal: controller.signal}, 30000);
     if (started.status === 401) { sessionStorage.removeItem("footballbot_admin_token"); throw new Error("admin token was rejected (401)"); }
@@ -985,7 +987,7 @@ async function downloadExport(scope = "audit") {
     document.body.appendChild(anchor); anchor.click(); anchor.remove();
     clearClientFault(`Study export ${scope}`);
     showToast(`${scopeLabel} download started (${formatBytes(job.bytes)}).`);
-    if (scope === "full") refreshRawSegments();
+    if (scope !== "audit") refreshRawSegments();
   } catch (error) {
     const message = error?.message || String(error);
     if (message === "cancelled") showToast(`${scopeLabel} cancelled.`);
@@ -1002,8 +1004,8 @@ async function downloadExport(scope = "audit") {
   }
 }
 async function cancelActiveExport() {
-  // Prefer cancelling the full job (audit bundles finish in seconds).
-  const scope = activeExports.has("full") ? "full" : activeExports.keys().next().value;
+  // Prefer cancelling a heavy raw/archive job (audit bundles finish quickly).
+  const scope = activeExports.has("archive") ? "archive" : activeExports.has("full") ? "full" : activeExports.keys().next().value;
   if (!scope) return;
   const active = activeExports.get(scope);
   const token = sessionStorage.getItem("footballbot_admin_token");
