@@ -53,3 +53,62 @@ AssertionError: 1 not found in {} : an uncommitted close did not restore as an o
 Ran 5 tests in 0.113s
 
 FAILED (failures=4)
+
+## Review section 1.3 — signal path finalization ownership
+$ .venv/bin/python -m unittest tests.test_signal_path_ownership -v
+
+EFEF.E
+======================================================================
+ERROR: test_a_cleanly_finalized_signal_is_not_rebuilt (tests.test_signal_path_ownership.SignalPathOwnershipTests.test_a_cleanly_finalized_signal_is_not_rebuilt)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_signal_path_ownership.py", line 210, in test_a_cleanly_finalized_signal_is_not_rebuilt
+    self.assertEqual(store.unfinalized_signal_paths(), [])
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: module 'app.store' has no attribute 'unfinalized_signal_paths'
+
+======================================================================
+ERROR: test_eviction_over_max_tracked_also_keeps_the_watch_on_failure (tests.test_signal_path_ownership.SignalPathOwnershipTests.test_eviction_over_max_tracked_also_keeps_the_watch_on_failure)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_signal_path_ownership.py", line 132, in test_eviction_over_max_tracked_also_keeps_the_watch_on_failure
+    self.engine._evict_signal_paths()
+    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'Engine' object has no attribute '_evict_signal_paths'
+
+======================================================================
+ERROR: test_unfinalized_watch_is_rebuilt_and_marked_incomplete_on_restart (tests.test_signal_path_ownership.SignalPathOwnershipTests.test_unfinalized_watch_is_rebuilt_and_marked_incomplete_on_restart)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_signal_path_ownership.py", line 189, in test_unfinalized_watch_is_rebuilt_and_marked_incomplete_on_restart
+    pending = store.unfinalized_signal_paths()
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: module 'app.store' has no attribute 'unfinalized_signal_paths'
+
+======================================================================
+FAIL: test_decline_rows_carry_sequences_and_record_one_gap (tests.test_signal_path_ownership.SignalPathOwnershipTests.test_decline_rows_carry_sequences_and_record_one_gap)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_signal_path_ownership.py", line 174, in test_decline_rows_carry_sequences_and_record_one_gap
+    self.assertEqual(
+AssertionError: Lists differ: [] != ['quote', 'gap', 'quote']
+
+Second list contains 3 additional elements.
+First extra element 0:
+'quote'
+
+- []
++ ['quote', 'gap', 'quote'] : a no-ladder run must record exactly one gap and then resume
+
+======================================================================
+FAIL: test_final_signal_path_failure_keeps_watch_then_retries_exactly_once (tests.test_signal_path_ownership.SignalPathOwnershipTests.test_final_signal_path_failure_keeps_watch_then_retries_exactly_once)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/home/user/Football-Bot/tests/test_signal_path_ownership.py", line 100, in test_final_signal_path_failure_keeps_watch_then_retries_exactly_once
+    self.assertEqual(
+AssertionError: 0 != 1 : the watch was popped even though its final write failed
+
+----------------------------------------------------------------------
+Ran 6 tests in 0.114s
+
+FAILED (failures=2, errors=3)

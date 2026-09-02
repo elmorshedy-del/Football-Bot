@@ -213,11 +213,18 @@ def init():
             )
         except sqlite3.OperationalError:
             pass
-    for column in ("match_clock_snapshot", "forward_path_summary"):
+    for column in ("match_clock_snapshot", "forward_path_summary",
+                   "path_incomplete_reason"):
         try:
             _conn.execute(f"ALTER TABLE signals ADD COLUMN {column} TEXT")
         except sqlite3.OperationalError:
             pass
+    # Durable finalization marker for a signal's forward path.  Without it a
+    # restart cannot tell a completed watch from one that died mid-window.
+    try:
+        _conn.execute("ALTER TABLE signals ADD COLUMN forward_path_finalized REAL")
+    except sqlite3.OperationalError:
+        pass
     # Provider duplicate identity is mode-scoped.  The old (event,fingerprint)
     # unique index made a live observation collide with a demo one and silently
     # refresh it instead of recording it.  Replacing the index deletes no row
@@ -604,6 +611,52 @@ def set_trade_path_summary(trade_id, summary):
 def set_signal_path_summary(signal_id, summary):
     ex("UPDATE signals SET forward_path_summary=? WHERE id=?",
        (json.dumps(summary, separators=(",", ":")) if summary else None, signal_id))
+
+
+def finalize_signal_path(signal_id, path_rows=None, truncated=False,
+                         dropped_samples=0, incomplete_reason=None, now=None):
+    """Persist a watch's remaining rows, summary and finalized marker as one unit.
+
+    The caller must not release the watch until this returns.  Rows and summary
+    used to be separate commits with no durable marker at all, so a failure
+    between them left a half-written path that no restart could detect.
+    """
+    with _lock:
+        try:
+            summary = _persist_path_in_transaction(
+                path_rows, "signal_id", signal_id,
+                extra_where=" AND kind='decline'",
+                truncated=truncated, dropped_samples=dropped_samples,
+            )
+            _conn.execute(
+                """UPDATE signals SET forward_path_summary=?,
+                       forward_path_finalized=?, path_incomplete_reason=?
+                     WHERE id=?""",
+                (json.dumps(summary, separators=(",", ":")) if summary else None,
+                 time.time() if now is None else now,
+                 incomplete_reason, signal_id),
+            )
+            _conn.commit()
+            return summary
+        except Exception:
+            _conn.rollback()
+            raise
+
+
+def unfinalized_signal_paths():
+    """Signals that have forward-path rows but never recorded a finalization.
+
+    These are watches whose process died inside the observation window.  Their
+    in-memory tail is gone, so they are rebuilt and labelled incomplete rather
+    than presented as a complete path.
+    """
+    scope, scope_args = mode_clause("s")
+    return q(
+        "SELECT DISTINCT s.id, s.local_ts FROM signals s"
+        " JOIN bid_path_samples p ON p.signal_id=s.id AND p.kind='decline'"
+        f" WHERE s.forward_path_finalized IS NULL{scope} ORDER BY s.id",
+        scope_args,
+    )
 
 
 def bid_path_for_trade(trade_id, limit=BID_PATH_MAX_SAMPLES):

@@ -111,6 +111,9 @@ class Engine:
     def __init__(self, queue):
         self.q = queue
         self._signal_paths = deque()
+        # Current fault, latched until a finalization actually succeeds.  A
+        # historical entry in `errors` decays; this does not.
+        self.signal_path_fault = None
         self.errors = deque(maxlen=50)
         self._last_error_key = None
         self._last_error_ts = 0.0
@@ -371,8 +374,7 @@ class Engine:
             "anchor_ts": now, "expires_at": now + config.SIGNAL_PATH_WINDOW_S,
             "outcome": outcome, "last": None, "rows": [], "dropped": 0, "total": 0,
         })
-        if len(self._signal_paths) > config.SIGNAL_PATH_MAX_TRACKED:
-            self._flush_signal_path(self._signal_paths.popleft(), final=True)
+        self._evict_signal_paths()
 
     def _record_signal_paths(self, ticker, book, now):
         for watch in self._signal_paths:
@@ -382,14 +384,25 @@ class Engine:
                 ladder = book.bid_ladder(watch["side"])
             except Exception:
                 ladder = []
-            if not ladder:
-                continue
-            bid, bid_size = ladder[0]
-            signature = (bid, bid_size)
+            if ladder:
+                bid, bid_size = ladder[0]
+                availability = "quote"
+            else:
+                # A no-ladder observation is evidence, not a hole.  Skipping it
+                # let the summary bridge an outage the decline never traded
+                # through.  One gap row per outage; repeats are suppressed by
+                # the unchanged-signature check below.
+                bid, bid_size = None, None
+                availability = "gap"
+            signature = (bid, bid_size, availability)
             if signature == watch["last"]:
                 continue
+            if availability == "gap" and watch["last"] is None:
+                # Never open a path with a gap: there is no availability to end.
+                continue
             watch["last"] = signature
-            if watch.get("total", 0) >= store.BID_PATH_MAX_SAMPLES:
+            # One slot is reserved so a terminal/final row always fits.
+            if watch.get("total", 0) >= store.BID_PATH_MAX_SAMPLES - 1:
                 watch["dropped"] += 1
                 continue
             watch["total"] = watch.get("total", 0) + 1
@@ -399,30 +412,90 @@ class Engine:
                 "strategy": watch["strategy"], "anchor_ts": watch["anchor_ts"],
                 "dt_ms": round((now - watch["anchor_ts"]) * 1000.0, 1),
                 "bid": bid, "bid_size": bid_size, "exec_px": None, "qty": None,
+                # Sequence keys make a retry exactly-once under the partial
+                # unique index; without them a retry duplicated every row.
+                "sample_seq": watch["total"], "availability": availability,
+                "terminal": 0,
             })
 
     def _flush_signal_path(self, watch, final=False):
-        if watch["rows"]:
-            rows = list(watch["rows"])
-            try:
-                store.insert_bid_path(rows)
-            except Exception as exc:
-                # Keep the rows for the next attempt rather than dropping them.
-                self._record_error("signal_path", exc)
-            else:
-                watch["rows"] = watch["rows"][len(rows):]
+        """Incremental flush. Returns True when the buffer is durable."""
         if final:
-            try:
-                samples = store.bid_path_for_signal(watch["signal_id"])
-                store.set_signal_path_summary(
-                    watch["signal_id"], store.bid_path_summary(samples),
-                )
-            except Exception as exc:
-                self._record_error("signal_path_summary", exc)
+            return self._finalize_signal_path(watch)
+        if not watch["rows"]:
+            return True
+        rows = list(watch["rows"])
+        try:
+            written = store.insert_bid_path(rows)
+        except Exception as exc:
+            # Keep the rows for the next attempt rather than dropping them.
+            self._record_error("signal_path", exc)
+            return False
+        if isinstance(written, int) and written < len(rows):
+            self._record_error("signal_path", RuntimeError(
+                f"signal {watch['signal_id']}: {len(rows) - written} of {len(rows)} "
+                "path rows collided with an existing sequence key",
+            ))
+        watch["rows"] = watch["rows"][len(rows):]
+        return True
+
+    def _finalize_signal_path(self, watch, incomplete_reason=None):
+        """Persist remaining rows, summary and the durable finalized marker.
+
+        One transaction.  The caller releases the watch only when this returns
+        True, so a failed write always leaves an owner to retry.
+        """
+        try:
+            store.finalize_signal_path(
+                watch["signal_id"],
+                path_rows=list(watch["rows"]),
+                truncated=bool(watch.get("dropped")),
+                dropped_samples=watch.get("dropped", 0),
+                incomplete_reason=incomplete_reason,
+            )
+        except Exception as exc:
+            self.signal_path_fault = "signal_path_persistence_failed"
+            self._record_error("signal_path", exc)
+            return False
+        watch["rows"] = []
+        self.signal_path_fault = None
+        return True
+
+    def _release_finalized(self, index=0):
+        """Finalize the watch at `index`, popping it only after it commits."""
+        watch = self._signal_paths[index]
+        if not self._finalize_signal_path(watch):
+            return False
+        del self._signal_paths[index]
+        return True
 
     def _expire_signal_paths(self, now):
+        # Peek, finalize, then pop.  popleft() before persisting destroyed the
+        # only owner of the buffered rows when the write failed.
         while self._signal_paths and self._signal_paths[0]["expires_at"] <= now:
-            self._flush_signal_path(self._signal_paths.popleft(), final=True)
+            if not self._release_finalized(0):
+                return
+
+    def _evict_signal_paths(self):
+        """Drop the oldest watches over the tracking cap, ownership-safely."""
+        while len(self._signal_paths) > config.SIGNAL_PATH_MAX_TRACKED:
+            if not self._release_finalized(0):
+                return
+
+    def rebuild_signal_paths(self):
+        """Finalize watches whose process died inside the observation window.
+
+        Their in-memory tail is unrecoverable, so the path is labelled
+        incomplete rather than presented as a complete forward observation.
+        """
+        rebuilt = 0
+        for row in store.unfinalized_signal_paths():
+            watch = {"signal_id": row["id"], "rows": [], "dropped": 0}
+            if self._finalize_signal_path(
+                watch, incomplete_reason="in_memory_tail_lost_on_restart",
+            ):
+                rebuilt += 1
+        return rebuilt
 
     def on_book(self, ticker, synthetic=False):
         b = self.books.get(ticker)
@@ -845,6 +918,11 @@ class Engine:
                 "mapped_matches": goal.get("mapped_matches", 0),
                 "last_error": goal.get("last_error"),
             },
+            "signal_path_persistence": {
+                "healthy": not getattr(self, "signal_path_fault", None),
+                "status": getattr(self, "signal_path_fault", None) or "persisted",
+                "watches_open": len(getattr(self, "_signal_paths", ())),
+            },
             "paper_execution": {
                 "healthy": not execution_errors,
                 "status": "ready" if not execution_errors else "recent_error",
@@ -914,6 +992,16 @@ class Engine:
             store.purge_non_live()  # clean demo/legacy rows so live P&L starts fresh
             if config.PAPER_EXECUTION_V2:
                 self.desk.restore_open_positions(store.load_open_paper_positions())
+                # Watches whose process died inside their observation window
+                # are finalized and labelled incomplete, so no signal is left
+                # with a half-written forward path and no finalization marker.
+                rebuilt = self.rebuild_signal_paths()
+                if rebuilt:
+                    store.log_event(
+                        "paper",
+                        f"rebuilt {rebuilt} unfinalized signal forward path(s) "
+                        "as incomplete after restart",
+                    )
                 for pos in self.desk.positions.values():
                     self._remember_fill({
                         "strategy": pos.strategy,
