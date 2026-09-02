@@ -225,6 +225,16 @@ def _event_observations(signals, mode=None):
     return list(score_rows) + list(provider_rows)
 
 
+def _observations_by_event(observations):
+    """Group audit observations once so each signal scans only its own match."""
+    grouped = {}
+    for row in observations:
+        event = row.get("event")
+        if event:
+            grouped.setdefault(event, []).append(row)
+    return grouped
+
+
 def _decorate_signal(row, observations, trade=None):
     row["detail"] = json_object(row.get("detail"))
     row["strategy"] = (
@@ -328,9 +338,15 @@ async def signals(limit: int = 60, mode: str | None = None):
     _label_modes(rows)
     trades_by_signal = _trades_by_signal_id(
         (row["id"] for row in rows), mode=selector)
-    observations = _event_observations(rows, mode=selector)
+    observations_by_event = _observations_by_event(
+        _event_observations(rows, mode=selector)
+    )
     for row in rows:
-        _decorate_signal(row, observations, trades_by_signal.get(row["id"]))
+        _decorate_signal(
+            row,
+            observations_by_event.get(row.get("event"), ()),
+            trades_by_signal.get(row["id"]),
+        )
         row["forward_path_summary"] = json_object(row.get("forward_path_summary")) or None
         row["forward_path_url"] = f"/api/signals/{row['id']}/path?mode={selector}"
     return rows
@@ -360,7 +376,9 @@ async def trades(limit: int = 200, mode: str | None = None):
     signal_rows = _rows_by_signal_id(
         [row.get("signal_id") for row in rows], mode=selector,
     )
-    observations = _event_observations(signal_rows.values(), mode=selector)
+    observations_by_event = _observations_by_event(
+        _event_observations(signal_rows.values(), mode=selector)
+    )
     for r in rows:
         r.pop("book_at_entry", None)
         signal = signal_rows.get(r.get("signal_id"))
@@ -375,7 +393,9 @@ async def trades(limit: int = 200, mode: str | None = None):
             r["trigger"] = build_trigger(signal)
             r["timing"] = timing_fields(signal, r)
             r["schedule_window"] = schedule_window(signal)
-            r["matched_event"] = match_signal_event(signal, observations)
+            r["matched_event"] = match_signal_event(
+                signal, observations_by_event.get(signal.get("event"), ())
+            )
             r["match_clock"] = parse_stored_stamp(signal.get("match_clock_snapshot"))
         r["high_after_entry_s"] = (
             round(r["max_executable_bid_ts"] - r["entry_ts"], 3)
@@ -955,8 +975,8 @@ async def download_study_export(
 
 @app.get("/api/export/raw", dependencies=[Depends(require_admin)])
 async def list_raw_segments():
-    """List immutable recorder segments without copying bodies."""
-    payload = {"segments": exporter.raw_inventory()}
+    """List immutable recorder segments without blocking the live event loop."""
+    payload = {"segments": await asyncio.to_thread(exporter.raw_inventory)}
     response = JSONResponse(payload)
     response.set_cookie(
         "footballbot_export_raw", _raw_download_token, max_age=EXPORT_JOB_TTL_S,
