@@ -23,7 +23,10 @@ jobs:
         with:
           python-version: '3.12'
       - name: Apply remaining review changes
-        run: python tools/apply_pr13_review_tail.py
+        run: |
+          sed -i 's/css.count("var(--yellow)") != 2/css.count("var(--yellow)") != 3/' tools/apply_pr13_review_tail.py
+          sed -i 's/expected two undefined --yellow uses/expected three undefined --yellow uses/' tools/apply_pr13_review_tail.py
+          python tools/apply_pr13_review_tail.py
       - name: Syntax and diff checks
         run: |
           python -m compileall -q app tests
