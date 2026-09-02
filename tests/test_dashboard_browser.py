@@ -172,6 +172,10 @@ class DashboardBrowserTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        # Contexts first, then the browser, then the driver: closing out of
+        # order leaves in-flight protocol calls with nothing to resolve against.
+        for context in list(cls.browser.contexts):
+            context.close()
         cls.browser.close()
         cls._play.stop()
         cls.server.shutdown()
@@ -180,7 +184,19 @@ class DashboardBrowserTests(unittest.TestCase):
     def open_dashboard(self, viewport=None, path_response="ok"):
         """Load the shipped dashboard with the API layer intercepted."""
         page = self.browser.new_page(viewport=viewport or {"width": 1280, "height": 900})
-        self.addCleanup(page.close)
+
+        def _teardown():
+            # Drop route handlers BEFORE closing. A handler still registered
+            # when the browser goes away leaves an unresolved continuation,
+            # which surfaces as an unretrieved TargetClosedError future during
+            # interpreter teardown -- noise that would mask a real leak.
+            try:
+                page.unroute_all(behavior="ignoreErrors")
+            except Exception:  # noqa: BLE001 - teardown must not mask failures
+                pass
+            page.close()
+
+        self.addCleanup(_teardown)
         self.console_errors = []
         page.on("pageerror", lambda exc: self.console_errors.append(str(exc)))
 

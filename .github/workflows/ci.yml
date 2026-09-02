@@ -61,8 +61,16 @@ jobs:
             echo "::error::browser acceptance was skipped; it is mandatory in CI"
             exit 1
           fi
-          if grep -q "Task exception was never retrieved" /tmp/suite.txt; then
-            echo "::error::an unretrieved task exception escaped the suite"
+          # Both asyncio wordings, not just the Task one: a leaked Future
+          # reports "Future exception was never retrieved", which an earlier
+          # version of this guard missed while still reporting the job green.
+          if grep -qE "(Task|Future) exception was never retrieved" /tmp/suite.txt; then
+            echo "::error::an unretrieved async exception escaped the suite"
+            grep -nE "(Task|Future) exception was never retrieved" /tmp/suite.txt
+            exit 1
+          fi
+          if grep -q "Task was destroyed but it is pending" /tmp/suite.txt; then
+            echo "::error::a pending task was destroyed during teardown"
             exit 1
           fi
 
