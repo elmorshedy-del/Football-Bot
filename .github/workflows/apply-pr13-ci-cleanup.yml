@@ -1,0 +1,37 @@
+name: Apply final PR13 CI cleanup
+
+on:
+  push:
+    branches:
+      - claude/binding-handoff-review-0ajqcl
+    paths:
+      - tools/apply_pr13_ci_cleanup.py
+      - .github/workflows/apply-pr13-ci-cleanup.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: claude/binding-handoff-review-0ajqcl
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply cleanup
+        run: python tools/apply_pr13_ci_cleanup.py
+      - name: Syntax and diff checks
+        run: |
+          python -m compileall -q tests
+          git diff --check
+      - name: Commit cleanup
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Align PR13 acceptance tests with terminal semantics"
+          git push origin HEAD:claude/binding-handoff-review-0ajqcl
