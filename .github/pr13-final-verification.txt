@@ -1,1 +1,0 @@
-PR #13 final verification trigger after preserving restart-recovery incomplete metadata across owned retries.
