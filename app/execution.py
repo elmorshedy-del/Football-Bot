@@ -163,13 +163,24 @@ class ShadowBook:
         else:
             source[price] = remaining
 
-    def snapshot_dict(self, depth=8):
+    # Default persisted depth.  Callers recording evidence for a specific fill
+    # must pass a depth that covers that fill's walk (see PaperDesk entry).
+    SNAPSHOT_DEPTH = 8
+
+    def snapshot_dict(self, depth=None):
+        depth = self.SNAPSHOT_DEPTH if depth is None else depth
+        yes_bids = sorted(self.yes_bids.items(), reverse=True)
+        no_bids = sorted(self.no_bids.items(), reverse=True)
         return {
-            "yes_bids": sorted(self.yes_bids.items(), reverse=True)[:depth],
-            "no_bids": sorted(self.no_bids.items(), reverse=True)[:depth],
+            "yes_bids": yes_bids[:depth],
+            "no_bids": no_bids[:depth],
             "seq": self.seq,
             "ok": self.ok,
             "shadow": True,
+            # Records whether anything was cut, so a later integrity check can
+            # tell "evidence does not cover this" from "the fill was wrong".
+            "depth": depth,
+            "truncated": len(yes_bids) > depth or len(no_bids) > depth,
         }
 
 

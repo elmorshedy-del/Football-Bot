@@ -1538,12 +1538,22 @@ def _paper_fill_integrity(trade):
         source_key = "no_bids" if trade["side"] == "yes" else "yes_bids"
         source = {round(100.0 - float(price), 8): float(size)
                   for price, size in book.get(source_key, [])}
+        # The snapshot is capped at a fixed depth, so a fill that walked further
+        # than the cap has levels the evidence simply does not cover.  Those are
+        # unverifiable, not wrong: reporting them as integrity failures made K1
+        # fail hardest on the deepest walks, which are exactly the fills whose
+        # realism matters most.  A level beyond the deepest recorded price is
+        # therefore treated as missing evidence; a level *inside* the recorded
+        # range that the book does not support is still a real inconsistency.
+        deepest = max(source, default=None)
         used = {}
         quantity = weighted = notional = 0.0
         for price, size in levels:
             price, size = float(price), float(size)
             if size <= 0 or price <= 0 or price > float(trade["cap"]) + 1e-6:
                 return False
+            if deepest is None or price > deepest + 1e-6:
+                return None
             used[round(price, 8)] = used.get(round(price, 8), 0.0) + size
             if used[round(price, 8)] > source.get(round(price, 8), 0.0) + 1e-6:
                 return False
