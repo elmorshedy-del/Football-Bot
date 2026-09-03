@@ -37,10 +37,10 @@ _SKIP_CLOCK_KEYS = {
 }
 
 _PERIOD_FIRST = {
-    "1", "1st", "first", "firsthalf", "1h", "h1", "fh", "period1",
+    "1", "1st", "1sthalf", "first", "firsthalf", "1h", "h1", "fh", "period1",
 }
 _PERIOD_SECOND = {
-    "2", "2nd", "second", "secondhalf", "2h", "h2", "sh", "period2",
+    "2", "2nd", "2ndhalf", "second", "secondhalf", "2h", "h2", "sh", "period2",
     "stoppage", "addedtime", "extratime2",
 }
 _PERIOD_HALF_TIME = {"ht", "halftime", "half"}
@@ -50,6 +50,18 @@ _PERIOD_FINAL = {
 _STATUS_LIVE = {
     "live", "inplay", "in_play", "inprogress", "in_progress", "playing",
     "active", "started",
+}
+# A provider that names the running period in its *status* field is reporting
+# play in progress, not an unknown state.  Kalshi does exactly this
+# ("2nd_half"), which compacts to a token none of the sets above matched, so
+# `normalize_status` returned it verbatim and the 88-gate refused every in-play
+# match as `clock_not_live`.  Half-time and full time are deliberately absent:
+# they name a stoppage, not play.  Bare "1"/"2" are absent too, since a lone
+# digit in a status field does not establish that a match is underway.
+_STATUS_LIVE_PERIOD = {
+    "1sthalf", "firsthalf", "1h", "h1", "fh", "period1",
+    "2ndhalf", "secondhalf", "2h", "h2", "sh", "period2",
+    "stoppage", "addedtime", "extratime", "extratime1", "extratime2", "et",
 }
 _STATUS_SUSPENDED = {"suspended", "stopped", "interrupted"}
 _STATUS_ABANDONED = {"abandoned", "postponed", "cancelled", "canceled", "void"}
@@ -154,7 +166,7 @@ def normalize_status(value):
     compact = _compact(value)
     if not compact:
         return None
-    if compact in _STATUS_LIVE:
+    if compact in _STATUS_LIVE or compact in _STATUS_LIVE_PERIOD:
         return "live"
     if compact in _STATUS_SUSPENDED:
         return "suspended"
@@ -344,7 +356,15 @@ def evaluate_clock_gate(parsed, age_ms, mapped=True):
         return False, "clock_unmapped", False, "unmapped"
     if parsed is None:
         return False, "clock_malformed", False, "malformed"
-    status = parsed.provider_status
+    # Normalize at the decision boundary rather than in the stamp, so the stamp
+    # and the persisted observation keep the provider's own wording for audit
+    # while the gate reasons over canonical labels.  A stamp built from a stored
+    # observation therefore resolves correctly even when that row was written
+    # before a vocabulary gap was closed.  A stamp that already carries a
+    # declared refusal is not re-derived here (see MatchClockGate.evaluate), so
+    # historical verdicts stay exactly as they were recorded.
+    # `normalize_status` is idempotent, so a canonical value passes unchanged.
+    status = normalize_status(parsed.provider_status)
     if status in {"final", "abandoned", "suspended", "half-time", "pre-match"}:
         outcome = {
             "final": "clock_final",
