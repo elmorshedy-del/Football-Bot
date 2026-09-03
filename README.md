@@ -83,6 +83,8 @@ to the defaults. Notable ones:
 | `GOAL_LATENCY_OBSERVER` | true | read-only Kalshi score-vs-market arrival experiment; never enters the signal path |
 | `GOAL_LATENCY_POLL_MS` | 250 | target interval for batched score polling; actual uncertainty is saved per observation |
 | `EVENT_MATCH_WINDOW_S` | 20 | fixed ±seconds for diagnostic signal/event consistency matching |
+| `SUBTHRESHOLD_CAPTURE` | true | record bursts below the Gate-A floor as research observations |
+| `SUBTHRESHOLD_DL_MIN` / `_LEVELS_MIN` / `_SIZE_MIN` | 0.3 / 3 / 50 | the research floor those observations must clear |
 | `ADMIN_TOKEN` | empty | required `X-Admin-Token` for kill, flatten, and study export; empty fails closed |
 
 Recorder health is exposed at `/api/status` under `recorder`. A write failure
@@ -150,6 +152,43 @@ promote it only if an untouched later-match holdout is also positive with at lea
 independent events and acceptable drawdown/tail loss. Do not let live observations
 continuously retune the active thresholds; use frozen champion/challenger versions
 so the holdout remains meaningful.
+
+### Configuration identity
+
+Every signal and trade carries a `config_id`: a content address over the
+strategy parameters **and** the contents of the strategy source files. The
+`config_versions` table resolves each id back to those parameters and a code
+fingerprint, and the export manifest names the identity that produced the run.
+
+This exists because an aggregate over a mixture answers nothing. The first live
+study reported one net of -$609.02 over 56 closed trades, which was really two
+configurations pooled: 27 trades at -$630.13 and 29 at +$21.11, with gross per
+contract moving from -3.98¢ to +2.39¢ between them. Code is part of the identity
+because those two eras ran the same environment variables and different code.
+Rows written before this existed keep a `NULL` config_id: unknown provenance is
+preserved as unknown, never backfilled.
+
+Never pool rows with different `config_id` values into one result.
+
+### Sub-threshold research capture
+
+The detector only ever recorded bursts that crossed the trading floor, so the
+population just below it left no row and `DL_MIN` / `LEVELS_MIN` / `SIZE_MIN`
+could only be re-fitted by replaying the raw feed. That population is large:
+across the first 7.9 days of live capture, accepted sweeps piled hard against
+every floor (`dl` p10 0.818 against a 0.8 minimum, `levels` p10 5 against 5,
+`size` p10 218 against 200).
+
+Bursts clearing the looser research floor are now stored with outcome
+`subthreshold`, carrying the same displacement, level, size, reference and
+extreme features a re-fit needs. They are strictly outside the trading path:
+never confirmed, never dispatched to a sleeve, never given a forward path, and
+excluded from every sleeve funnel and kill-condition count (they are reported
+separately as `subthreshold_observations`). A near miss is held until its burst
+window closes and dropped if that burst turns out to clear the trading floor, so
+the inventory contains no pre-echo of a sweep that actually traded. On the
+bundled Espanyol–Real Madrid tape this yields 41 observations against 8 tradeable
+candidates.
 
 ### Downloadable research bundle
 

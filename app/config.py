@@ -84,6 +84,21 @@ SLEEVE_OSCILLATION_CROSSES = _i("SLEEVE_OSCILLATION_CROSSES", 3)
 SLEEVE_MAX_OSCILLATION_EFFICIENCY = _f("SLEEVE_MAX_OSCILLATION_EFFICIENCY", 0.35)
 SLEEVE_TIMEOUT_S = _f("SLEEVE_TIMEOUT_S", 30.0)
 
+# --- Sub-threshold research capture (collection only; never trades) ---
+# Bursts that clear this floor but not the Gate-A thresholds are recorded with
+# outcome ``subthreshold``.  They are never confirmed, never dispatched to a
+# sleeve, and never counted toward a kill-condition gate.  They exist so the
+# detector thresholds can be re-fitted from the study database instead of only
+# by replaying the raw feed.  These knobs are excluded from the strategy
+# configuration identity: capturing an observation cannot change a decision.
+SUBTHRESHOLD_CAPTURE = _b("SUBTHRESHOLD_CAPTURE", True)
+SUBTHRESHOLD_DL_MIN = _f("SUBTHRESHOLD_DL_MIN", 0.3)
+SUBTHRESHOLD_LEVELS_MIN = _i("SUBTHRESHOLD_LEVELS_MIN", 3)
+SUBTHRESHOLD_SIZE_MIN = _f("SUBTHRESHOLD_SIZE_MIN", 50.0)
+# Per-market rate limit.  Bounds the write rate to at most one observation per
+# market per interval, whatever the trade rate.
+SUBTHRESHOLD_COOLDOWN_S = _f("SUBTHRESHOLD_COOLDOWN_S", 5.0)
+
 # --- Paper execution adapter (off preserves the original paper desk exactly) ---
 PAPER_EXECUTION_V2 = _b("PAPER_EXECUTION_V2", False)
 PAPER_ENTRY_LATENCY_MS = _f("PAPER_ENTRY_LATENCY_MS", 150.0)

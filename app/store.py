@@ -1737,11 +1737,21 @@ def _compute_stats(mode=None):
     signal_scope, signal_args = mode_clause("s", selector=mode)
     closed = q(f"SELECT * FROM trades WHERE status='closed'{scope}", scope_args)
     open_t = q(f"SELECT * FROM trades WHERE status='open'{scope}", scope_args)
+    # Sub-threshold rows are research observations about where the detector
+    # floor sits, not signals of either sleeve.  `_strategy_key` maps every
+    # unrecognised label to gate_a, so leaving them in would inflate the Gate A
+    # funnel with bursts that were never eligible to trade.  They are counted
+    # separately below instead.
     signal_rows = q(
         "SELECT s.outcome,s.detail,t.strategy AS trade_strategy"
         " FROM signals s LEFT JOIN trades t"
-        f" ON t.signal_id=s.id{trade_scope} WHERE 1=1{signal_scope}",
+        f" ON t.signal_id=s.id{trade_scope} WHERE s.outcome IS NOT 'subthreshold'"
+        f"{signal_scope}",
         (*trade_args, *signal_args),
+    )
+    subthreshold = q(
+        f"SELECT COUNT(*) n FROM signals s WHERE s.outcome='subthreshold'{signal_scope}",
+        signal_args,
     )
     latency_evidence = _latency_evidence(mode=mode)
     by_strategy = {
@@ -1816,4 +1826,6 @@ def _compute_stats(mode=None):
         "sleeves": sleeves,
         "leagues": lg,
         "kill": kill,
+        # Reported beside the sleeves, never inside them.
+        "subthreshold_observations": subthreshold[0]["n"] if subthreshold else 0,
     }
