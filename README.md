@@ -117,9 +117,13 @@ confirmed signals, and K4 measures total signal-to-paper-arrival latency.
 Set `PRICE_ONLY_SLEEVE_MODE=parallel` and `PAPER_EXECUTION_V2=true` to paper-test
 Gate A and the new sleeve independently with realistic fills. Use `enforce` only when
 you intentionally want to suppress Gate A. The new sleeve never reads a score, goal, VAR, penalty,
-or other match-event feed. Minute 88 is approximated from the market's scheduled
-`expected_expiration_time`; the default window begins two minutes before that time
-and stays open for twelve minutes of possible stoppage.
+or other match-event feed. Admission is gated on the persisted provider **match
+clock** (period, minute and status only, never a score or event), which must be
+mapped, fresh within `MATCH_CLOCK_MAX_AGE_MS`, and reading minute 88 or later.
+A candidate whose clock is missing, stale or pre-88 fails closed and is recorded
+with the reason. `SLEEVE_START_BEFORE_EXPIRY_MIN` / `SLEEVE_AFTER_EXPIRY_MIN`
+describe a *schedule proxy* derived from `expected_expiration_time` that is
+reported per signal as a diagnostic; they do not admit or reject a trade.
 
 For each complete 1X2 market, the sleeve converts executable midpoints into a
 normalized state vector:

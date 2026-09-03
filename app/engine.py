@@ -237,19 +237,12 @@ class Engine:
         ct = parse_iso(m["close_time"])
         return ct is not None and (ct - time.time()) <= config.LATE_WINDOW_MIN * 60
 
-    def is_sleeve_window(self, ticker):
-        """Approximate minute 88 from scheduled expiration, without live scores."""
-        if self.mode == "demo":
-            return True
-        m = self.meta.get(ticker)
-        if not m or not m.get("close_time"):
-            return False
-        ct = parse_iso(m["close_time"])
-        if ct is None:
-            return False
-        until_expiry = ct - time.time()
-        return (-config.SLEEVE_AFTER_EXPIRY_MIN * 60.0 <= until_expiry <=
-                config.SLEEVE_START_BEFORE_EXPIRY_MIN * 60.0)
+    # A scheduled-expiration approximation of minute 88 used to live here.  The
+    # sleeve is gated on the persisted provider clock instead (see
+    # `_clock_gate_for` / MatchClockGate), so the approximation had no caller
+    # and only misled readers into thinking expiry time admitted trades.  The
+    # SLEEVE_*_EXPIRY_MIN settings still describe the schedule-proxy window
+    # reported as a per-signal diagnostic in `audit.schedule_window`.
 
     def _observe_sleeve(self, ticker, observed_ms):
         if config.PRICE_ONLY_SLEEVE_MODE not in {"enforce", "parallel"}:

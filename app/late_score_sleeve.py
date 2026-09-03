@@ -55,22 +55,45 @@ class PriceOnlyLateScoreSleeve:
         self.last_leg_observation = defaultdict(dict)
 
     @staticmethod
-    def _snapshot(tickers, meta, books, observed_ms):
+    def _snapshot(tickers, meta, books, observed_ms, evidence=None):
+        """Build the normalized triplet, or explain why it could not be built.
+
+        `evidence` collects the measurements behind a refusal.  Returning bare
+        reasons made a rejection unre-decidable: a `wide_spread` row recorded
+        that the book was too wide but never how wide, so no later analysis
+        could ask what a different cap would have admitted.  Every refusal now
+        carries the numbers that produced it.
+        """
+        evidence = {} if evidence is None else evidence
+        evidence["leg_count"] = len(tickers)
         if len(tickers) != 3:
             return None, "not_triplet"
         mids, spreads, roles = {}, {}, {}
+        evidence["spread_c"] = spreads
+        evidence["mid_c"] = mids
         for ticker in tickers:
             book = books.get(ticker)
             if book is None or not book.ok:
+                evidence["missing_leg"] = ticker
+                evidence["book_ok"] = None if book is None else bool(book.ok)
                 return None, "incomplete_book"
             bid, ask = book.best_yes_bid(), book.best_yes_ask()
             if bid is None or ask is None or ask < bid:
+                evidence["missing_leg"] = ticker
+                evidence["best_bid"], evidence["best_ask"] = bid, ask
                 return None, "incomplete_book"
             spreads[ticker] = ask - bid
-            if spreads[ticker] > config.SLEEVE_MAX_SPREAD_C:
-                return None, "wide_spread"
             mids[ticker] = (bid + ask) / 2.0
             roles[ticker] = leg_role(ticker, meta.get(ticker, {}).get("title", ""))
+        # Widths are measured for every leg before any is judged, so the row
+        # shows the whole triplet rather than stopping at the first offender.
+        widest = max(spreads, key=spreads.get)
+        evidence["widest_leg"] = widest
+        evidence["widest_spread_c"] = round(spreads[widest], 3)
+        evidence["max_spread_c_limit"] = config.SLEEVE_MAX_SPREAD_C
+        if spreads[widest] > config.SLEEVE_MAX_SPREAD_C:
+            return None, "wide_spread"
+        evidence["roles"] = dict(roles)
         if list(roles.values()).count("draw") != 1:
             return None, "ambiguous_draw_leg"
         probs = normalized_triplet(mids)
@@ -111,7 +134,9 @@ class PriceOnlyLateScoreSleeve:
         if candidate.get("dir") != 1:
             return SleeveDecision(False, "not_rising_leg", detail)
 
-        snapshot, error = self._snapshot(tickers, meta, books, observed_ms)
+        snapshot, error = self._snapshot(
+            tickers, meta, books, observed_ms, evidence=detail,
+        )
         if snapshot is None:
             return SleeveDecision(False, error, detail)
         if ticker not in snapshot["q"]:
@@ -128,12 +153,23 @@ class PriceOnlyLateScoreSleeve:
             return SleeveDecision(False, "stale_triplet_leg", detail)
 
         target_ms = float(observed_ms) - config.SLEEVE_BASELINE_MS
-        eligible = [row for row in self.history.get(event, ())
-                    if row["ts_ms"] <= target_ms]
+        rows = list(self.history.get(event, ()))
+        eligible = [row for row in rows if row["ts_ms"] <= target_ms]
+        # Recorded before the refusals below, so a baseline rejection shows how
+        # much history existed and how old the best candidate was.  Without it
+        # neither the baseline lag nor its max age could be re-fitted.
+        detail["baseline_rows"] = len(rows)
+        detail["baseline_eligible"] = len(eligible)
+        detail["baseline_lag_ms"] = config.SLEEVE_BASELINE_MS
+        detail["max_baseline_age_ms"] = config.SLEEVE_MAX_BASELINE_AGE_MS
+        detail["oldest_row_age_ms"] = (
+            round(float(observed_ms) - rows[0]["ts_ms"], 1) if rows else None
+        )
         if not eligible:
             return SleeveDecision(False, "no_baseline", detail)
         baseline = eligible[-1]
         baseline_age_ms = float(observed_ms) - baseline["ts_ms"]
+        detail["baseline_age_ms"] = round(baseline_age_ms, 1)
         if baseline_age_ms > config.SLEEVE_MAX_BASELINE_AGE_MS:
             return SleeveDecision(False, "stale_baseline", detail)
 
