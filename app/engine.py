@@ -558,7 +558,14 @@ class Engine:
                 if ticker in p["siblings"]:
                     ok, lag = self.detector.confirm(p["cand"], p["siblings"])
                     if ok:
-                        self.act_on_signal(p["cand"], lag)
+                        if time.time() - p["queued_at"] <= config.CONF_TRADE_MAX_AGE_S:
+                            self.act_on_signal(p["cand"], lag)
+                        else:
+                            # Coherent on the exchange clock, but we learned of
+                            # it too late to trade.  Recorded so the true
+                            # confirmation rate is measurable instead of being
+                            # hidden inside `unconfirmed`.
+                            self.record_signal(p["cand"], lag, "confirmed_late")
                         continue
                 if time.time() < p["deadline"]:
                     still.append(p)
@@ -571,8 +578,10 @@ class Engine:
             if ok:
                 self.act_on_signal(cand, lag)
             elif sibs:
+                now = time.time()
                 self.pending.append({"cand": cand, "siblings": sibs,
-                                     "deadline": time.time() + 0.2})
+                                     "queued_at": now,
+                                     "deadline": now + config.CONF_WAIT_S})
             else:
                 self.record_signal(cand, None, "unconfirmed")
 

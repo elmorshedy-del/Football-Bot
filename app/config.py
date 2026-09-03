@@ -38,6 +38,22 @@ DL_MIN = _f("DL_MIN", 0.8)              # min log-odds displacement of the sweep
 LEVELS_MIN = _i("LEVELS_MIN", 5)        # min distinct price levels in the sweep
 SIZE_MIN = _f("SIZE_MIN", 200.0)        # min contracts in the sweep
 CONF_MS = _i("CONF_MS", 50)             # sibling confirmation window (+- ms)
+# How long to hold an unconfirmed candidate waiting for its sibling's frame to
+# arrive.  This is transport patience, not a strategy window: `Detector.confirm`
+# judges coherence on exchange timestamps (CONF_MS above), so waiting longer
+# cannot admit a pair the exchange clock says was too far apart.  It was fixed
+# at 200ms against an observed feed lag p95 of 0.9-1.1s, so siblings whose
+# exchange stamps were within 50ms of each other were still dropped as
+# unconfirmed purely because their frames arrived late.
+CONF_WAIT_S = _f("CONF_WAIT_S", 2.0)
+# Maximum wall-clock age of a candidate at confirmation time for it to be
+# tradeable.  Waiting longer than this still records the confirmation, as
+# `confirmed_late`, but does not enter: a coherent pair learned two seconds
+# after the fact is evidence about the confirmation rate, not an opportunity,
+# and entering on it would deepen an arrival latency that is already the
+# study's largest execution problem.  The default preserves the previous
+# trading behaviour exactly, so the longer wait is purely additive evidence.
+CONF_TRADE_MAX_AGE_S = _f("CONF_TRADE_MAX_AGE_S", 0.2)
 CONF_SIGN = _b("CONF_SIGN", True)       # sibling must move opposite sign (validated improvement)
 PRICE_CAP = _f("PRICE_CAP", 58.0)       # max price paid (isotonic zero-crossing, late regime)
 NOTIONAL_USD = _f("NOTIONAL_USD", 100.0)

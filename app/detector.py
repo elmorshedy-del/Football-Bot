@@ -171,7 +171,11 @@ class Detector:
         # sweep, not a near miss.  Drop it rather than record it.
         st.pending_subthreshold = None
         if ts_ms - st.last_candidate_ms < config.EPISODE_COOLDOWN_S * 1000:
-            st.last_candidate_ms = ts_ms
+            # The window is anchored to the last *emitted* candidate, not to
+            # the last suppressed one.  Advancing it here re-armed the cooldown
+            # on every suppression, so a market printing sweeps faster than the
+            # interval could be silenced indefinitely and the episode inventory
+            # was shaped by trade arrival pattern rather than by the rule.
             return None
         st.last_candidate_ms = ts_ms
         return {"ticker": ticker, "ts_ms": ts_ms, "dir": d, "dl": round(dl, 3),
