@@ -2,6 +2,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from app import config
 from app.books import Book
 from app.late_score_sleeve import (
     PriceOnlyLateScoreSleeve,
@@ -205,3 +206,75 @@ class PriceOnlyExitTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RejectionEvidenceTests(unittest.TestCase):
+    """A refusal must carry the numbers that produced it.
+
+    In the first live study the early refusals returned bare reasons: a
+    `wide_spread` row recorded that the book was too wide but never how wide,
+    so no later analysis could ask what a different cap would have admitted.
+    """
+
+    class FakeBook:
+        def __init__(self, bid, ask, ok=True):
+            self._bid, self._ask, self.ok = bid, ask, ok
+
+        def best_yes_bid(self):
+            return self._bid
+
+        def best_yes_ask(self):
+            return self._ask
+
+    def books(self, spreads):
+        return {t: self.FakeBook(50 - s / 2.0, 50 + s / 2.0)
+                for t, s in spreads.items()}
+
+    def classify(self, books, tickers=None, observe=False):
+        sleeve = PriceOnlyLateScoreSleeve()
+        tickers = tickers or list(books)
+        meta = {t: {"title": "Tie" if t.endswith("TIE") else "Team"}
+                for t in tickers}
+        if observe:
+            # Mark every leg as just seen so the freshness gate passes and the
+            # refusal under test is the baseline one.
+            sleeve.last_leg_observation["E"].update({t: 1000.0 for t in tickers})
+        return sleeve.classify(
+            {"ticker": tickers[0], "dir": 1}, "E", tickers, meta, books, 1000.0,
+        )
+
+    def test_wide_spread_records_how_wide_and_against_what_limit(self):
+        books = self.books({"A": 2.0, "B-TIE": 3.0, "C": 40.0})
+        decision = self.classify(books)
+        self.assertFalse(decision.accepted)
+        self.assertEqual(decision.reason, "wide_spread")
+        self.assertEqual(decision.detail["widest_leg"], "C")
+        self.assertEqual(decision.detail["widest_spread_c"], 40.0)
+        self.assertEqual(decision.detail["max_spread_c_limit"],
+                         config.SLEEVE_MAX_SPREAD_C)
+        # Every leg's width is present, not just the offending one.
+        self.assertEqual(len(decision.detail["spread_c"]), 3)
+
+    def test_incomplete_book_names_the_leg_that_was_missing(self):
+        books = self.books({"A": 2.0, "B-TIE": 2.0, "C": 2.0})
+        books["C"] = self.FakeBook(None, None, ok=True)
+        decision = self.classify(books)
+        self.assertEqual(decision.reason, "incomplete_book")
+        self.assertEqual(decision.detail["missing_leg"], "C")
+
+    def test_baseline_refusals_record_the_history_they_lacked(self):
+        books = self.books({"A": 2.0, "B-TIE": 2.0, "C": 2.0})
+        decision = self.classify(books, observe=True)
+        self.assertEqual(decision.reason, "no_baseline")
+        self.assertEqual(decision.detail["baseline_rows"], 0)
+        self.assertEqual(decision.detail["baseline_eligible"], 0)
+        self.assertEqual(decision.detail["baseline_lag_ms"],
+                         config.SLEEVE_BASELINE_MS)
+        self.assertEqual(decision.detail["max_baseline_age_ms"],
+                         config.SLEEVE_MAX_BASELINE_AGE_MS)
+
+    def test_not_triplet_records_the_leg_count(self):
+        books = self.books({"A": 2.0, "B-TIE": 2.0})
+        decision = self.classify(books)
+        self.assertEqual(decision.reason, "not_triplet")
+        self.assertEqual(decision.detail["leg_count"], 2)

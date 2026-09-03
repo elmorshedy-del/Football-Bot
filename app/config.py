@@ -1,4 +1,6 @@
 """Football-Bot configuration. Everything overridable via environment variables."""
+import hashlib
+import json
 import os
 
 
@@ -36,6 +38,22 @@ DL_MIN = _f("DL_MIN", 0.8)              # min log-odds displacement of the sweep
 LEVELS_MIN = _i("LEVELS_MIN", 5)        # min distinct price levels in the sweep
 SIZE_MIN = _f("SIZE_MIN", 200.0)        # min contracts in the sweep
 CONF_MS = _i("CONF_MS", 50)             # sibling confirmation window (+- ms)
+# How long to hold an unconfirmed candidate waiting for its sibling's frame to
+# arrive.  This is transport patience, not a strategy window: `Detector.confirm`
+# judges coherence on exchange timestamps (CONF_MS above), so waiting longer
+# cannot admit a pair the exchange clock says was too far apart.  It was fixed
+# at 200ms against an observed feed lag p95 of 0.9-1.1s, so siblings whose
+# exchange stamps were within 50ms of each other were still dropped as
+# unconfirmed purely because their frames arrived late.
+CONF_WAIT_S = _f("CONF_WAIT_S", 2.0)
+# Maximum wall-clock age of a candidate at confirmation time for it to be
+# tradeable.  Waiting longer than this still records the confirmation, as
+# `confirmed_late`, but does not enter: a coherent pair learned two seconds
+# after the fact is evidence about the confirmation rate, not an opportunity,
+# and entering on it would deepen an arrival latency that is already the
+# study's largest execution problem.  The default preserves the previous
+# trading behaviour exactly, so the longer wait is purely additive evidence.
+CONF_TRADE_MAX_AGE_S = _f("CONF_TRADE_MAX_AGE_S", 0.2)
 CONF_SIGN = _b("CONF_SIGN", True)       # sibling must move opposite sign (validated improvement)
 PRICE_CAP = _f("PRICE_CAP", 58.0)       # max price paid (isotonic zero-crossing, late regime)
 NOTIONAL_USD = _f("NOTIONAL_USD", 100.0)
@@ -81,6 +99,21 @@ SLEEVE_OSCILLATION_WINDOW_S = _f("SLEEVE_OSCILLATION_WINDOW_S", 4.0)
 SLEEVE_OSCILLATION_CROSSES = _i("SLEEVE_OSCILLATION_CROSSES", 3)
 SLEEVE_MAX_OSCILLATION_EFFICIENCY = _f("SLEEVE_MAX_OSCILLATION_EFFICIENCY", 0.35)
 SLEEVE_TIMEOUT_S = _f("SLEEVE_TIMEOUT_S", 30.0)
+
+# --- Sub-threshold research capture (collection only; never trades) ---
+# Bursts that clear this floor but not the Gate-A thresholds are recorded with
+# outcome ``subthreshold``.  They are never confirmed, never dispatched to a
+# sleeve, and never counted toward a kill-condition gate.  They exist so the
+# detector thresholds can be re-fitted from the study database instead of only
+# by replaying the raw feed.  These knobs are excluded from the strategy
+# configuration identity: capturing an observation cannot change a decision.
+SUBTHRESHOLD_CAPTURE = _b("SUBTHRESHOLD_CAPTURE", True)
+SUBTHRESHOLD_DL_MIN = _f("SUBTHRESHOLD_DL_MIN", 0.3)
+SUBTHRESHOLD_LEVELS_MIN = _i("SUBTHRESHOLD_LEVELS_MIN", 3)
+SUBTHRESHOLD_SIZE_MIN = _f("SUBTHRESHOLD_SIZE_MIN", 50.0)
+# Per-market rate limit.  Bounds the write rate to at most one observation per
+# market per interval, whatever the trade rate.
+SUBTHRESHOLD_COOLDOWN_S = _f("SUBTHRESHOLD_COOLDOWN_S", 5.0)
 
 # --- Paper execution adapter (off preserves the original paper desk exactly) ---
 PAPER_EXECUTION_V2 = _b("PAPER_EXECUTION_V2", False)
@@ -187,6 +220,93 @@ LEAGUE_PRIOR = {
     "KXBRASILEIROGAME": 13, "KXARGPREMDIVGAME": 12, "KXUECLGAME": 14, "KXEPLGAME": 4,
     "KXWCGAME": 0, "KXUCLGAME": 0, "KXUELGAME": 0, "KXCHNSLGAME": 0, "KXDIMAYORGAME": 0,
 }
+
+
+# --- Strategy configuration identity ---------------------------------------
+# Every signal and trade is stamped with the identity of the configuration that
+# produced it.  Without this, rows from different builds pool into one
+# aggregate: the first live study reported a single net of -$609.02 that was
+# really a pre-Aug-30 build at -$630.13 plus a later one at +$21.11, and no
+# aggregate over that pool answered any question about either.
+#
+# The identity covers parameters AND code, because a strategy change is just as
+# often a code edit as an environment change. `SOCCER_SERIES` is included: the
+# traded universe is part of the configuration.  Read-only observability knobs
+# (the goal-latency observer, diagnostic windows, forward-path capture) are
+# excluded, since changing them cannot change a trading decision.
+STRATEGY_PARAM_NAMES = (
+    "DL_MIN", "LEVELS_MIN", "SIZE_MIN", "CONF_MS", "CONF_SIGN",
+    "PRICE_CAP", "NOTIONAL_USD", "TARGET", "TIMEOUT_S", "LOCKOUT_S",
+    "EPISODE_COOLDOWN_S", "LATE_ONLY", "LATE_WINDOW_MIN", "USE_STOP",
+    "STOP_FRAC", "FEE_EXIT_TAKER", "PRICE_ONLY_SLEEVE_MODE",
+    "SLEEVE_START_BEFORE_EXPIRY_MIN", "SLEEVE_AFTER_EXPIRY_MIN",
+    "SLEEVE_BASELINE_MS", "SLEEVE_MAX_BASELINE_AGE_MS",
+    "SLEEVE_TRIPLET_FRESH_MS", "SLEEVE_MAX_SPREAD_C",
+    "SLEEVE_MIN_TEAM_GAIN_PP", "SLEEVE_MIN_DRAW_GAIN_PP",
+    "SLEEVE_MIN_TEAM_POST", "SLEEVE_MIN_DRAW_POST",
+    "SLEEVE_MAX_SIBLING_RISE_PP", "SLEEVE_MIN_EXPLAINED",
+    "SLEEVE_SCRATCH_ARM_C", "SLEEVE_SCRATCH_BUFFER_C",
+    "SLEEVE_UNKNOWN_FEE_BUFFER_C", "SLEEVE_TRAIL_ARM_C", "SLEEVE_TRAIL_MIN_C",
+    "SLEEVE_TRAIL_FRAC", "SLEEVE_REVERSAL_C", "SLEEVE_OSCILLATION_WINDOW_S",
+    "SLEEVE_OSCILLATION_CROSSES", "SLEEVE_MAX_OSCILLATION_EFFICIENCY",
+    "SLEEVE_TIMEOUT_S", "PAPER_EXECUTION_V2", "PAPER_ENTRY_LATENCY_MS",
+    "PAPER_EXIT_LATENCY_MS", "PAPER_EXECUTION_POLL_MS",
+    "MATCH_CLOCK_MAX_AGE_MS", "SOCCER_SERIES",
+)
+
+# Source files whose contents decide what is traded and how it is filled.
+_STRATEGY_SOURCES = (
+    "books.py", "config.py", "detector.py", "engine.py", "execution.py",
+    "late_score_sleeve.py", "match_clock.py", "paper.py",
+)
+_UNREADABLE_SOURCE = "unreadable"
+
+
+def strategy_params():
+    """The parameter set that defines one strategy configuration."""
+    return {name.lower(): globals()[name] for name in STRATEGY_PARAM_NAMES}
+
+
+def _compute_code_fingerprint():
+    """Hash the strategy-critical sources so a code edit changes the identity.
+
+    A configuration that is identical in parameters but different in code is a
+    different configuration.  Hashing file contents keeps this self-contained:
+    no git metadata is needed, and the image need not ship a repository.
+    """
+    digest = hashlib.sha256()
+    here = os.path.dirname(os.path.abspath(__file__))
+    for name in _STRATEGY_SOURCES:
+        digest.update(name.encode("utf-8"))
+        try:
+            with open(os.path.join(here, name), "rb") as handle:
+                digest.update(handle.read())
+        except OSError:
+            # Never fail startup over provenance; record the gap instead of
+            # claiming a fingerprint that did not read every source.
+            digest.update(_UNREADABLE_SOURCE.encode("utf-8"))
+    return digest.hexdigest()[:12]
+
+
+# Sources cannot change under a running process, so this is computed once.
+CODE_FINGERPRINT = _compute_code_fingerprint()
+
+
+def config_id():
+    """Stable content address for the active parameters and code."""
+    blob = json.dumps(strategy_params(), sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(blob.encode("utf-8"))
+    digest.update(CODE_FINGERPRINT.encode("utf-8"))
+    return digest.hexdigest()[:16]
+
+
+def config_record():
+    """The full, self-describing record behind `config_id()`."""
+    return {
+        "config_id": config_id(),
+        "code_fingerprint": CODE_FINGERPRINT,
+        "params": strategy_params(),
+    }
 
 
 def has_credentials():

@@ -13,7 +13,7 @@ from . import config, store
 
 # Samples buffered before an incremental write; bounds crash loss.
 BID_PATH_FLUSH_EVERY = 250
-from .execution import ShadowBooks
+from .execution import ShadowBook, ShadowBooks
 from .late_score_sleeve import sleeve_exit_reason
 
 
@@ -275,12 +275,21 @@ class PaperDesk:
         if not shadow.ok:
             return self._finalize_entry_outcome(pending, "no_book", now_wall, [])
         side = "yes" if pending.sig["dir"] > 0 else "no"
-        arrival_book = shadow.snapshot_dict()
         fill = shadow.buy(side, config.NOTIONAL_USD, config.PRICE_CAP, consume=False)
         if fill.quantity < 1 or fill.vwap is None:
             return self._finalize_entry_outcome(
                 pending, "rejected_cap", now_wall, fill.levels,
             )
+        # The snapshot must be deep enough to re-verify the walk it is evidence
+        # for.  At the fixed default depth a fill that walked further than the
+        # snapshot recorded could never be checked, and K1 read that missing
+        # evidence as a failed fill: the only two K1 failures in the first live
+        # study were its only two walks past the default depth.  `buy` does not
+        # consume with `consume=False`, so taking the snapshot after it yields
+        # the identical arrival book.
+        arrival_book = shadow.snapshot_dict(
+            depth=max(ShadowBook.SNAPSHOT_DEPTH, len(fill.levels)),
+        )
         arrival_book["fill_levels"] = fill.levels
         latency_ms, order_arrival_ms, detail = self._entry_timing(pending, now_wall, fill.levels)
         fee_type = pending.meta.get("fee_type", "quadratic")

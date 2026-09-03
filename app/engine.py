@@ -19,6 +19,9 @@ from .recorder import RawRecorder
 
 GATE_A_STRATEGY = "gate_a"
 PRICE_ONLY_STRATEGY = "price_only_late_score"
+# Research observations only.  Never traded, never confirmed, and excluded from
+# every sleeve aggregate and kill-condition count.
+SUBTHRESHOLD_STRATEGY = "subthreshold_observer"
 
 
 def market_game_title(market):
@@ -132,7 +135,7 @@ class Engine:
             import httpx as _httpx
             self.client._http = _httpx.AsyncClient(base_url=config.KALSHI_REST, timeout=30)
             self.client.n_requests = self.client.n_429 = self.client.n_retries = 0
-        self.detector = Detector()
+        self.detector = Detector(subthreshold_sink=self.record_subthreshold)
         self.late_score_sleeve = PriceOnlyLateScoreSleeve()
         self.desk = PaperDesk(
             self.broadcast, self.on_paper_entry_result, error_result=self._record_error,
@@ -234,19 +237,12 @@ class Engine:
         ct = parse_iso(m["close_time"])
         return ct is not None and (ct - time.time()) <= config.LATE_WINDOW_MIN * 60
 
-    def is_sleeve_window(self, ticker):
-        """Approximate minute 88 from scheduled expiration, without live scores."""
-        if self.mode == "demo":
-            return True
-        m = self.meta.get(ticker)
-        if not m or not m.get("close_time"):
-            return False
-        ct = parse_iso(m["close_time"])
-        if ct is None:
-            return False
-        until_expiry = ct - time.time()
-        return (-config.SLEEVE_AFTER_EXPIRY_MIN * 60.0 <= until_expiry <=
-                config.SLEEVE_START_BEFORE_EXPIRY_MIN * 60.0)
+    # A scheduled-expiration approximation of minute 88 used to live here.  The
+    # sleeve is gated on the persisted provider clock instead (see
+    # `_clock_gate_for` / MatchClockGate), so the approximation had no caller
+    # and only misled readers into thinking expiry time admitted trades.  The
+    # SLEEVE_*_EXPIRY_MIN settings still describe the schedule-proxy window
+    # reported as a per-signal diagnostic in `audit.schedule_window`.
 
     def _observe_sleeve(self, ticker, observed_ms):
         if config.PRICE_ONLY_SLEEVE_MODE not in {"enforce", "parallel"}:
@@ -555,7 +551,14 @@ class Engine:
                 if ticker in p["siblings"]:
                     ok, lag = self.detector.confirm(p["cand"], p["siblings"])
                     if ok:
-                        self.act_on_signal(p["cand"], lag)
+                        if time.time() - p["queued_at"] <= config.CONF_TRADE_MAX_AGE_S:
+                            self.act_on_signal(p["cand"], lag)
+                        else:
+                            # Coherent on the exchange clock, but we learned of
+                            # it too late to trade.  Recorded so the true
+                            # confirmation rate is measurable instead of being
+                            # hidden inside `unconfirmed`.
+                            self.record_signal(p["cand"], lag, "confirmed_late")
                         continue
                 if time.time() < p["deadline"]:
                     still.append(p)
@@ -568,10 +571,56 @@ class Engine:
             if ok:
                 self.act_on_signal(cand, lag)
             elif sibs:
+                now = time.time()
                 self.pending.append({"cand": cand, "siblings": sibs,
-                                     "deadline": time.time() + 0.2})
+                                     "queued_at": now,
+                                     "deadline": now + config.CONF_WAIT_S})
             else:
                 self.record_signal(cand, None, "unconfirmed")
+
+    def record_subthreshold(self, observation):
+        """Persist one near-miss burst as a research observation.
+
+        Deliberately leaner than `record_signal`: no sibling confirmation, no
+        strategy dispatch, no dashboard broadcast, no forward-path watch, and
+        no clock-gate miss accounting.  A near miss is evidence about where the
+        detector thresholds sit, not a signal, and it must not consume a
+        trading budget or move a health indicator.  The clock is stamped
+        read-only, because whether a near miss happened at minute 88 is the
+        first thing any re-fit will ask.
+        """
+        ticker = observation["ticker"]
+        meta = self.meta.get(ticker, {})
+        event = meta.get("event", "?")
+        try:
+            stamp = self.clock_tracker.stamp(event, observation.get("local_ts"))
+        except Exception:
+            stamp = None
+        try:
+            store.insert_signal({
+                "ts_ms": observation["ts_ms"], "local_ts": observation["local_ts"],
+                "market": ticker, "event": event, "series": meta.get("series", "?"),
+                "dir": observation["dir"], "dl": observation["dl"],
+                "levels": observation["levels"], "size": observation["size"],
+                "ref": observation["ref"], "ext": observation["ext"],
+                "conf_lag_ms": None, "late": self.is_late(ticker),
+                "outcome": "subthreshold",
+                "detail": {
+                    "strategy": SUBTHRESHOLD_STRATEGY,
+                    "below": observation.get("below") or [],
+                    "trading_floor": {
+                        "dl_min": config.DL_MIN,
+                        "levels_min": config.LEVELS_MIN,
+                        "size_min": config.SIZE_MIN,
+                    },
+                },
+                "match_clock_snapshot": stamp,
+                # No forward path: these are numerous by design, and each watch
+                # costs a tracking slot and up to BID_PATH_MAX_SAMPLES rows.
+                "forward_path_started_ts": None,
+            })
+        except Exception as exc:
+            self._record_error("subthreshold", exc)
 
     def record_signal(self, cand, lag, outcome, announce=True):
         m = self.meta.get(cand["ticker"], {})
@@ -858,6 +907,10 @@ class Engine:
             self.desk.check_timeouts()
             # expire stale pendings
             now = time.time()
+            # A near miss on a market that then goes quiet would otherwise sit
+            # held until its next trade, which may never come before the match
+            # ends.  Flushing on the same clock bounds that wait.
+            self.detector.flush_subthreshold(now * 1000.0)
             # Also retries startup watches when no new book frame arrives.
             self._expire_signal_paths(now)
             for p in [p for p in self.pending if now >= p["deadline"]]:

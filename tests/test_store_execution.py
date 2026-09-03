@@ -184,6 +184,59 @@ class PaperExecutionStoreTests(unittest.TestCase):
         trade["size"] = 3.0
         self.assertFalse(store._paper_fill_integrity(trade))
 
+    def test_a_walk_past_the_recorded_depth_is_unverifiable_not_failed(self):
+        """Production regression: the only two K1 failures were truncations.
+
+        The arrival snapshot is capped at a fixed depth, so trades 39 and 64
+        (15 and 14 levels walked, 8 recorded) reported failed fills when the
+        evidence simply did not reach that far. Their first eight levels
+        matched the book exactly and no level exceeded available depth.
+        """
+        trade = {
+            "side": "yes",
+            "cap": 50.0,
+            "size": 4.0,
+            "entry_px": 46.0,
+            "notional": 1.9,
+            "book_at_entry": json.dumps({
+                # Records depth to 45c only; the fill walked one level past it.
+                "no_bids": [[55.0, 2.0]],
+                "fill_levels": [[45.0, 2.0], [47.0, 2.0]],
+            }),
+        }
+        self.assertIsNone(store._paper_fill_integrity(trade))
+
+    def test_a_level_inside_the_recorded_range_must_still_be_supported(self):
+        """Truncation tolerance must not become a hole in the check."""
+        trade = {
+            "side": "yes",
+            "cap": 50.0,
+            "size": 4.0,
+            "entry_px": 44.5,
+            "notional": 1.8,
+            "book_at_entry": json.dumps({
+                "no_bids": [[57.0, 2.0], [55.0, 2.0]],
+                # 44c sits inside the recorded 43c..45c range but the book
+                # holds no depth there, so this is a real inconsistency.
+                "fill_levels": [[43.0, 2.0], [44.0, 2.0]],
+            }),
+        }
+        self.assertFalse(store._paper_fill_integrity(trade))
+
+    def test_snapshot_depth_covers_the_walk_it_is_evidence_for(self):
+        from app.execution import ShadowBook
+
+        book = ShadowBook.__new__(ShadowBook)
+        book.yes_bids = {float(90 - i): 5.0 for i in range(20)}
+        book.no_bids = {float(90 - i): 5.0 for i in range(20)}
+        book.seq, book.ok = 1, True
+        default = book.snapshot_dict()
+        self.assertEqual(len(default["no_bids"]), ShadowBook.SNAPSHOT_DEPTH)
+        self.assertTrue(default["truncated"])
+        deep = book.snapshot_dict(depth=20)
+        self.assertEqual(len(deep["no_bids"]), 20)
+        self.assertFalse(deep["truncated"])
+
     def test_k2_cannot_pass_before_fifty_confirmed_signals(self):
         for index in range(5):
             store.ex(

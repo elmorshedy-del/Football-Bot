@@ -366,7 +366,9 @@ async def status():
 
 @app.get("/api/config")
 async def get_config():
-    return {"dl_min": config.DL_MIN, "levels_min": config.LEVELS_MIN,
+    return {"config_id": config.config_id(),
+            "code_fingerprint": config.CODE_FINGERPRINT,
+            "dl_min": config.DL_MIN, "levels_min": config.LEVELS_MIN,
             "size_min": config.SIZE_MIN, "conf_ms": config.CONF_MS,
             "conf_sign": config.CONF_SIGN, "price_cap": config.PRICE_CAP,
             "notional_usd": config.NOTIONAL_USD, "target": config.TARGET,

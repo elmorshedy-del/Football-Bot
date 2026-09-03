@@ -91,6 +91,14 @@ CREATE TABLE IF NOT EXISTS latency(
 CREATE INDEX IF NOT EXISTS idx_latency_kind_ts ON latency(kind, ts);
 CREATE TABLE IF NOT EXISTS eventlog(
   ts REAL, kind TEXT, text TEXT);
+-- Content-addressed strategy configurations.  Every signal and trade carries a
+-- config_id, and this table is what makes that id self-describing inside an
+-- export: parameters plus the code fingerprint that produced them.  Rows are
+-- immutable; a changed threshold or a changed strategy source is a new id, not
+-- an edit to an existing one.
+CREATE TABLE IF NOT EXISTS config_versions(
+  config_id TEXT PRIMARY KEY, first_seen_ts REAL NOT NULL,
+  code_fingerprint TEXT NOT NULL, params TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS goal_latency_observations(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   observed_ts REAL NOT NULL,
@@ -160,6 +168,11 @@ CREATE INDEX IF NOT EXISTS idx_provider_events_event_ts
 
 
 _mode = "demo"
+
+# Content address of the configuration that produced the rows this process
+# writes.  None until `init()` registers one; rows written without it keep a
+# NULL config_id rather than borrowing another configuration's identity.
+_config_id = None
 
 # Rows written before capture modes existed carry a NULL mode.  Their
 # provenance is unknown, not disposable: they are preserved and presented under
@@ -301,6 +314,14 @@ def init():
             _conn.execute(f"ALTER TABLE signals ADD COLUMN {column} TEXT")
         except sqlite3.OperationalError:
             pass
+    # Configuration provenance.  Rows written before this existed keep a NULL
+    # config_id: their configuration is unknown, not assumed to be the current
+    # one, so they are never pooled into a current-configuration aggregate.
+    for table in ("signals", "trades"):
+        try:
+            _conn.execute(f"ALTER TABLE {table} ADD COLUMN config_id TEXT")
+        except sqlite3.OperationalError:
+            pass
     # Durable finalization marker for a signal's forward path.  Without it a
     # restart cannot tell a completed watch from one that died mid-window.
     try:
@@ -426,11 +447,37 @@ def init():
     global _db_generation
     _db_generation += 1
     _stats_cache.clear()
+    register_config_version()
 
 
 def set_mode(m):
     global _mode
     _mode = m
+
+
+def register_config_version(record=None):
+    """Record the active configuration and make it the stamp for new rows.
+
+    Idempotent: re-registering an id keeps its original `first_seen_ts`, so a
+    restart under an unchanged configuration does not look like a new one.
+    """
+    global _config_id
+    record = config.config_record() if record is None else record
+    _config_id = record["config_id"]
+    try:
+        ex("""INSERT INTO config_versions(config_id,first_seen_ts,code_fingerprint,params)
+              VALUES(?,?,?,?) ON CONFLICT(config_id) DO NOTHING""",
+           (_config_id, time.time(), record["code_fingerprint"],
+            json.dumps(record["params"], sort_keys=True)))
+    except sqlite3.Error:
+        # Provenance must never take down collection.  The id is still stamped
+        # on rows; only the self-describing record is missing.
+        pass
+    return _config_id
+
+
+def current_config_id():
+    return _config_id
 
 
 def purge_non_live():
@@ -1292,13 +1339,13 @@ def _stamp_text(value):
 def insert_signal(s):
     cur = ex("""INSERT INTO signals(ts_ms,local_ts,market,event,series,dir,dl,levels,size,
                 ref,ext,conf_lag_ms,late,outcome,detail,mode,match_clock_snapshot,
-                forward_path_started_ts)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                forward_path_started_ts,config_id)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
              (s["ts_ms"], s["local_ts"], s["market"], s["event"], s["series"], s["dir"],
               s["dl"], s["levels"], s["size"], s["ref"], s["ext"], s.get("conf_lag_ms"),
               1 if s.get("late") else 0, s["outcome"], json.dumps(s.get("detail") or {}), _mode,
               _stamp_text(s.get("match_clock_snapshot")),
-              s.get("forward_path_started_ts")))
+              s.get("forward_path_started_ts"), _config_id))
     return cur.lastrowid
 
 
@@ -1326,12 +1373,12 @@ def finish_paper_signal(signal_id, outcome, detail, latency_ms, order_arrival_ms
 
 def insert_trade(t):
     cur = ex("""INSERT INTO trades(signal_id,market,event,series,dir,side,entry_ts,entry_px,
-                size,cap,notional,book_at_entry,status,mode,strategy)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?,?)""",
+                size,cap,notional,book_at_entry,status,mode,strategy,config_id)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?,?,?)""",
              (t["signal_id"], t["market"], t["event"], t["series"], t["dir"], t["side"],
               t["entry_ts"], t["entry_px"], t["size"], t["cap"], t["notional"],
               json.dumps(t.get("book_at_entry") or {}), _mode,
-              t.get("strategy") or "gate_a"))
+              t.get("strategy") or "gate_a", _config_id))
     return cur.lastrowid
 
 
@@ -1342,13 +1389,14 @@ def open_paper_trade(t, detail, fill_levels, entry_fee, latency_ms, order_arriva
             cur = _conn.execute(
                 """INSERT INTO trades(signal_id,market,event,series,dir,side,entry_ts,entry_px,
                        size,cap,notional,book_at_entry,status,mode,remaining,realized_gross,
-                       accrued_fees,exit_qty,exit_vwap_num,fee_type,fee_multiplier,strategy)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?, ?, 0, ?, 0, 0, ?, ?,?)""",
+                       accrued_fees,exit_qty,exit_vwap_num,fee_type,fee_multiplier,strategy,
+                       config_id)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?, ?, 0, ?, 0, 0, ?, ?,?,?)""",
                 (t["signal_id"], t["market"], t["event"], t["series"], t["dir"], t["side"],
                  t["entry_ts"], t["entry_px"], t["size"], t["cap"], t["notional"],
                  json.dumps(t.get("book_at_entry") or {}), _mode, t["size"], entry_fee,
                  t.get("fee_type"), t.get("fee_multiplier"),
-                 t.get("strategy") or "gate_a"),
+                 t.get("strategy") or "gate_a", _config_id),
             )
             trade_id = cur.lastrowid
             _conn.execute("UPDATE signals SET outcome='filled', detail=? WHERE id=?",
@@ -1490,12 +1538,22 @@ def _paper_fill_integrity(trade):
         source_key = "no_bids" if trade["side"] == "yes" else "yes_bids"
         source = {round(100.0 - float(price), 8): float(size)
                   for price, size in book.get(source_key, [])}
+        # The snapshot is capped at a fixed depth, so a fill that walked further
+        # than the cap has levels the evidence simply does not cover.  Those are
+        # unverifiable, not wrong: reporting them as integrity failures made K1
+        # fail hardest on the deepest walks, which are exactly the fills whose
+        # realism matters most.  A level beyond the deepest recorded price is
+        # therefore treated as missing evidence; a level *inside* the recorded
+        # range that the book does not support is still a real inconsistency.
+        deepest = max(source, default=None)
         used = {}
         quantity = weighted = notional = 0.0
         for price, size in levels:
             price, size = float(price), float(size)
             if size <= 0 or price <= 0 or price > float(trade["cap"]) + 1e-6:
                 return False
+            if deepest is None or price > deepest + 1e-6:
+                return None
             used[round(price, 8)] = used.get(round(price, 8), 0.0) + size
             if used[round(price, 8)] > source.get(round(price, 8), 0.0) + 1e-6:
                 return False
@@ -1689,11 +1747,21 @@ def _compute_stats(mode=None):
     signal_scope, signal_args = mode_clause("s", selector=mode)
     closed = q(f"SELECT * FROM trades WHERE status='closed'{scope}", scope_args)
     open_t = q(f"SELECT * FROM trades WHERE status='open'{scope}", scope_args)
+    # Sub-threshold rows are research observations about where the detector
+    # floor sits, not signals of either sleeve.  `_strategy_key` maps every
+    # unrecognised label to gate_a, so leaving them in would inflate the Gate A
+    # funnel with bursts that were never eligible to trade.  They are counted
+    # separately below instead.
     signal_rows = q(
         "SELECT s.outcome,s.detail,t.strategy AS trade_strategy"
         " FROM signals s LEFT JOIN trades t"
-        f" ON t.signal_id=s.id{trade_scope} WHERE 1=1{signal_scope}",
+        f" ON t.signal_id=s.id{trade_scope} WHERE s.outcome IS NOT 'subthreshold'"
+        f"{signal_scope}",
         (*trade_args, *signal_args),
+    )
+    subthreshold = q(
+        f"SELECT COUNT(*) n FROM signals s WHERE s.outcome='subthreshold'{signal_scope}",
+        signal_args,
     )
     latency_evidence = _latency_evidence(mode=mode)
     by_strategy = {
@@ -1768,4 +1836,6 @@ def _compute_stats(mode=None):
         "sleeves": sleeves,
         "leagues": lg,
         "kill": kill,
+        # Reported beside the sleeves, never inside them.
+        "subthreshold_observations": subthreshold[0]["n"] if subthreshold else 0,
     }

@@ -7,6 +7,7 @@ from app.match_clock import (
     MatchClockGate,
     MatchClockTracker,
     evaluate_clock_gate,
+    normalize_status,
     parse_current_clock,
     parse_clock_text,
     parse_stored_stamp,
@@ -267,6 +268,53 @@ class ClockGateAndStampTests(unittest.TestCase):
                 self.observation(90, 1, period, status), "E", 100.2,
             )
             self.assertEqual(MatchClockGate(stamp).evaluate()["outcome"], outcome)
+
+    def test_period_shaped_status_is_live_play(self):
+        """Kalshi reports the running period in the status field.
+
+        Production regression: ``2nd_half`` compacted to a token no status set
+        matched, so ``normalize_status`` returned it verbatim and the gate
+        refused every in-play match as ``clock_not_live``.  Over the first 7.9
+        days of live capture that rejected 100% of price-only candidates and the
+        sleeve never admitted a single one.  Counts below are the observed
+        provider vocabulary from that capture.
+        """
+        for raw in ("2nd_half", "1st_half", "2ND_HALF", "second half", "extra_time"):
+            with self.subTest(status=raw):
+                self.assertEqual(normalize_status(raw), "live")
+        # A stoppage is not play, and must keep failing closed.
+        for raw, expected in (
+            ("halftime", "half-time"),
+            ("half-time", "half-time"),
+            ("final", "final"),
+            ("suspended", "suspended"),
+        ):
+            with self.subTest(status=raw):
+                self.assertEqual(normalize_status(raw), expected)
+
+    def test_second_half_88_reaches_the_gate(self):
+        """The exact production shape: minute 88, period 2nd, status 2nd_half."""
+        stamp = stamp_from_observation(
+            self.observation(88, None, "2nd", "2nd_half"), "E", 100.2,
+        )
+        gate = MatchClockGate(stamp).evaluate()
+        self.assertTrue(gate["accepted"])
+        self.assertEqual(gate["outcome"], "clock_88_plus")
+        self.assertTrue(stamp["usable_for_88_gate"])
+        # Fixing the status must not weaken any other boundary.
+        for minute, period, status, outcome in (
+            (87, "2nd", "2nd_half", "clock_pre_88"),
+            (40, "1st", "1st_half", "clock_first_half"),
+            (45, "half-time", "halftime", "clock_half_time"),
+            (90, "final", "final", "clock_final"),
+        ):
+            with self.subTest(minute=minute, status=status):
+                other = stamp_from_observation(
+                    self.observation(minute, None, period, status), "E", 100.2,
+                )
+                evaluated = MatchClockGate(other).evaluate()
+                self.assertFalse(evaluated["accepted"])
+                self.assertEqual(evaluated["outcome"], outcome)
 
     def test_stale_and_unmapped_fail_closed(self):
         stamp = stamp_from_observation(self.observation(ts=90.0), "E", 100.2)
