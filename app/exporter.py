@@ -26,6 +26,10 @@ TABLES = (
     "provider_match_events",
     "bid_path_samples",
     "eventlog",
+    # Resolves every config_id on a signal or trade to its parameters and code
+    # fingerprint.  It carries no `mode`, so mode scoping keeps it whole: an
+    # export must be able to describe every configuration it contains.
+    "config_versions",
 )
 _RAW_NAME = re.compile(r"^feed-\d{8}-\d{2}(?:-part-\d+)?\.jsonl\.gz$")
 _CHUNK = 1024 * 1024
@@ -35,30 +39,23 @@ class ExportCancelled(Exception):
     """Raised when an in-flight study export is cancelled by the operator."""
 
 
+# Observability settings.  They are reported for the record but deliberately
+# excluded from the strategy configuration identity in `config.config_id()`,
+# since changing them cannot change a trading decision.
+_OBSERVABILITY_NAMES = (
+    "GOAL_LATENCY_OBSERVER", "GOAL_LATENCY_POLL_MS", "GOAL_LATENCY_LOOKBACK_S",
+    "GOAL_LATENCY_AFTER_S", "EVENT_MATCH_WINDOW_S",
+)
+
+
 def non_secret_config():
-    """Return an explicit allowlist; never serialize the process environment."""
-    names = (
-        "DL_MIN", "LEVELS_MIN", "SIZE_MIN", "CONF_MS", "CONF_SIGN",
-        "PRICE_CAP", "NOTIONAL_USD", "TARGET", "TIMEOUT_S", "LOCKOUT_S",
-        "EPISODE_COOLDOWN_S", "LATE_ONLY", "LATE_WINDOW_MIN", "USE_STOP",
-        "STOP_FRAC", "FEE_EXIT_TAKER", "PRICE_ONLY_SLEEVE_MODE",
-        "SLEEVE_START_BEFORE_EXPIRY_MIN", "SLEEVE_AFTER_EXPIRY_MIN",
-        "SLEEVE_BASELINE_MS", "SLEEVE_MAX_BASELINE_AGE_MS",
-        "SLEEVE_TRIPLET_FRESH_MS", "SLEEVE_MAX_SPREAD_C",
-        "SLEEVE_MIN_TEAM_GAIN_PP", "SLEEVE_MIN_DRAW_GAIN_PP",
-        "SLEEVE_MIN_TEAM_POST", "SLEEVE_MIN_DRAW_POST",
-        "SLEEVE_MAX_SIBLING_RISE_PP", "SLEEVE_MIN_EXPLAINED",
-        "SLEEVE_SCRATCH_ARM_C", "SLEEVE_SCRATCH_BUFFER_C",
-        "SLEEVE_UNKNOWN_FEE_BUFFER_C",
-        "SLEEVE_TRAIL_ARM_C", "SLEEVE_TRAIL_MIN_C", "SLEEVE_TRAIL_FRAC",
-        "SLEEVE_REVERSAL_C", "SLEEVE_OSCILLATION_WINDOW_S",
-        "SLEEVE_OSCILLATION_CROSSES", "SLEEVE_MAX_OSCILLATION_EFFICIENCY",
-        "SLEEVE_TIMEOUT_S", "PAPER_EXECUTION_V2", "PAPER_ENTRY_LATENCY_MS",
-        "PAPER_EXIT_LATENCY_MS", "PAPER_EXECUTION_POLL_MS",
-        "GOAL_LATENCY_OBSERVER", "GOAL_LATENCY_POLL_MS",
-        "GOAL_LATENCY_LOOKBACK_S", "GOAL_LATENCY_AFTER_S",
-        "EVENT_MATCH_WINDOW_S", "MATCH_CLOCK_MAX_AGE_MS", "SOCCER_SERIES",
-    )
+    """Return an explicit allowlist; never serialize the process environment.
+
+    The strategy half is `config.STRATEGY_PARAM_NAMES`, the same list the
+    configuration fingerprint hashes, so the manifest and the identity stamped
+    on every row cannot drift apart.
+    """
+    names = config.STRATEGY_PARAM_NAMES + _OBSERVABILITY_NAMES
     return {name.lower(): getattr(config, name) for name in names}
 
 
@@ -357,6 +354,12 @@ def build_study_bundle(output_path=None, mode=None, raw_paths=None, snapshot_pat
                 # them is inside the stated uncertainty interval.
                 "capture_boundary": _capture_boundary(boundary),
                 "configuration": non_secret_config(),
+                # The identity stamped on every signal and trade this process
+                # wrote.  Rows carrying a different config_id came from a
+                # different configuration and must not be pooled with these;
+                # the exported `config_versions` table resolves each id to its
+                # parameters and code fingerprint.
+                "configuration_identity": config.config_record(),
                 "tables": {},
                 "raw_feed": [],
                 "artifacts": {},
