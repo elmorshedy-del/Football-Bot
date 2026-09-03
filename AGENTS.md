@@ -57,6 +57,80 @@ These instructions apply to the entire repository.
 - Make failures, stale data, missing coverage, and disconnections visible; do not swallow them.
 - Do not deploy or merge the implementation PR until the requested independent final review passes.
 
+## Engineering change log
+
+`docs/ENGINEERING_CHANGE_LOG.md` is the record the original architect reads to
+understand what changed and why **without** reading the implementation history.
+Commit messages are not a substitute: they are per-commit, they are not indexed
+by day, and they do not carry validation results or outstanding risk.
+
+This is distinct from `docs/DUAL_SLEEVE_CHANGELOG.md`, which is the scoped
+implementation record for the PR 12/13 dual-sleeve contract and stays as it is.
+Work inside that contract still updates that file; **all** code change,
+including that work, also appends here.
+
+**Every change to `app/`, `static/`, `Dockerfile`, `railway.json`, or any
+strategy parameter default appends an entry before that work is handed back.**
+Documentation-only edits and test-only edits that accompany a logged change are
+covered by that change's entry and need no separate one.
+
+Rules:
+
+- **Append, never rewrite.** Past entries are a record of what was believed at
+  the time. If an entry turns out to be wrong, add a dated follow-up entry that
+  corrects it and say which entry it corrects. Do not edit history.
+- **Newest first.** Newest day at the top; newest change first within a day.
+- **One entry per logical change**, not per commit and not per file. A change
+  spanning three files is one entry; three unrelated fixes in one commit are
+  three entries.
+- **Identify entries as `CHG-YYYY-MM-DD-NNN`**, numbered within the day in the
+  order the work was done, so `-001` is the first change of that day.
+- **Cite evidence, not adjectives.** "Improved latency" is not an entry.
+  "Arrival p95 7,018 ms against a 250 ms threshold, n=34" is. Quote real
+  measurements with their sample size. If a number came from production, say so.
+- **Record what you checked and did *not* change.** A defect you investigated
+  and disproved is worth more than silence, because it stops the next person
+  re-investigating it. See CHG-2026-09-03-006 for the shape.
+- **State residual risk honestly.** An entry with an empty risk section had
+  better deserve it.
+
+Each entry uses these headings, in this order:
+
+```markdown
+### CHG-YYYY-MM-DD-NNN — <imperative summary>
+
+**Commit:** <sha(s)>
+**Components:** <files and modules touched>
+
+**Observed / original behaviour.** What was seen, with measurements, and what
+the code did before.
+
+**Root cause.** The actual technical cause. If the change is a design gap
+rather than a defect, say so explicitly.
+
+**Why necessary.** What breaks, stays unmeasurable, or stays wrong without it.
+
+**Exact change.** What was implemented, specifically enough to review without
+the diff.
+
+**Before / after.** Concrete expected behaviour on both sides, ideally the same
+input evaluated against both.
+
+**Reasoning and trade-offs.** Alternatives considered and why they were
+rejected. Record the option you did not take.
+
+**Validation.** Tests added and what they assert; suite result; any validation
+against real or production data, with numbers.
+
+**Risks / limitations.** Side effects, data that stays wrong, and what the
+change does not fix.
+
+**Follow-up.** Remaining work, or "None."
+```
+
+Start each day's section with the branch, base commit, commit list, diff
+totals, suite counts before and after, and current deployment status.
+
 ## Required validation
 
 Run the specification's targeted tests plus the full CI-equivalent suite:

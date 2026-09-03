@@ -227,6 +227,14 @@ Results are available at `/api/goal-latency`. Positive `last_book_lead_ms` or
 change. Each result retains the raw live-data object and complete pre-score market
 window in `detail` for independent review.
 
+## Change history
+
+[`docs/ENGINEERING_CHANGE_LOG.md`](docs/ENGINEERING_CHANGE_LOG.md) records every
+change with its evidence, root cause, trade-offs, validation results, residual
+risk, and follow-ups. Read it before changing strategy behaviour: several
+entries exist because a plausible-looking change was measured and rejected.
+Appending to it is mandatory, in the format `AGENTS.md` prescribes.
+
 ## Architecture
 
 ```mermaid
