@@ -14,7 +14,7 @@ from app.match_clock import (
     stamp_from_observation,
     unusable_stamp,
 )
-from app import store
+from app import config, store
 
 
 class ClockParserTests(unittest.TestCase):
@@ -221,10 +221,14 @@ class ClockLineageAndFreshnessTests(unittest.TestCase):
         t.promote("EV", 42)
         self.assertEqual(t.coverage({"EV"}, now=1000.1)["clock_fresh"], 1)
         self.assertEqual(t.stamp("EV", 1000.1)["gate_outcome"], "clock_88_plus")
-        late = t.coverage({"EV"}, now=1010.0)
+        # Derived from the configured bound rather than a literal: the bound is
+        # tuned against measured feed latency, and this test asserts the two
+        # readers agree about it, not what its value happens to be.
+        stale_at = 1000.0 + (config.MATCH_CLOCK_MAX_AGE_MS / 1000.0) + 1.0
+        late = t.coverage({"EV"}, now=stale_at)
         self.assertEqual(late["clock_fresh"], 0)
         self.assertEqual(late["clock_stale"], 1)
-        self.assertEqual(t.stamp("EV", 1010.0)["gate_outcome"], "clock_stale")
+        self.assertEqual(t.stamp("EV", stale_at)["gate_outcome"], "clock_stale")
         self.assertIn("stale", [row["reason"] for row in late["faults"]])
 
 

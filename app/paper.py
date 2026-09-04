@@ -280,6 +280,16 @@ class PaperDesk:
             return self._finalize_entry_outcome(
                 pending, "rejected_cap", now_wall, fill.levels,
             )
+        # Lower bound, mirroring the cap above. A fixed dollar notional buys
+        # contracts as 1/price, so a cheap leg quietly carries several times the
+        # exposure of an expensive one on the outcome the market has just marked
+        # down. The signal and its forward path are already recorded by this
+        # point, so refusing here removes the trade from the ledger while the
+        # evidence about whether the floor was right keeps accruing.
+        if config.PRICE_FLOOR > 0 and fill.vwap < config.PRICE_FLOOR:
+            return self._finalize_entry_outcome(
+                pending, "rejected_floor", now_wall, fill.levels,
+            )
         # The snapshot must be deep enough to re-verify the walk it is evidence
         # for.  At the fixed default depth a fill that walked further than the
         # snapshot recorded could never be checked, and K1 read that missing
@@ -426,6 +436,10 @@ class PaperDesk:
         if size < 1:
             return "rejected_cap"
         entry_px = vwap_num / size
+        # Same lower bound as the V2 adapter, so the two paths cannot disagree
+        # about which entries are eligible.
+        if config.PRICE_FLOOR > 0 and entry_px < config.PRICE_FLOOR:
+            return "rejected_floor"
         tid = store.insert_trade({
             "signal_id": signal_id, "market": sig["ticker"], "event": meta["event"],
             "series": meta["series"], "dir": sig["dir"], "side": side,

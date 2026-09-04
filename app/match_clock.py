@@ -395,7 +395,11 @@ def evaluate_clock_gate(parsed, age_ms, mapped=True):
         return False, "clock_future", False, "future_timestamp"
     if age_ms is None or age_ms > clock_max_age_ms():
         return False, "clock_stale", False, "stale"
-    if parsed.provider_minute < 88:
+    # The outcome labels keep the historical `88` wording even though the
+    # threshold is configurable, because they are stable identifiers already
+    # written across the study; renaming them would break comparability with
+    # every row recorded so far.
+    if parsed.provider_minute < config.SLEEVE_MIN_MINUTE:
         return False, "clock_pre_88", False, "pre_88"
     return True, "clock_88_plus", True, None
 

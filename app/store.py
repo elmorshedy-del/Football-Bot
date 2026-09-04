@@ -1664,8 +1664,13 @@ def _strategy_summary(closed, open_t, signals, latency_evidence):
     for row in signals:
         outcome = row.get("outcome") or "unknown"
         signal_counts[outcome] = signal_counts.get(outcome, 0) + 1
+    # A confirmed signal is one that reached the execution stage, whether or not
+    # it produced a fill. `rejected_floor` belongs here for the same reason
+    # `rejected_cap` does: the episode was real and eligible, and the price
+    # bound is what declined it.
     confirmed_outcomes = {
-        "filled", "rejected_cap", "no_book", "killed", "expired", "unsupported_fee",
+        "filled", "rejected_cap", "rejected_floor", "no_book", "killed",
+        "expired", "unsupported_fee",
     }
     n_conf = sum(count for outcome, count in signal_counts.items()
                  if outcome in confirmed_outcomes)

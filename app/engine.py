@@ -674,7 +674,8 @@ class Engine:
             "size": cand["size"], "ref": cand["ref"], "ext": cand["ext"],
             "conf_lag_ms": lag, "outcome": outcome, "ts": time.time(),
             "strategy": cand.get("strategy")}})
-        icon = {"filled": "🎯", "rejected_cap": "🧢", "unconfirmed": "👻"}.get(outcome, "•")
+        icon = {"filled": "🎯", "rejected_cap": "🧢", "rejected_floor": "🪣",
+                "unconfirmed": "👻"}.get(outcome, "•")
         store.log_event("signal", f"{icon} {outcome.upper()} {cand['ticker']} "
                                   f"dl={cand['dl']} lv={cand['levels']} "
                                   f"conf={f'{lag:+.0f}ms' if lag is not None else '—'}")
@@ -1109,6 +1110,9 @@ class Engine:
                     self.market_window,
                     clock_tracker=self.clock_tracker,
                 )
+                # Mapping resolution runs separately so its sequential REST
+                # calls can never delay a clock confirmation (see mapping_task).
+                asyncio.create_task(self.goal_latency.mapping_task())
                 asyncio.create_task(self.goal_latency.run())
             store.log_event("sys", "engine started in LIVE mode")
         else:
