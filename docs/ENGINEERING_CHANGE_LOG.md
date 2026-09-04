@@ -21,6 +21,108 @@ They were written before any code changed today and are left below in the order
 they were written. Entries `-004` to `-006`, which follow immediately and do
 change code, are ordered newest first per `AGENTS.md`.
 
+### CHG-2026-09-04-007 — Lower the sleeve minute floor to 80
+
+**Commit:** `<this commit>`
+**Components:** `app/config.py`, `.env.example`,
+`tests/test_price_floor_and_clock.py`, `tests/test_match_clock.py`,
+`tests/test_engine_signal.py`
+
+**Corrects CHG-2026-09-04-006**, which made `SLEEVE_MIN_MINUTE` configurable
+and stated that the default was deliberately left at 88 because the timing
+study was not precise enough to name a replacement. That reasoning was
+incomplete. It treated the threshold as an estimate of the optimum, when its
+actual job is to bound which minutes are ever observed.
+
+**Observed / original behaviour.** With the default at 88, the sleeve can only
+ever fire at minute 88 or later, so no data is generated below 88 and the
+threshold can never be fitted from this venue's own clock. On the most recent
+500 provider observations (484 `live`), eligible coverage by floor:
+
+| Floor | Eligible observations | vs. 88 |
+|---|---|---|
+| 88 | 61 | — |
+| 85 | 85 | +39% |
+| 82 | 109 | +79% |
+| **80** | **125** | **+105%** |
+| 75 | 164 | +169% |
+
+**Root cause.** Design gap in how the threshold was reasoned about, not a
+defect. The Polymarket study put the shock inflection at minutes 86-90 on an
+inferred clock measured to run about 5 minutes fast, back-calibrating to
+roughly 81-85 with several minutes of uncertainty either side. Setting the
+floor *inside* that band censors the sample exactly where the answer lies: at
+85, an optimum of 82 could never be observed, because nothing below 85 fires.
+A floor is a sampling bound; it should sit below the lowest plausible optimum,
+not at the best point estimate of it.
+
+**Why necessary.** Without it the number stays frozen at a value derived from a
+cross-venue inference on an unreliable clock, and no forward evidence can ever
+contradict it. The precondition named in CHG-2026-09-04-006's follow-up — a
+forward study on Kalshi's own provider clock — cannot run while the gate
+prevents the observations it needs.
+
+**Exact change.** `SLEEVE_MIN_MINUTE` default 88 -> 80 in `config.py` and
+`.env.example`. No gate logic changed; the parameter was already read from
+config and already in `STRATEGY_PARAM_NAMES`, so the change produces a new
+`config_id` and the 88-era and 80-era rows cannot pool.
+
+Three existing tests asserted the 87/88 boundary against the default and would
+have silently tracked whatever the default became. They are now pinned with
+`patch.object(config, "SLEEVE_MIN_MINUTE", 88)` so they keep testing the
+property they were written for — a below-threshold minute refuses and
+short-circuits before the classifier — independent of what ships.
+
+**Before / after.** Minute 82 in the second half: refused as `clock_pre_88`
+before, accepted as `clock_88_plus` after. Minute 79 still refuses. Roughly
+double the clock observations become gate-eligible, per the table above.
+
+**Reasoning and trade-offs.** 85 was rejected because it sits inside the
+estimated band and censors the answer. 75 was rejected because it doubles the
+exposure again for margin there is no evidence is needed, and the whole thesis
+is convexity near the whistle — minutes far from it are expected to be worse,
+not merely unmeasured. 80 sits about one minute below the bottom of the
+calibrated band, which covers the study's uncertainty without paying for
+margin beyond it.
+
+The admitted cost is explicit: this fires trades in a regime the study suggests
+is worse than the latest minutes. That is the point — every fired trade records
+its `provider_minute` and forward path, so the minute becomes a measured
+variable rather than a guess. `PRICE_FLOOR` (CHG-2026-09-04-004) bounds what
+the sample can cost, since entry price and not minute was the dominant loss
+driver: the counterfactual on the 68-trade history was -$843.60 -> +$85.38 from
+the price bound alone, with no minute change at all.
+
+Also verified, and worth recording so it is not re-investigated: the
+expiration-time window (`SLEEVE_START_BEFORE_EXPIRY_MIN` /
+`SLEEVE_AFTER_EXPIRY_MIN`) is **not** a second gate that would blunt this.
+`audit.schedule_window` is read only by `main.py` for per-signal display; the
+dead gate that once used it was removed in CHG-2026-09-03-006. The clock stamp
+at `engine.py:636` is the only minute constraint on the sleeve path.
+
+**Validation.** 2 new tests: the shipped default gates where it claims to
+(accepts at the default, refuses one below) — the only test that exercises the
+deployed value, since every other minute test now pins its own; and the default
+is asserted to sit at or below 81 and at or above 70, which fails loudly if
+someone later moves it into the estimated band. Full suite 394 passing, lint
+and compile clean. Sizing computed against 500 live production observations.
+
+**Risks / limitations.** This is a deliberate widening of the trading window on
+the strength of a study whose clock this log has already recorded as unreliable
+(about 5 minutes fast, 9-11 minute inter-match IQR). If the convexity thesis is
+right, minutes 80-87 will be measurably worse than 88+ and the floor should
+come back up — that is the expected finding, not a failure. Loss accrual per
+unit time should be expected to rise, bounded by `PRICE_FLOOR` and by the
+sleeve's other admission gates, which remain unvalidated bootstrap numbers that
+have still never been exercised against live data. K2 currently reads FAIL with
+`[-31.57, +6.11]` at n=325; widening the window does not improve that and will
+mix two minute regimes within the new `config_id`.
+
+**Follow-up.** Once a forward sample accumulates, bucket sleeve outcomes by
+`provider_minute` and look for the inflection on Kalshi's own clock. That is
+the study that should set this number permanently, and it is now possible to
+run. Until it does, 80 is a sampling floor and not a claim about the optimum.
+
 ### CHG-2026-09-04-006 — Make the sleeve minute configurable
 
 **Commit:** `635cff0`

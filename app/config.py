@@ -165,7 +165,24 @@ MATCH_CLOCK_MAX_AGE_MS = _f("MATCH_CLOCK_MAX_AGE_MS", 10000.0)
 # Match minute at which the price-only sleeve becomes eligible. Previously
 # hard-coded as 88 inside the gate. Made configurable so it can be moved
 # deliberately, and so it enters the strategy configuration fingerprint.
-SLEEVE_MIN_MINUTE = _i("SLEEVE_MIN_MINUTE", 88)
+#
+# 80, and deliberately *below* the best estimate of the optimum rather than at
+# it. The Polymarket timing study put the shock inflection at minutes 86-90 on
+# an inferred clock measured to run about 5 minutes fast, which back-calibrates
+# to roughly 81-85 with several minutes of uncertainty either side. A floor set
+# inside that band censors the data exactly where the answer lies: at 85 an
+# optimum of 82 could never be observed, because nothing below 85 would ever
+# fire. A floor at 80 puts the whole plausible band inside the sample, so the
+# threshold can be fitted from this venue's own provider clock rather than from
+# a cross-venue inference. On the most recent 500 provider observations it
+# roughly doubles eligible clock coverage: 61 at minute >= 88, 125 at >= 80.
+#
+# This admits candidates the study suggests are worse than the latest ones.
+# That is the intended cost: every fired trade records its `provider_minute`
+# and its forward path, so the minute becomes a measured variable instead of a
+# guess. `PRICE_FLOOR` bounds what the sample can cost, since entry price and
+# not minute was the dominant loss driver.
+SLEEVE_MIN_MINUTE = _i("SLEEVE_MIN_MINUTE", 80)
 # How often to re-resolve event -> milestone mappings. This runs on its own
 # task: it makes one sequential REST call per unmapped event, and doing that
 # inside the clock poll loop blocked the refresh for seconds at a time.

@@ -247,7 +247,11 @@ class ClockGateAndStampTests(unittest.TestCase):
             "source": "kalshi_live_data_batch",
         }
 
+    @patch.object(config, "SLEEVE_MIN_MINUTE", 88)
     def test_87_rejects_88_and_stoppage_accept(self):
+        """Boundary behaviour of the gate, pinned at 88 rather than reading the
+        shipped default, so this keeps asserting `threshold - 1 refuses,
+        threshold accepts` however the default is later tuned."""
         for minute, stoppage, accepted, outcome in (
             (87, None, False, "clock_pre_88"),
             (88, None, True, "clock_88_plus"),
@@ -296,8 +300,14 @@ class ClockGateAndStampTests(unittest.TestCase):
             with self.subTest(status=raw):
                 self.assertEqual(normalize_status(raw), expected)
 
+    @patch.object(config, "SLEEVE_MIN_MINUTE", 88)
     def test_second_half_88_reaches_the_gate(self):
-        """The exact production shape: minute 88, period 2nd, status 2nd_half."""
+        """The exact production shape: minute 88, period 2nd, status 2nd_half.
+
+        Pinned at 88 because this is the regression test for the status fix, and
+        it must keep testing the status matcher rather than the current
+        threshold. Minute 87 appears below as the one-below-threshold case.
+        """
         stamp = stamp_from_observation(
             self.observation(88, None, "2nd", "2nd_half"), "E", 100.2,
         )

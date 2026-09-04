@@ -124,6 +124,24 @@ class SleeveMinuteTests(unittest.TestCase):
             self.assertEqual(self.gate(84)["outcome"], "clock_pre_88")
             self.assertEqual(self.gate(85)["outcome"], "clock_88_plus")
 
+    def test_the_shipped_default_gates_where_it_claims_to(self):
+        """Every other minute test pins the threshold, so this is the only one
+        that exercises the value actually deployed."""
+        default = config.SLEEVE_MIN_MINUTE
+        self.assertTrue(self.gate(default)["accepted"])
+        self.assertFalse(self.gate(default - 1)["accepted"])
+
+    def test_the_default_sits_below_the_estimated_optimum(self):
+        """The floor is a sampling bound, not a guess at the answer.
+
+        The timing study back-calibrates the shock inflection to roughly minute
+        81-85. A floor inside that band would censor the data exactly where the
+        answer lies, so the default must sit below it and stay a plausible
+        late-game minute.
+        """
+        self.assertLessEqual(config.SLEEVE_MIN_MINUTE, 81)
+        self.assertGreaterEqual(config.SLEEVE_MIN_MINUTE, 70)
+
     def test_the_minute_is_part_of_the_configuration_identity(self):
         before = config.config_id()
         with patch.object(config, "SLEEVE_MIN_MINUTE", 85):
