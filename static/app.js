@@ -92,7 +92,8 @@ function leagueName(series) { return state.config.league_names?.[series] || seri
 
 const outcomeLabels = {
   filled: "Paper order filled", queued: "Paper order queued", executing: "Checking executable depth",
-  rejected_cap: "Declined: executable price exceeded cap", no_book: "Declined: no valid arrival order book",
+  rejected_cap: "Declined: executable price exceeded cap",
+  rejected_floor: "Declined: executable price below floor", no_book: "Declined: no valid arrival order book",
   killed: "Declined: kill switch active", expired: "Declined: market expired before arrival",
   unsupported_fee: "Declined: fee schedule could not be verified", unconfirmed: "Ignored: no coherent sibling confirmation",
   not_late: "Ignored: outside Gate A late window", strategy_lockout: "Ignored: sleeve re-entry lockout",

@@ -385,12 +385,32 @@ class GoalLatencyObserver:
             )
         self.pending = remaining
 
+    async def mapping_task(self):
+        """Resolve event -> milestone mappings on their own slower cadence.
+
+        This used to run inside `run()`, before every poll. It makes one
+        sequential REST call per unmapped event, and leagues Kalshi has no
+        milestone for never resolve, so the call is retried for each of them
+        every 30 s forever. That blocked the clock refresh for seconds at a
+        time: measured `match_clock_age_ms` was p50 6099 ms against a poll
+        interval of 250 ms, which starved the 88+ gate of fresh clocks and left
+        the sleeve unable to admit a single candidate.
+
+        Mapping changes on the discovery timescale, not the poll timescale, so
+        it belongs on its own task where it cannot delay a clock confirmation.
+        """
+        while True:
+            try:
+                await self._resolve_new_events()
+            except Exception as exc:  # noqa: BLE001
+                self.last_error = f"{type(exc).__name__}: {exc}"
+            await asyncio.sleep(max(config.CLOCK_MAPPING_INTERVAL_S, 1.0))
+
     async def run(self):
         delay = max(config.GOAL_LATENCY_POLL_MS, 50.0) / 1000.0
         while True:
             loop_started = time.monotonic()
             try:
-                await self._resolve_new_events()
                 await self._poll()
                 await self._finish_pending()
                 self.last_error = None

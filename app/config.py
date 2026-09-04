@@ -56,6 +56,17 @@ CONF_WAIT_S = _f("CONF_WAIT_S", 2.0)
 CONF_TRADE_MAX_AGE_S = _f("CONF_TRADE_MAX_AGE_S", 0.2)
 CONF_SIGN = _b("CONF_SIGN", True)       # sibling must move opposite sign (validated improvement)
 PRICE_CAP = _f("PRICE_CAP", 58.0)       # max price paid (isotonic zero-crossing, late regime)
+# Minimum executable price. Below this the entry is refused as `rejected_floor`,
+# but the signal and its forward path are still recorded, exactly as
+# `rejected_cap` handles the upper bound, so the evidence keeps accruing.
+#
+# Sub-35c entries were 41% of trades and 73% of all contract exposure, because a
+# fixed dollar notional buys contracts as 1/price: $100 is ~727 contracts at
+# 13.8c against ~176 at 57c. That bucket lost 22 of 27, and every one of the six
+# with a recorded MFE never traded above entry even once. The hypothesis was
+# stated from trades 1-61 and then reproduced out of sample on trades 83-89.
+# Set to 0 to disable the floor entirely.
+PRICE_FLOOR = _f("PRICE_FLOOR", 35.0)
 NOTIONAL_USD = _f("NOTIONAL_USD", 100.0)
 TARGET = _f("TARGET", 90.0)             # take-profit (YES-space for longs, mirrored for NO)
 TIMEOUT_S = _i("TIMEOUT_S", 180)        # max hold before flattening
@@ -136,7 +147,46 @@ EVENT_MATCH_WINDOW_S = _f("EVENT_MATCH_WINDOW_S", 20.0)
 # nothing in the trading path reads it.
 SIGNAL_PATH_WINDOW_S = _f("SIGNAL_PATH_WINDOW_S", 300.0)
 SIGNAL_PATH_MAX_TRACKED = _i("SIGNAL_PATH_MAX_TRACKED", 400)
-MATCH_CLOCK_MAX_AGE_MS = _f("MATCH_CLOCK_MAX_AGE_MS", 2500.0)
+# Maximum age of a persisted match-clock confirmation used by the 88+ gate.
+#
+# Was 2500 ms, derived as ten 250 ms poll intervals. Live capture measured
+# match_clock_age_ms at p50 6099 ms, so the bound rejected the great majority of
+# candidates and the sleeve never admitted one: 12 `sleeve_clock_stale` refusals
+# and 42 cumulative gate misses, against zero sleeve trades ever.
+#
+# The bound should be proportional to how fast the underlying signal changes,
+# and a provider minute changes once per 60 s. Staleness is also directionally
+# safe for this gate: match minute only increases, so a stale reading of minute
+# M means the true minute is >= M, and `minute >= threshold` can therefore only
+# refuse an eligible candidate, never admit an ineligible one. The residual risk
+# it does carry is entering shortly after a final whistle the stale clock has
+# not yet reflected, which is what bounds this at ten seconds rather than sixty.
+MATCH_CLOCK_MAX_AGE_MS = _f("MATCH_CLOCK_MAX_AGE_MS", 10000.0)
+# Match minute at which the price-only sleeve becomes eligible. Previously
+# hard-coded as 88 inside the gate. Made configurable so it can be moved
+# deliberately, and so it enters the strategy configuration fingerprint.
+#
+# 80, and deliberately *below* the best estimate of the optimum rather than at
+# it. The Polymarket timing study put the shock inflection at minutes 86-90 on
+# an inferred clock measured to run about 5 minutes fast, which back-calibrates
+# to roughly 81-85 with several minutes of uncertainty either side. A floor set
+# inside that band censors the data exactly where the answer lies: at 85 an
+# optimum of 82 could never be observed, because nothing below 85 would ever
+# fire. A floor at 80 puts the whole plausible band inside the sample, so the
+# threshold can be fitted from this venue's own provider clock rather than from
+# a cross-venue inference. On the most recent 500 provider observations it
+# roughly doubles eligible clock coverage: 61 at minute >= 88, 125 at >= 80.
+#
+# This admits candidates the study suggests are worse than the latest ones.
+# That is the intended cost: every fired trade records its `provider_minute`
+# and its forward path, so the minute becomes a measured variable instead of a
+# guess. `PRICE_FLOOR` bounds what the sample can cost, since entry price and
+# not minute was the dominant loss driver.
+SLEEVE_MIN_MINUTE = _i("SLEEVE_MIN_MINUTE", 80)
+# How often to re-resolve event -> milestone mappings. This runs on its own
+# task: it makes one sequential REST call per unmapped event, and doing that
+# inside the clock poll loop blocked the refresh for seconds at a time.
+CLOCK_MAPPING_INTERVAL_S = _f("CLOCK_MAPPING_INTERVAL_S", 15.0)
 
 # --- Market discovery ---
 DISCOVERY_INTERVAL_S = _i("DISCOVERY_INTERVAL_S", 180)
@@ -251,7 +301,8 @@ STRATEGY_PARAM_NAMES = (
     "SLEEVE_OSCILLATION_CROSSES", "SLEEVE_MAX_OSCILLATION_EFFICIENCY",
     "SLEEVE_TIMEOUT_S", "PAPER_EXECUTION_V2", "PAPER_ENTRY_LATENCY_MS",
     "PAPER_EXIT_LATENCY_MS", "PAPER_EXECUTION_POLL_MS",
-    "MATCH_CLOCK_MAX_AGE_MS", "SOCCER_SERIES",
+    "MATCH_CLOCK_MAX_AGE_MS", "SLEEVE_MIN_MINUTE", "PRICE_FLOOR",
+    "SOCCER_SERIES",
 )
 
 # Source files whose contents decide what is traded and how it is filled.

@@ -14,7 +14,7 @@ from app.match_clock import (
     stamp_from_observation,
     unusable_stamp,
 )
-from app import store
+from app import config, store
 
 
 class ClockParserTests(unittest.TestCase):
@@ -221,10 +221,14 @@ class ClockLineageAndFreshnessTests(unittest.TestCase):
         t.promote("EV", 42)
         self.assertEqual(t.coverage({"EV"}, now=1000.1)["clock_fresh"], 1)
         self.assertEqual(t.stamp("EV", 1000.1)["gate_outcome"], "clock_88_plus")
-        late = t.coverage({"EV"}, now=1010.0)
+        # Derived from the configured bound rather than a literal: the bound is
+        # tuned against measured feed latency, and this test asserts the two
+        # readers agree about it, not what its value happens to be.
+        stale_at = 1000.0 + (config.MATCH_CLOCK_MAX_AGE_MS / 1000.0) + 1.0
+        late = t.coverage({"EV"}, now=stale_at)
         self.assertEqual(late["clock_fresh"], 0)
         self.assertEqual(late["clock_stale"], 1)
-        self.assertEqual(t.stamp("EV", 1010.0)["gate_outcome"], "clock_stale")
+        self.assertEqual(t.stamp("EV", stale_at)["gate_outcome"], "clock_stale")
         self.assertIn("stale", [row["reason"] for row in late["faults"]])
 
 
@@ -243,7 +247,11 @@ class ClockGateAndStampTests(unittest.TestCase):
             "source": "kalshi_live_data_batch",
         }
 
+    @patch.object(config, "SLEEVE_MIN_MINUTE", 88)
     def test_87_rejects_88_and_stoppage_accept(self):
+        """Boundary behaviour of the gate, pinned at 88 rather than reading the
+        shipped default, so this keeps asserting `threshold - 1 refuses,
+        threshold accepts` however the default is later tuned."""
         for minute, stoppage, accepted, outcome in (
             (87, None, False, "clock_pre_88"),
             (88, None, True, "clock_88_plus"),
@@ -292,8 +300,14 @@ class ClockGateAndStampTests(unittest.TestCase):
             with self.subTest(status=raw):
                 self.assertEqual(normalize_status(raw), expected)
 
+    @patch.object(config, "SLEEVE_MIN_MINUTE", 88)
     def test_second_half_88_reaches_the_gate(self):
-        """The exact production shape: minute 88, period 2nd, status 2nd_half."""
+        """The exact production shape: minute 88, period 2nd, status 2nd_half.
+
+        Pinned at 88 because this is the regression test for the status fix, and
+        it must keep testing the status matcher rather than the current
+        threshold. Minute 87 appears below as the one-below-threshold case.
+        """
         stamp = stamp_from_observation(
             self.observation(88, None, "2nd", "2nd_half"), "E", 100.2,
         )

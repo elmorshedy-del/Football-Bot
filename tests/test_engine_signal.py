@@ -196,7 +196,10 @@ class SignalPersistenceTests(unittest.TestCase):
         engine.late_score_sleeve.classify.assert_called_once()
         self.assertNotEqual(outcomes["price_only_late_score"], "sleeve_outside_window")
 
+    @patch("app.match_clock.config.SLEEVE_MIN_MINUTE", 88)
     def test_minute_87_fails_closed_and_skips_classifier(self):
+        """Pinned at 88 so this keeps asserting that a below-threshold minute
+        short-circuits before the classifier, whatever the shipped default is."""
         engine = self.make_engine()
         parsed = parse_current_clock({"time": "87'", "half": "2nd", "status": "live"})
         engine.clock_tracker.observe("E", "M", parsed, {
