@@ -15,8 +15,239 @@ after PR #17 merged as `1089af7`)
 **Deployment:** PR #17 live since 2026-09-03 12:01Z, `config_id`
 `630d7b0f702f23b1`, 23 h uptime at time of check.
 
-No code changed today. This is a post-deploy verification entry plus a research
-freeze, recorded because both carry findings that must not be lost.
+Entries `-001` to `-003` are observation only: a post-deploy verification and a
+research freeze, recorded because both carry findings that must not be lost.
+They were written before any code changed today and are left below in the order
+they were written. Entries `-004` to `-006`, which follow immediately and do
+change code, are ordered newest first per `AGENTS.md`.
+
+### CHG-2026-09-04-006 — Make the sleeve minute configurable
+
+**Commit:** `635cff0`
+**Components:** `app/config.py`, `app/match_clock.py`, `.env.example`,
+`tests/test_price_floor_and_clock.py`
+
+**Observed / original behaviour.** `evaluate_clock_gate` refused any candidate
+with `parsed.provider_minute < 88`, written as a literal. The number could not
+be changed without editing the gate, and because it was not a configuration
+parameter it was absent from `STRATEGY_PARAM_NAMES`, so two runs with different
+thresholds would have carried the same `config_id` and pooled in every summary.
+
+**Root cause.** Design gap, not a defect. 88 was one of the educated guesses the
+README already flags; it was written as a constant before there was any data to
+argue with it.
+
+**Why necessary.** The Polymarket timing study (CHG-2026-09-04-003) is the first
+evidence bearing on this number, and its conclusion is that 88 is *probably* a
+few minutes late. That is not enough to move the default, but the number has to
+become movable and fingerprinted before it can ever be moved and measured.
+Without the fingerprint, an era at 88 and an era at 85 would silently average.
+
+**Exact change.** `SLEEVE_MIN_MINUTE = _i("SLEEVE_MIN_MINUTE", 88)` added to
+`config.py` and to `STRATEGY_PARAM_NAMES`; the literal in `evaluate_clock_gate`
+replaced by `config.SLEEVE_MIN_MINUTE`. The returned outcome labels
+(`clock_pre_88`, `clock_88_plus`) keep their `88` wording. Documented in
+`.env.example` with a pointer to the research log.
+
+**Before / after.** Behaviour at the default is byte-identical: minute 87
+refuses, 88 accepts. With `SLEEVE_MIN_MINUTE=85`, minute 85 now accepts where it
+previously refused, and `config_id` changes, so the two eras never pool.
+
+**Reasoning and trade-offs.** Renaming the outcome labels to track the threshold
+was considered and rejected: `clock_pre_88` is already written across every
+recorded row and the sleeve funnel keys off it, so renaming would break
+comparability with all history for a cosmetic gain. The labels are identifiers,
+not descriptions; the threshold that produced them is recoverable from the
+`config_id` on the row. **The default was deliberately not changed.** The study
+puts the shock inflection near minute 80-85 on a clock measured to run about
+5 minutes fast with a 9-11 minute inter-match IQR, which is enough to say "88 is
+probably late" and not enough to name a replacement.
+
+**Validation.** 3 tests: the threshold is honoured at 85 and at 88 with the
+boundary checked on both sides; outcome labels stay stable when the threshold
+moves; a threshold change produces a different `config_id`. Full suite 392
+passing.
+
+**Risks / limitations.** The label wording is now potentially misleading to a
+reader who does not check the `config_id` — `clock_pre_88` at a threshold of 85
+means "before 85". This is documented in the code comment and is the accepted
+cost of comparability. Nothing here makes 88 more or less correct.
+
+**Follow-up.** The Kalshi provider clock, not Polymarket's inferred one, should
+settle the number. `sleeve_clock_pre_88` rejections now record
+`provider_minute`, and signals record forward paths, so a forward study of
+"what did the price do after minute M" can be run on this venue's own clock
+without changing the threshold at all. That study is the precondition for
+moving the default.
+
+### CHG-2026-09-04-005 — Stop the mapping loop starving the match clock
+
+**Commit:** `635cff0`
+**Components:** `app/goal_latency.py`, `app/engine.py`, `app/config.py`,
+`.env.example`, `tests/test_price_floor_and_clock.py`,
+`tests/test_match_clock.py`
+
+**Observed / original behaviour.** After the status fix in CHG-2026-09-03-001
+the sleeve reached the clock gate for the first time and was then refused on
+freshness: `sleeve_clock_stale` was the largest new rejection bucket (12), and
+the sleeve still had **zero trades ever**. Production `match_clock_age_ms` ran
+at **p50 6099 ms** against a `MATCH_CLOCK_MAX_AGE_MS` of 2500 ms, on a poll
+loop configured at 250 ms.
+
+**Root cause.** Two causes, both real.
+
+First, `GoalLatencyObserver.run` called `await self._resolve_new_events()` at
+the top of every poll iteration. That method makes one sequential REST call per
+unmapped event, and leagues for which Kalshi publishes no milestone feed never
+resolve, so those calls were retried for every such event on every pass,
+forever. The poll loop's effective period was therefore set by mapping latency,
+not by `GOAL_LATENCY_POLL_MS`.
+
+Second, 2500 ms was itself the wrong bound. It was derived as ten poll
+intervals — a property of the code's own cadence, not of the thing being
+measured. The signal is a provider match minute, which changes once per 60 s.
+
+**Why necessary.** Without it the sleeve cannot admit a single candidate. Every
+sleeve threshold in the config is an unvalidated bootstrap number and none of
+them can begin to be measured while the gate upstream of them never opens.
+
+**Exact change.** `_resolve_new_events` removed from `run()` and moved into a
+new `mapping_task()` coroutine that loops on
+`CLOCK_MAPPING_INTERVAL_S` (default 15 s) with its own exception capture;
+`engine.py` starts it as a separate task alongside `run()`.
+`MATCH_CLOCK_MAX_AGE_MS` default raised 2500 -> 10000 ms.
+
+**Before / after.** The exact production shape — a clock confirmed 6099 ms ago
+at minute 90 in the second half — returned `clock_stale` before and returns
+`clock_88_plus` after. A clock 45 s old still returns `clock_stale`. The poll
+loop's period is now bounded by `GOAL_LATENCY_POLL_MS` rather than by the
+number of unmappable events in the current window.
+
+**Reasoning and trade-offs.** Raising the bound without splitting the loop was
+rejected: it would have hidden a starved poll loop behind a looser threshold,
+and the tail (p95 was far worse than p50) would still have refused candidates
+intermittently and unpredictably. Splitting without raising the bound was also
+rejected: even a healthy 250 ms loop plus feed transport does not reliably stay
+under 2500 ms, as the K4 investigation already established a 228 ms feed
+transport floor.
+
+Ten seconds rather than sixty is the deliberate choice. Staleness is
+*directionally safe* for this gate — match minute only increases, so a stale
+reading of minute M implies a true minute >= M, and a `minute >= threshold` test
+can therefore only refuse an eligible candidate, never admit an ineligible one.
+The one risk staleness does carry is the opposite edge: entering just after a
+final whistle that a stale clock has not yet reflected. Ten seconds bounds that
+exposure while sitting comfortably above the observed p50.
+
+**Validation.** 4 tests: the measured 6099 ms staleness now passes; a 45 s clock
+still fails closed; the bound is asserted to sit between the observed p50 and a
+provider minute; and `run()` is asserted by source inspection to no longer
+resolve mappings while `mapping_task` does. `tests/test_match_clock.py`
+B2b was rewritten to derive its stale timestamp from
+`config.MATCH_CLOCK_MAX_AGE_MS` rather than the old 2500 ms literal, so it
+asserts that coverage and the gate agree about the bound rather than what the
+bound is. Full suite 392 passing.
+
+**Risks / limitations.** This does not prove the sleeve will now trade; it
+removes the freshness refusal and hands the decision to the sleeve's own
+unvalidated admission thresholds, which have still never been exercised. The
+final-whistle edge above is bounded, not eliminated. `mapping_task` swallows
+exceptions into `last_error` exactly as `run()` does, so a permanently failing
+mapping endpoint degrades silently rather than crashing — same behaviour as
+before, now on a separate task. Mappings for a newly discovered event are
+resolved up to 15 s later than before.
+
+**Follow-up.** Re-measure `match_clock_age_ms` after deploy. If p95 still
+exceeds 10 s, the residual cause is transport rather than loop scheduling and
+should be investigated as part of K4 rather than by loosening the bound again.
+
+### CHG-2026-09-04-004 — Refuse sub-floor entries, keep the evidence
+
+**Commit:** `635cff0`
+**Components:** `app/config.py`, `app/paper.py`, `app/store.py`,
+`app/engine.py`, `static/app.js`, `.env.example`,
+`tests/test_price_floor_and_clock.py`
+
+**Observed / original behaviour.** Entry price is the dominant driver of the
+loss, established from trades 1-61 on 2026-09-03 and confirmed out of sample on
+trades 83-89 (CHG-2026-09-04-002). Over all 68 closed trades:
+
+| Bucket | n | Net | Losers | Contracts |
+|---|---|---|---|---|
+| All, as traded | 68 | **-$843.60** | 41 (60%) | 21,977 |
+| Entry >= 35c | 41 | **+$85.38** | 19 (46%) | 5,964 |
+| Entry < 35c | 27 | **-$928.98** | 22 (81%) | 16,012 |
+
+The cheap bucket is 40% of trades and **73% of all contract exposure**. Of the
+cheap trades with a recorded MFE, none ever traded above entry even once.
+`PRICE_CAP` bounded the top of the range at 58c; nothing bounded the bottom.
+
+**Root cause.** The sizing rule. `NOTIONAL_USD` is a fixed dollar amount, so
+contract count scales as 1/price: $100 buys ~727 contracts at 13.8c against
+~176 at 57c. The strategy therefore takes its largest positions, by a factor of
+four, on exactly the outcome the market has just marked down hardest — and pays
+a quadratic fee on every one of those contracts. This is a design gap in the
+interaction between sizing and entry, not a bug in either.
+
+**Why necessary.** The cheap bucket is not a tail: it is the loss. Its 80%+
+loss frequency reproduces independently in both build eras, so it is not an
+artefact of a fixed bug. Continuing to take those entries spends capital to
+re-confirm something already confirmed twice.
+
+**Exact change.** `PRICE_FLOOR = _f("PRICE_FLOOR", 35.0)` added to `config.py`
+and to `STRATEGY_PARAM_NAMES`. Both entry paths check it: the V2 adapter
+(`_execute_entry`) after the fill VWAP is computed, returning `rejected_floor`
+through `_finalize_entry_outcome` so the arrival book and fill levels are still
+persisted; and the legacy `try_enter` path against `entry_px`, so the two cannot
+disagree about eligibility. `rejected_floor` added to `confirmed_outcomes` in
+`store._strategy_summary`, to the engine's event icon map, and to the dashboard
+outcome labels. `PRICE_FLOOR=0` disables the bound.
+
+**Before / after.** Same 68 trades: **net -$843.60 as traded, +$85.38 with the
+floor applied**, keeping 41 of 68 trades (60%) and 27% of contract exposure. A
+sub-floor candidate that previously opened a trade now records a signal with
+outcome `rejected_floor`, no trade row, and a forward path — the same treatment
+`rejected_cap` already gives the upper bound.
+
+**Reasoning and trade-offs.** Three alternatives were considered and rejected.
+*Fixed contract count instead of fixed notional* addresses the same mechanism
+but changes the sizing of every trade including the profitable band, which is a
+larger and less reversible change than bounding the range. *Doing nothing and
+collecting more data* was the standing position and was reconsidered honestly:
+it was correct while the finding was in-sample only, and the out-of-sample
+confirmation is what changed it. *Refusing the signal outright* rather than the
+fill was rejected because it would destroy the evidence needed to ever revisit
+the floor.
+
+The floor is deliberately implemented as a refusal at the execution stage, not
+a filter at detection, so the counterfactual stays measurable: every refused
+episode still records its signal and forward path, and whether the floor was
+right can be re-decided from the database rather than re-argued from memory.
+
+It must be said plainly that 35c was chosen after seeing the data. Every
+confidence interval on this still spans zero, and K2 currently reads FAIL with
+`[-31.57, +6.11]` at n=325. This is a pre-registered challenger being tested
+forward, not a validated parameter. It enters the config fingerprint, so the
+before and after eras cannot pool.
+
+**Validation.** 4 tests: a floor change produces a new `config_id`; a
+`rejected_floor` signal persists with no trade row; `rejected_floor` counts as a
+confirmed signal so the floor cannot silently shrink the K2 denominator; and a
+zero floor disables the bound. Counterfactual computed against the real 68-trade
+production history, table above. Full suite 392 passing.
+
+**Risks / limitations.** The floor is fitted to 68 trades with wide intervals;
+it may be wrong in level or in kind. It removes 40% of the sample, so K2 will
+accumulate evidence more slowly from here. Trades that were genuinely mispriced
+cheap outcomes will now be refused along with the bad ones, and the recorded
+forward paths are what will show whether that cost anything. Nothing here fixes
+the sizing rule itself, which remains 1/price within the surviving band.
+
+**Follow-up.** After a forward sample accumulates, compare realised outcomes on
+`rejected_floor` signals against filled ones in the band just above the floor.
+If refused episodes systematically ran favourably, the floor is too high and
+should move; if they ran as the history suggests, the next question is whether
+the fixed-notional sizing rule should be replaced outright.
 
 ### CHG-2026-09-04-001 — Post-deploy verification of PR #17
 
