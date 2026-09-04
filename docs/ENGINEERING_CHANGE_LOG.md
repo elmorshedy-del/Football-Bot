@@ -23,7 +23,7 @@ change code, are ordered newest first per `AGENTS.md`.
 
 ### CHG-2026-09-04-007 — Lower the sleeve minute floor to 80
 
-**Commit:** `<this commit>`
+**Commit:** `015aecd`
 **Components:** `app/config.py`, `.env.example`,
 `tests/test_price_floor_and_clock.py`, `tests/test_match_clock.py`,
 `tests/test_engine_signal.py`
