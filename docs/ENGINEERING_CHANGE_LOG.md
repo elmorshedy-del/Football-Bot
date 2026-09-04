@@ -18,8 +18,8 @@ after PR #17 merged as `1089af7`)
 Entries `-001` to `-003` are observation only: a post-deploy verification and a
 research freeze, recorded because both carry findings that must not be lost.
 They were written before any code changed today and are left below in the order
-they were written. Entries `-004` to `-006`, which follow immediately and do
-change code, are ordered newest first per `AGENTS.md`.
+they were written. Entries `-004` onward, which follow immediately and do change
+code, are ordered newest first per `AGENTS.md`.
 
 ### CHG-2026-09-04-007 — Lower the sleeve minute floor to 80
 
