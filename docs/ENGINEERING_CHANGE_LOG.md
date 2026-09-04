@@ -8,6 +8,114 @@ entries; correct them with a dated follow-up entry instead.
 
 ---
 
+## 2026-09-04
+
+**Branch:** `claude/strategy-optimization-backtest-wd2j7z` (restarted from `main`
+after PR #17 merged as `1089af7`)
+**Deployment:** PR #17 live since 2026-09-03 12:01Z, `config_id`
+`630d7b0f702f23b1`, 23 h uptime at time of check.
+
+No code changed today. This is a post-deploy verification entry plus a research
+freeze, recorded because both carry findings that must not be lost.
+
+### CHG-2026-09-04-001 — Post-deploy verification of PR #17
+
+**Components:** none changed. Observation only, against the live service.
+
+**Observed.** All four shipped fixes are confirmed working in production after a
+full day of live capture.
+
+| Fix | Before deploy | Now |
+|---|---|---|
+| Sub-threshold capture | absent | **314 observations** |
+| K1 fill integrity | FAIL (trades 39, 64) | **PASS, n=64, zero failures** |
+| Late-confirmation recording | did not exist | **2 `confirmed_late`** |
+| 88-gate status matcher | 32 `sleeve_clock_not_live` | **still exactly 32** |
+
+That last row is the proof for the status fix. `sleeve_clock_not_live` has not
+incremented once since deploy, while three *new* rejection reasons appeared that
+could never be reached before: `sleeve_clock_stale` (12),
+`sleeve_clock_pre_88` (3), `sleeve_clock_half_time` (2). Candidates now pass the
+status check and are refused on legitimate grounds.
+
+**New blocker identified, not fixed.** The sleeve still has zero trades. Its
+binding constraint has moved from status to **clock freshness**:
+`sleeve_clock_stale` is the largest new bucket. `MATCH_CLOCK_MAX_AGE_MS` is
+2500 ms against an observed `match_clock_age_ms` p50 of roughly 6000 ms. Until
+the clock poll keeps up, or that bound is reviewed, the sleeve will keep
+refusing candidates it now correctly reaches.
+
+**Risks / limitations.** Only 17 new sleeve evaluations, so the reason mix is
+provisional. K4 reads STALE rather than BREACH because latency samples reset
+with the process.
+
+**Follow-up.** Investigate `match_clock_age_ms`. It is now the single thing
+standing between the sleeve and its first observation.
+
+### CHG-2026-09-04-002 — Price-floor hypothesis confirmed out of sample
+
+**Components:** none changed. Recorded so the evidence is not re-derived.
+
+**Observed.** Seven trades closed since the previous analysis. The price-floor
+hypothesis was stated on 2026-09-03 from trades 1-61; these seven are new data
+and reproduce it exactly.
+
+| Band | Trades | Net | Losers | Contracts |
+|---|---|---|---|---|
+| Below 35¢ | 2 | **-$148.92** | 2 of 2 | 1,020 |
+| 35¢ and above | 5 | **+$46.68** | 2 of 5 | 531 |
+
+Both cheap trades recorded `mfe_c` of exactly 0.0: they never traded above entry
+once. That is now **6 of 6** measured cheap trades with zero favourable
+excursion. Study-wide the sub-35¢ bucket is 27 trades and 22 losers (81.5%).
+
+Without the two cheap trades the day would have been **+$46.68** instead of
+-$102.24.
+
+**Why this changes the "keep collecting" answer.** The argument is not that the
+paper account is down. It is that the cheap bucket is **contaminating the
+evidence being collected**. It holds 41% of trades and 73% of contract exposure
+in a band that loses four times in five, so it dominates the variance of the K2
+interval, which still spans zero at [-31.57, +6.11] on n=325. Continuing to
+trade it adds noise, not signal, to a question already answered.
+
+**Deliberately NOT changed.** No parameter was touched. The recommended design
+is a `PRICE_FLOOR` that refuses the entry but still records the signal and its
+forward path, mirroring how `rejected_cap` already handles the upper bound. That
+keeps the evidence accumulating while removing it from the P&L, and gets a new
+`config_id` so the two eras stay separable.
+
+**Follow-up.** Operator decision. See
+`RESEARCH_LOG_2026-09-04_POLYMARKET_TIMING.md` §6 for the full challenger queue.
+
+### CHG-2026-09-04-003 — Polymarket cross-venue study frozen
+
+**Components:** `docs/RESEARCH_LOG_2026-09-04_POLYMARKET_TIMING.md` (new).
+
+**Why.** A 462-match, 1.13 M-trade external study was run to answer questions the
+live Kalshi sample is too small to settle. It produced one confirmed finding,
+one withdrawn claim, and two challengers. Frozen mid-study at the operator's
+request so it can be resumed cold.
+
+**Headlines.** Late repricing is genuinely larger and safer, confirmed under
+every clock mapping. The precise optimal minute is **not** determined: the naive
+clock ran ~5 min late, verified independently by halftime-density detection and
+by aligning real goal minutes to price jumps, with several minutes of residual
+per-match spread. Sibling coherence is a weak filter that is structurally blind
+to VAR reversals and missed penalties. The 2¢ reversal stop fires on 60% of
+shocks and looks actively harmful.
+
+**Risks / limitations.** Polymarket charges no fees (a Kalshi fee model is
+applied throughout), has no historical order book (all returns are upper
+bounds), and stamps trades to the second (so nothing here speaks to Gate A's
+±50 ms window). Nothing is promotable without forward testing on Kalshi.
+
+**Follow-up.** The document carries a resume section and an explicit
+falsification section. The highest-value next step is the replay engine over the
+recorded Kalshi feed, not more Polymarket work.
+
+---
+
 ## 2026-09-03
 
 **Branch:** `claude/strategy-optimization-backtest-wd2j7z`
