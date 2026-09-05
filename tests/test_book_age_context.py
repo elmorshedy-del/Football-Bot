@@ -317,14 +317,35 @@ class ExitContextTests(unittest.TestCase):
         with patch("app.paper.store.log_event"):
             desk.close(pos, 50.0, "timeout", book=book, bid=50.0, now=1_180.0)
 
+        desk._observe_executable_high(pos, 61.0, now=1_100.0)
+
+        with patch("app.paper.store.log_event"):
+            desk.close(pos, 50.0, "timeout", book=book, bid=50.0, now=1_180.0)
+
         context = self.exit_context(pos.tid)
         trigger = context["exit_trigger"]
         self.assertEqual(trigger["reason"], "timeout")
         self.assertEqual(trigger["observed_bid"], 50.0)
         self.assertEqual(trigger["elapsed_s"], 180.0)
+        # The executable high, maintained for every position -- not
+        # `Position.peak_bid`, which only advances for a sleeve position.
         self.assertEqual(trigger["peak_bid"], 61.0)
+        self.assertEqual(trigger["peak_bid_ts"], 1_100.0)
         self.assertEqual(context["book_source"], "fill")
         self.assertAlmostEqual(context["book_age_ms"], 1_000.0, places=1)
+
+    def test_a_gate_a_exit_does_not_report_the_entry_price_as_the_peak(self):
+        """`Position.peak_bid` never advances outside the sleeve; using it here
+        recorded a 43c 'peak' on a trade whose bid reached 90c."""
+        desk = PaperDesk(Mock(), realistic=False, error_result=Mock())
+        pos = self.open_position(desk)
+        desk._observe_executable_high(pos, 90.0, now=1_050.0)
+        self.assertEqual(pos.peak_bid, pos.entry_px)
+
+        trigger = desk._exit_trigger(pos, "target", 90.0, 1_100.0)
+
+        self.assertEqual(trigger["peak_bid"], 90.0)
+        self.assertNotIn("sleeve_peak_bid", trigger)
 
     def test_the_exit_records_the_held_and_opposite_side_top_eight(self):
         desk = PaperDesk(Mock(), realistic=False, error_result=Mock())
@@ -358,6 +379,7 @@ class ExitContextTests(unittest.TestCase):
         self.assertEqual(trigger["observed_bid"], 47.0)
         self.assertEqual(trigger["elapsed_s"], 10.0)
         self.assertEqual(trigger["anchor_bid"], 52.0)
+        self.assertEqual(trigger["sleeve_peak_bid"], 58.0)
         self.assertIsInstance(trigger["scratch_c"], float)
         self.assertGreater(trigger["scratch_c"], pos.entry_px)
 

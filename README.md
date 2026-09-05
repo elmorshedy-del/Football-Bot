@@ -82,7 +82,9 @@ to the defaults. Notable ones:
 | `PAPER_EXECUTION_V2` | false | opt into latency-aware paper arrivals, shadow liquidity, and entry/exit depth walking |
 | `GOAL_LATENCY_OBSERVER` | true | read-only Kalshi score-vs-market arrival experiment; never enters the signal path |
 | `GOAL_LATENCY_POLL_MS` | 250 | target interval for batched score polling; actual uncertainty is saved per observation |
-| `EVENT_MATCH_WINDOW_S` | 20 | fixed ±seconds for diagnostic signal/event consistency matching |
+| `EVENT_MATCH_WINDOW_S` | 90 | fixed ±seconds for diagnostic signal/event consistency matching; raised from 20 because the score feed lands 10-40 s after the market moves. Excluded from the strategy identity |
+| `PAPER_MAX_BOOK_AGE_MS` | 0 | max age of the book a paper entry may fill against. **0 = record only**; above zero an older book refuses the entry as `stale_book`. A strategy parameter: it changes `config_id` |
+| `PATH_THIN_AFTER_S` / `PATH_THIN_INTERVAL_MS` | 10 / 250 | forward/execution path sampling: every change for the first N seconds, then one row per interval, with every new peak and trough always kept |
 | `SUBTHRESHOLD_CAPTURE` | true | record bursts below the Gate-A floor as research observations |
 | `SUBTHRESHOLD_DL_MIN` / `_LEVELS_MIN` / `_SIZE_MIN` | 0.3 / 3 / 50 | the research floor those observations must clear |
 | `PROVIDER_EVENT_FLUSH_S` | 60 | how often already-recorded provider events have their "last seen at" refreshed, in one batched transaction |
@@ -125,6 +127,27 @@ Every signal row (**every** outcome, including `subthreshold` and
 the exchange stamp), `proc_lag_ms` (processing minus arrival) and `backlog` for
 the frame the burst was observed on. In demo mode `feed_lag_ms` is the replay
 offset from the recorded tape's original timestamps, not a live measurement.
+
+### What a captured row now answers
+
+| Column | Where | Answers |
+|---|---|---|
+| `signals.context.books` | every signal row | what every leg of the match was quoting at the decision — bid, ask, sizes, last, mid |
+| `signals.context.spread_c` | every signal row | how wide the candidate's own leg was |
+| `signals.context.fillable` | every signal row | **what a Gate-A entry would have filled at** — `{vwap, qty, levels}` from walking the asks to `PRICE_CAP` for `NOTIONAL_USD`, without consuming anything. A declined or unconfirmed signal therefore carries the trade it refused |
+| `signals.context.confirmation` | every signal row | the sibling bursts the confirmation scan weighed — `{sibling_ticker, lag_ms, signed_dl, levels, in_window, opposite_sign}` — so `unconfirmed` (76% of the funnel, 1,150 of 1,511 rows) says *why* |
+| `signals.context.load` | every signal row | open forward watches, open positions and pending candidates at the decision |
+| `signals.episode_id` | every signal row of one episode | `<market>:<candidate ts_ms>`, so the two rows `parallel` mode writes for one episode join without heuristics |
+| `trades.entry_context` | every entry fill | `book_exchange_ts_ms`, `book_age_ms` (fill wall minus book arrival), `book_exchange_lag_ms` (fill wall minus exchange stamp), and the feed lag/backlog at the fill — **a fill taken from a 16 s-old book is labelled as such** |
+| `trades.exit_context.exit_trigger` | every exit fill | the numbers behind the label: reason, observed bid, `elapsed_s`, the executable peak, and the computed scratch level for a sleeve exit |
+| `trades.exit_context.book` | every exit fill | held-side and opposite-side top-8 at the fill, with `book_source` saying whether that is the fill book or the last one seen |
+| `markets.result` / `settled_ts` / `last_yes_bid` / `last_yes_ask` | every watched market | how the market actually resolved — including the ones the bot **declined**, so the declined population has an outcome label |
+| `goal_latency_observations.poll_seq`, `match_clock_observations.poll_seq` | every observation | which poll produced it, so poll cadence is reconstructible |
+
+Rows written before a column existed keep `NULL`. Nothing is backfilled: an
+unrecorded condition stays unrecorded rather than being given a plausible value.
+In demo mode `book_exchange_lag_ms` carries the same caveat as `feed_lag_ms` —
+it is the replay offset from the tape's original timestamps.
 
 ### Realistic paper execution (opt-in)
 
@@ -251,8 +274,12 @@ entry/exit inputs in the handoff contract.
 ### Goal latency observer
 
 The observer resolves each watched event to a Kalshi milestone, polls every mapped
-milestone through one `/live_data/batch` request, and compares only numeric fields
-under score-shaped keys. It does not use a language model and has no reference to the
+milestone through one `/live_data/batch` request, and compares only **score-valued**
+fields — `*_same_game_score`, `*_aggregate_score` and `period_scores.N.home_score` /
+`away_score`. Structural keys (`number`, `type`) and list growth are ignored, and a
+newly appearing key counts as a goal only when it appears above zero, so a
+second-half kickoff appending `period_scores[1]` is a `score_schema_change` rather
+than a goal. It does not use a language model and has no reference to the
 detector or paper desk. The first response containing a changed score is bounded by
 the previous successful poll and current receipt; both timestamps and request duration
 are saved instead of claiming a more precise provider event time.

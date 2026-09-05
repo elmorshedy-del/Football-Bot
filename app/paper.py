@@ -919,10 +919,19 @@ class PaperDesk:
             "reason": reason,
             "observed_bid": round(bid, 3) if isinstance(bid, (int, float)) else None,
             "elapsed_s": round(now - pos.entry_ts, 3),
-            "peak_bid": pos.peak_bid,
+            # The executable high, which `_observe_executable_high` maintains
+            # for EVERY position.  `Position.peak_bid` is not the peak of the
+            # trade: it only advances inside `sleeve_exit_reason`, so on a
+            # Gate-A position it never leaves the entry price.  It is reported
+            # too, under its own name, because it is the value three sleeve
+            # exits actually read.
+            "peak_bid": pos.max_executable_bid,
+            "peak_bid_ts": pos.max_executable_bid_ts,
             "entry_px": round(pos.entry_px, 3),
             "remaining": round(pos.remaining, 3),
         }
+        if pos.sleeve:
+            trigger["sleeve_peak_bid"] = pos.peak_bid
         if pos.sleeve and isinstance(bid, (int, float)):
             # The scratch level is the discriminator for three of the four
             # sleeve exits, and it is recomputed per quote from fees that are
