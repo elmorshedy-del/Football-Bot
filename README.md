@@ -85,11 +85,46 @@ to the defaults. Notable ones:
 | `EVENT_MATCH_WINDOW_S` | 20 | fixed ±seconds for diagnostic signal/event consistency matching |
 | `SUBTHRESHOLD_CAPTURE` | true | record bursts below the Gate-A floor as research observations |
 | `SUBTHRESHOLD_DL_MIN` / `_LEVELS_MIN` / `_SIZE_MIN` | 0.3 / 3 / 50 | the research floor those observations must clear |
+| `PROVIDER_EVENT_FLUSH_S` | 60 | how often already-recorded provider events have their "last seen at" refreshed, in one batched transaction |
 | `ADMIN_TOKEN` | empty | required `X-Admin-Token` for kill, flatten, and study export; empty fails closed |
 
 Recorder health is exposed at `/api/status` under `recorder`. A write failure
 marks it unhealthy, records the last error/failure count, alerts the dashboard,
 and retries on later messages instead of silently losing the raw feed.
+
+### Raw feed frames and the feed-health ledger
+
+The socket is split into a reader that only receives and stamps frames and a
+consumer that parses and routes them, so a recorded timestamp is the moment the
+frame **arrived** rather than the moment it was processed. Each line of a raw
+gzip segment is:
+
+| key | meaning |
+|---|---|
+| `at` / `am` | arrival wall and monotonic clock, stamped by the reader on receipt |
+| `lt` / `lm` | processing wall and monotonic clock, stamped when the consumer dequeued it (the original meaning of these keys, unchanged) |
+| `bl` | frames still queued behind this one — the measured processing backlog |
+| `m` | the exchange message |
+
+`at`/`am`/`bl` are omitted when unknown, so older readers and older segments
+stay valid. `lt - at` is the delay a frame suffered; before this existed that
+delay was silently folded into every timestamp derived from the frame.
+
+`feed_events` is the ledger of everything that interrupts the feed —
+`connected`, `disconnected`, `subscribed`, `resubscribed`, `gap`,
+`snapshot_requested`, `snapshot_complete`, `market_added`, `market_dropped`,
+`recorder_rotate` — readable at `/api/feed-events` and included in the study
+export. The same events are also written into the raw stream as
+`{"type": "recorder_marker", "kind": ..., "detail": ...}` frames, so a segment
+explains its own discontinuities without needing the database. `/api/status`
+reports the live queue depth as `feed_backlog`, and the `backlog_frames`
+latency series records the deepest queue seen in each 5 s window.
+
+Every signal row (**every** outcome, including `subthreshold` and
+`unconfirmed`) carries a `context` JSON column with `feed_lag_ms` (arrival minus
+the exchange stamp), `proc_lag_ms` (processing minus arrival) and `backlog` for
+the frame the burst was observed on. In demo mode `feed_lag_ms` is the replay
+offset from the recorded tape's original timestamps, not a live measurement.
 
 ### Realistic paper execution (opt-in)
 
@@ -205,7 +240,7 @@ as the selected raw gzip segments and return:
 
 - the database and SQL schema;
 - CSV and JSONL versions of markets, signals, trades, fills, latency, canonical match-event
-  observations, and event/error logs;
+  observations, the feed-health ledger, and event/error logs;
 - immutable raw WebSocket gzip files;
 - an allowlisted non-secret configuration, table counts, byte sizes, and SHA-256 hashes; and
 - the external [backtest architecture and validation contract](docs/PRICE_ONLY_BACKTEST_HANDOFF.md).
