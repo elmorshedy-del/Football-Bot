@@ -131,6 +131,24 @@ PAPER_EXECUTION_V2 = _b("PAPER_EXECUTION_V2", False)
 PAPER_ENTRY_LATENCY_MS = _f("PAPER_ENTRY_LATENCY_MS", 150.0)
 PAPER_EXIT_LATENCY_MS = _f("PAPER_EXIT_LATENCY_MS", 150.0)
 PAPER_EXECUTION_POLL_MS = _f("PAPER_EXECUTION_POLL_MS", 5.0)
+# Maximum age, in milliseconds, of the order book a paper entry may fill
+# against, measured from that book's arrival in this process to the fill.
+#
+# 0 means RECORD ONLY: the age is measured and persisted on every fill, and no
+# entry is ever refused for it, so the default reproduces today's behaviour
+# exactly. Above zero, an entry whose book is older than the bound is finalised
+# as `stale_book` instead of filling.
+#
+# This is a strategy parameter, not an observability knob: raising it above
+# zero refuses entries, so it changes `config_id` and rows written under
+# different bounds must not pool.
+#
+# Why it exists: a raw L2 replay of 2026-09-04 20:00-22:00 (1.9 M frames, 78
+# Gate-A candidates) found the reconstructed book's best ask worse than a real
+# same-side executed price for 29 of 29 candidates (median +12c), with the
+# process running 5.6 s median behind the exchange across 18 sequence gaps and
+# 8 reconnects. An unaged fill price is therefore an unfalsifiable claim.
+PAPER_MAX_BOOK_AGE_MS = _f("PAPER_MAX_BOOK_AGE_MS", 0.0)
 
 # --- Read-only Kalshi goal/market latency observer ---
 # This never participates in signal generation or paper execution.  It polls
@@ -309,6 +327,9 @@ STRATEGY_PARAM_NAMES = (
     "SLEEVE_TIMEOUT_S", "PAPER_EXECUTION_V2", "PAPER_ENTRY_LATENCY_MS",
     "PAPER_EXIT_LATENCY_MS", "PAPER_EXECUTION_POLL_MS",
     "MATCH_CLOCK_MAX_AGE_MS", "SLEEVE_MIN_MINUTE", "PRICE_FLOOR",
+    # Above zero this refuses entries (`stale_book`), so it is a strategy
+    # parameter and a change to it is a new configuration identity.
+    "PAPER_MAX_BOOK_AGE_MS",
     "SOCCER_SERIES",
 )
 

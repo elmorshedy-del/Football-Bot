@@ -260,6 +260,13 @@ def init():
         ("max_executable_bid_ts", "REAL"),
         ("bid_path_summary", "TEXT"),
         ("mfe_c", "REAL"),
+        # Conditions at the entry fill: the age of the book it consumed, the
+        # exchange stamp behind that book, and the feed lag/backlog at the
+        # moment of the fill.  Additive JSON; see CHG-2026-09-05-008.
+        ("entry_context", "TEXT"),
+        # Conditions at the exit fill: the trigger values behind the recorded
+        # exit reason, and the held-side/opposite-side book at the fill.
+        ("exit_context", "TEXT"),
     ):
         try:
             _conn.execute(f"ALTER TABLE trades ADD COLUMN {column} {definition}")
@@ -1460,12 +1467,14 @@ def finish_paper_signal(signal_id, outcome, detail, latency_ms, order_arrival_ms
 
 def insert_trade(t):
     cur = ex("""INSERT INTO trades(signal_id,market,event,series,dir,side,entry_ts,entry_px,
-                size,cap,notional,book_at_entry,status,mode,strategy,config_id)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?,?,?)""",
+                size,cap,notional,book_at_entry,status,mode,strategy,config_id,
+                entry_context)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?,?,?,?)""",
              (t["signal_id"], t["market"], t["event"], t["series"], t["dir"], t["side"],
               t["entry_ts"], t["entry_px"], t["size"], t["cap"], t["notional"],
               json.dumps(t.get("book_at_entry") or {}), _mode,
-              t.get("strategy") or "gate_a", _config_id))
+              t.get("strategy") or "gate_a", _config_id,
+              _stamp_text(t.get("entry_context"))))
     return cur.lastrowid
 
 
@@ -1477,13 +1486,14 @@ def open_paper_trade(t, detail, fill_levels, entry_fee, latency_ms, order_arriva
                 """INSERT INTO trades(signal_id,market,event,series,dir,side,entry_ts,entry_px,
                        size,cap,notional,book_at_entry,status,mode,remaining,realized_gross,
                        accrued_fees,exit_qty,exit_vwap_num,fee_type,fee_multiplier,strategy,
-                       config_id)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?, ?, 0, ?, 0, 0, ?, ?,?,?)""",
+                       config_id,entry_context)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?, ?, 0, ?, 0, 0, ?, ?,?,?,?)""",
                 (t["signal_id"], t["market"], t["event"], t["series"], t["dir"], t["side"],
                  t["entry_ts"], t["entry_px"], t["size"], t["cap"], t["notional"],
                  json.dumps(t.get("book_at_entry") or {}), _mode, t["size"], entry_fee,
                  t.get("fee_type"), t.get("fee_multiplier"),
-                 t.get("strategy") or "gate_a", _config_id),
+                 t.get("strategy") or "gate_a", _config_id,
+                 _stamp_text(t.get("entry_context"))),
             )
             trade_id = cur.lastrowid
             _conn.execute("UPDATE signals SET outcome='filled', detail=? WHERE id=?",
@@ -1509,7 +1519,7 @@ def open_paper_trade(t, detail, fill_levels, entry_fee, latency_ms, order_arriva
 
 def record_paper_exit(tid, signal_id, side, ts, reason, fill_levels, progress,
                       latency_ms, final=None, path_rows=None, truncated=False,
-                      dropped_samples=0):
+                      dropped_samples=0, exit_context=None):
     """Atomically persist exit fills, position progress, and optional close.
 
     When `final` is supplied this is the trade's last write, so the remaining
@@ -1557,9 +1567,11 @@ def record_paper_exit(tid, signal_id, side, ts, reason, fill_levels, progress,
             if final is not None:
                 _conn.execute(
                     """UPDATE trades SET exit_ts=?, exit_px=?, exit_reason=?, gross=?, fees=?,
-                           net=?, mae=?, shadow_stop_px=?, status='closed' WHERE id=?""",
+                           net=?, mae=?, shadow_stop_px=?, exit_context=?,
+                           status='closed' WHERE id=?""",
                     (ts, final["exit_px"], reason, final["gross"], final["fees"],
-                     final["net"], final["mae"], final["shadow_stop_px"], tid),
+                     final["net"], final["mae"], final["shadow_stop_px"],
+                     _stamp_text(exit_context), tid),
                 )
             _conn.commit()
         except Exception:
@@ -1589,7 +1601,8 @@ def load_open_paper_positions():
 
 
 def close_trade(tid, exit_px, reason, gross, fees, net, mae, shadow_stop_px,
-                path_rows=None, truncated=False, dropped_samples=0):
+                path_rows=None, truncated=False, dropped_samples=0,
+                exit_context=None):
     """Close a simple (non-realistic) trade and its path in ONE transaction.
 
     Same contract as `record_paper_exit`: path rows, terminal row, summary and
@@ -1604,10 +1617,10 @@ def close_trade(tid, exit_px, reason, gross, fees, net, mae, shadow_stop_px,
             _conn.execute(
                 """UPDATE trades SET exit_ts=?, exit_px=?, exit_reason=?, gross=?,
                        fees=?, net=?, mae=?, shadow_stop_px=?, bid_path_summary=?,
-                       status='closed' WHERE id=?""",
+                       exit_context=?, status='closed' WHERE id=?""",
                 (time.time(), exit_px, reason, gross, fees, net, mae, shadow_stop_px,
                  json.dumps(summary, separators=(",", ":")) if summary else None,
-                 tid),
+                 _stamp_text(exit_context), tid),
             )
             _conn.commit()
         except Exception:
@@ -1755,9 +1768,13 @@ def _strategy_summary(closed, open_t, signals, latency_evidence):
     # it produced a fill. `rejected_floor` belongs here for the same reason
     # `rejected_cap` does: the episode was real and eligible, and the price
     # bound is what declined it.
+    # `stale_book` belongs here for the same reason `no_book` does: the episode
+    # was real and reached the execution stage, and the book-age bound is what
+    # declined it.  Leaving it out would let raising PAPER_MAX_BOOK_AGE_MS
+    # silently shrink the K2 denominator instead of showing up as refusals.
     confirmed_outcomes = {
-        "filled", "rejected_cap", "rejected_floor", "no_book", "killed",
-        "expired", "unsupported_fee",
+        "filled", "rejected_cap", "rejected_floor", "no_book", "stale_book",
+        "killed", "expired", "unsupported_fee",
     }
     n_conf = sum(count for outcome, count in signal_counts.items()
                  if outcome in confirmed_outcomes)

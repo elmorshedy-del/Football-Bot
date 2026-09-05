@@ -3,10 +3,12 @@
 Kalshi book semantics: `yes` side = resting YES bids, `no` side = resting NO
 bids. A NO bid at price q is an offer to sell YES at (100 - q). All prices
 kept internally in cents (float, supports sub-cent)."""
+import time
 
 
 class Book:
-    __slots__ = ("yes_bids", "no_bids", "last_seq", "ok", "ts_ms")
+    __slots__ = ("yes_bids", "no_bids", "last_seq", "ok", "ts_ms",
+                 "last_exchange_ts_ms", "last_arrival_wall")
 
     def __init__(self):
         self.yes_bids = {}   # price_c -> size
@@ -14,14 +16,24 @@ class Book:
         self.last_seq = None
         self.ok = False
         self.ts_ms = 0
+        # When the exchange stamped the newest update this book carries, and
+        # when this process received it.  A fill taken from a 16 s-old book is
+        # a different claim from one taken at the touch, and until these
+        # existed the difference was unrecorded: a raw L2 replay of
+        # 2026-09-04 20:00-22:00 found the reconstructed best ask worse than a
+        # real same-side executed price for 29 of 29 candidates (median +12c)
+        # while the process ran 5.6 s median behind the exchange.
+        self.last_exchange_ts_ms = None
+        self.last_arrival_wall = None
 
-    def apply_snapshot(self, msg, seq):
+    def apply_snapshot(self, msg, seq, arrival_wall=None):
         self.yes_bids = {float(p) * 100: float(s) for p, s in (msg.get("yes_dollars_fp") or [])}
         self.no_bids = {float(p) * 100: float(s) for p, s in (msg.get("no_dollars_fp") or [])}
         self.last_seq = seq
         self.ok = True
+        self._stamp(msg, arrival_wall)
 
-    def apply_delta(self, msg, seq, sequence_validated=False):
+    def apply_delta(self, msg, seq, sequence_validated=False, arrival_wall=None):
         """Apply one delta after optional subscription-level validation.
 
         Kalshi sequences the entire WebSocket subscription, not each ticker.
@@ -43,7 +55,21 @@ class Book:
         else:
             side[px] = nv
         self.ts_ms = msg.get("ts_ms") or self.ts_ms
+        self._stamp(msg, arrival_wall)
         return True
+
+    def _stamp(self, msg, arrival_wall):
+        """Record the age inputs.  Never invents an exchange stamp.
+
+        `arrival_wall` is the reader's receipt stamp when the caller has one;
+        it falls back to now so an isolated caller still produces a usable age
+        rather than a null.  A frame with no `ts_ms` leaves the exchange stamp
+        as it was: a missing provider timestamp stays missing.
+        """
+        exchange = msg.get("ts_ms") if isinstance(msg, dict) else None
+        if isinstance(exchange, (int, float)) and not isinstance(exchange, bool):
+            self.last_exchange_ts_ms = float(exchange)
+        self.last_arrival_wall = time.time() if arrival_wall is None else float(arrival_wall)
 
     # --- views (YES space) ---
     def best_yes_bid(self):

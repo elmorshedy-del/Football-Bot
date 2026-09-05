@@ -139,6 +139,7 @@ class Engine:
         self.late_score_sleeve = PriceOnlyLateScoreSleeve()
         self.desk = PaperDesk(
             self.broadcast, self.on_paper_entry_result, error_result=self._record_error,
+            feed_state=self.feed_state,
         )
         self.recorder = RawRecorder(self.on_recorder_error, self.on_feed_event)
         self.books = {}
@@ -268,6 +269,18 @@ class Engine:
     def on_ws_feed_event(self, kind, detail=None):
         """Socket-side adapter: the WebSocket client passes (kind, detail)."""
         self.on_feed_event(kind, detail)
+
+    def feed_state(self):
+        """Current transport conditions, stamped onto every paper fill.
+
+        The most recent feed lag rather than a window statistic: a fill is one
+        instant, and the question the entry_context answers is how far behind
+        the exchange this process was at that instant.
+        """
+        return {
+            "feed_lag_ms": round(self.feed_lag[-1], 3) if self.feed_lag else None,
+            "backlog": int(getattr(self, "feed_backlog", 0) or 0),
+        }
 
     def register_market(self, ticker, event, series, title, close_time,
                         fee_type="quadratic", fee_multiplier=1.0, leg_title=None,
@@ -399,18 +412,20 @@ class Engine:
                                 arrival_wall=wall, arrival_mono=mono, backlog=backlog)
         if t == "orderbook_snapshot":
             b = self.books.setdefault(ticker, Book())
-            b.apply_snapshot(body, msg.get("seq"))
+            b.apply_snapshot(body, msg.get("seq"), arrival_wall=wall)
             self.desk.apply_book_snapshot(ticker, b)
             self.on_book(ticker)
             self._record_market_observation(ticker, "book", wall, mono)
         elif t == "orderbook_delta":
             b = self.books.setdefault(ticker, Book())
-            if not b.apply_delta(body, msg.get("seq"), sequence_validated=True):
+            if not b.apply_delta(body, msg.get("seq"), sequence_validated=True,
+                                 arrival_wall=wall):
                 self.desk.invalidate_books([ticker])
                 if self.ws:
                     asyncio.get_event_loop().create_task(self.ws.request_snapshot(ticker))
             else:
-                self.desk.apply_book_delta(ticker, body, msg.get("seq"))
+                self.desk.apply_book_delta(ticker, body, msg.get("seq"),
+                                           arrival_wall=wall)
                 self.on_book(ticker)
                 self._record_market_observation(ticker, "book", wall, mono)
         elif t == "trade":
