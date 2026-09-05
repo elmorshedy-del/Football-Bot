@@ -619,6 +619,9 @@ class MatchClockTracker:
             "poll_started_ts": timing["started_wall"],
             "previous_poll_ts": timing.get("previous_poll_ts"),
             "response_ms": timing["response_ms"],
+            # Observer-run poll counter, carried through so clock cadence is
+            # reconstructible from the persisted rows.
+            "poll_seq": timing.get("poll_seq"),
             "event": event,
             "milestone_id": str(milestone_id),
             "provider_period": parsed.provider_period if parsed else None,

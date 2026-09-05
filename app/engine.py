@@ -14,7 +14,7 @@ from .goal_latency import GoalLatencyObserver
 from .kalshi import KalshiClient, KalshiWS
 from .late_score_sleeve import PriceOnlyLateScoreSleeve
 from .match_clock import MatchClockGate, MatchClockTracker, unusable_stamp
-from .paper import BID_PATH_FLUSH_EVERY, PaperDesk
+from .paper import BID_PATH_FLUSH_EVERY, PaperDesk, path_thins
 from .recorder import RawRecorder
 
 
@@ -140,6 +140,7 @@ class Engine:
         self.late_score_sleeve = PriceOnlyLateScoreSleeve()
         self.desk = PaperDesk(
             self.broadcast, self.on_paper_entry_result, error_result=self._record_error,
+            feed_state=self.feed_state,
         )
         # The raw-feed archive.  Constructed unconditionally so `status()` can
         # always describe the timeline, but completely inert -- no uploads, no
@@ -178,6 +179,9 @@ class Engine:
         self._feed_event_tasks = set()
         self._path_write_tasks = set()
         self._watched_markets = set()
+        # Markets whose settlement has already been persisted, so the widened
+        # settlement poll does not re-request a resolved market every 30 s.
+        self._settled_markets = set()
         self.market_observations = {}  # event -> recent locally timestamped price changes
         self._last_market_state = {}   # (kind, ticker) -> tuple, suppress unchanged frames
         self.goal_latency = None
@@ -280,6 +284,18 @@ class Engine:
     def on_ws_feed_event(self, kind, detail=None):
         """Socket-side adapter: the WebSocket client passes (kind, detail)."""
         self.on_feed_event(kind, detail)
+
+    def feed_state(self):
+        """Current transport conditions, stamped onto every paper fill.
+
+        The most recent feed lag rather than a window statistic: a fill is one
+        instant, and the question the entry_context answers is how far behind
+        the exchange this process was at that instant.
+        """
+        return {
+            "feed_lag_ms": round(self.feed_lag[-1], 3) if self.feed_lag else None,
+            "backlog": int(getattr(self, "feed_backlog", 0) or 0),
+        }
 
     def register_market(self, ticker, event, series, title, close_time,
                         fee_type="quadratic", fee_multiplier=1.0, leg_title=None,
@@ -411,18 +427,20 @@ class Engine:
                                 arrival_wall=wall, arrival_mono=mono, backlog=backlog)
         if t == "orderbook_snapshot":
             b = self.books.setdefault(ticker, Book())
-            b.apply_snapshot(body, msg.get("seq"))
+            b.apply_snapshot(body, msg.get("seq"), arrival_wall=wall)
             self.desk.apply_book_snapshot(ticker, b)
             self.on_book(ticker)
             self._record_market_observation(ticker, "book", wall, mono)
         elif t == "orderbook_delta":
             b = self.books.setdefault(ticker, Book())
-            if not b.apply_delta(body, msg.get("seq"), sequence_validated=True):
+            if not b.apply_delta(body, msg.get("seq"), sequence_validated=True,
+                                 arrival_wall=wall):
                 self.desk.invalidate_books([ticker])
                 if self.ws:
                     asyncio.get_event_loop().create_task(self.ws.request_snapshot(ticker))
             else:
-                self.desk.apply_book_delta(ticker, body, msg.get("seq"))
+                self.desk.apply_book_delta(ticker, body, msg.get("seq"),
+                                           arrival_wall=wall)
                 self.on_book(ticker)
                 self._record_market_observation(ticker, "book", wall, mono)
         elif t == "trade":
@@ -440,7 +458,48 @@ class Engine:
         elif t == "market_lifecycle_v2":
             res = body.get("settled_result") or body.get("result")
             if res in ("yes", "no"):
+                self._record_market_result(ticker, res, proc_wall)
                 self.desk.settle_market(ticker, res)
+
+    def _last_yes_quote(self, ticker):
+        book = self.books.get(ticker)
+        if book is None or not book.ok:
+            return None, None
+        return self._cents(book.best_yes_bid()), self._cents(book.best_yes_ask())
+
+    def _record_market_result(self, ticker, result, settled_ts):
+        """Persist a settlement from the socket without an fsync on the loop.
+
+        Settlement is rare, but `handle_ws` runs on the event loop and the
+        platform pass removed the writes that were there.  This reuses the same
+        dispatch: to a worker thread when a loop is running, inline only when
+        there is none (the synchronous replay harness and the tests).
+        """
+        if result not in ("yes", "no") or not ticker:
+            return
+        self._settled_markets.add(ticker)
+        bid, ask = self._last_yes_quote(ticker)
+        args = (ticker, result, settled_ts, bid, ask)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            try:
+                store.record_market_result(*args)
+            except Exception as exc:  # noqa: BLE001 - reported, never raised
+                self._record_error("market_result", exc)
+            return
+
+        async def _write():
+            try:
+                await asyncio.to_thread(store.record_market_result, *args)
+            except Exception as exc:  # noqa: BLE001 - reported, never raised
+                self._record_error("market_result", exc)
+
+        task = loop.create_task(_write())
+        self._path_write_tasks.add(task)
+        task.add_done_callback(self._path_write_tasks.discard)
 
     def _watch_signal_forward(self, sid, cand, outcome):
         """Track the held-side price for a bounded window after any signal.
@@ -460,6 +519,9 @@ class Engine:
             "side": side, "strategy": cand.get("strategy") or "detector",
             "anchor_ts": now, "expires_at": now + config.SIGNAL_PATH_WINDOW_S,
             "outcome": outcome, "last": None, "rows": [], "dropped": 0, "total": 0,
+            # Time-based thinning state (see `path_thins`): the extremes seen so
+            # far and when a row was last written.
+            "peak": None, "trough": None, "last_written": 0.0, "thinned": 0,
         })
         self._evict_signal_paths()
 
@@ -489,12 +551,26 @@ class Engine:
             if availability == "gap" and watch["last"] is None:
                 # Never open a path with a gap: there is no availability to end.
                 continue
+            if path_thins(now - watch["anchor_ts"], bid, watch.get("peak"),
+                          watch.get("trough"), now, watch.get("last_written", 0.0)):
+                # `last` is deliberately not advanced: it tracks what is
+                # durable, so the next written row carries the current quote.
+                watch["thinned"] = watch.get("thinned", 0) + 1
+                continue
             watch["last"] = signature
             # One slot is reserved so a terminal/final row always fits.
             if watch.get("total", 0) >= store.BID_PATH_MAX_SAMPLES - 1:
                 watch["dropped"] += 1
                 continue
             watch["total"] = watch.get("total", 0) + 1
+            if bid is None:
+                # An outage ends the interval, so the resuming quote is kept.
+                watch["last_written"] = 0.0
+            else:
+                watch["last_written"] = now
+                peak, trough = watch.get("peak"), watch.get("trough")
+                watch["peak"] = bid if peak is None else max(peak, bid)
+                watch["trough"] = bid if trough is None else min(trough, bid)
             watch["rows"].append({
                 "kind": "decline", "trade_id": None, "signal_id": watch["signal_id"],
                 "event": watch["event"], "market": ticker, "side": watch["side"],
@@ -774,6 +850,143 @@ class Engine:
             context["proc_lag_ms"] = round((proc - arrival) * 1000.0, 3)
         return context
 
+    @staticmethod
+    def _attach_confirmation(cand, evidence):
+        """Carry the confirmation scan's evidence on the candidate.
+
+        Attached to the candidate rather than passed alongside it because the
+        same candidate is copied into both sleeves by `_strategy_candidate`, so
+        one attachment reaches every row of the episode.  `attempts` counts how
+        many times the scan actually ran, which is what separates "no sibling
+        ever printed" from "the wait window expired before its frame arrived".
+        """
+        if not isinstance(evidence, dict):
+            return
+        previous = cand.get("confirmation") or {}
+        evidence = dict(evidence)
+        evidence["attempts"] = int(previous.get("attempts") or 0) + 1
+        cand["confirmation"] = evidence
+
+    @staticmethod
+    def episode_id(cand):
+        """Stable identity for one detected episode.
+
+        In `parallel` mode a confirmed episode writes two signal rows with
+        different ids, identical trigger fields and two forward watches, and
+        nothing keyed them together: joining them meant matching on
+        (market, ts_ms, dl, levels) and hoping.  The candidate's exchange
+        timestamp and market are the episode, so they are the key.
+        """
+        ticker, ts_ms = cand.get("ticker"), cand.get("ts_ms")
+        if not ticker or not isinstance(ts_ms, (int, float)):
+            return None
+        return f"{ticker}:{int(ts_ms)}"
+
+    @staticmethod
+    def _cents(value):
+        """Round a recorded price to whole-cent precision plus a margin.
+
+        `best_yes_ask` is `100 - max(no_bids)` in floating point, so an exact
+        55c NO bid reads back as 44.99999999999999.  Rounding the *recorded*
+        value keeps the row readable and comparable; no decision reads this
+        field, so nothing about admission or fills is affected.
+        """
+        return None if value is None else round(value, 3)
+
+    def _leg_quote(self, ticker, depth=True):
+        """Top of book for one leg in YES space, or None when unavailable."""
+        book = self.books.get(ticker)
+        if book is None or not book.ok:
+            return None
+        bid, ask = book.best_yes_bid(), book.best_yes_ask()
+        quote = {"bid": self._cents(bid), "ask": self._cents(ask)}
+        if depth:
+            quote["bid_size"] = book.yes_bids.get(bid) if bid is not None else None
+            quote["ask_size"] = (
+                book.no_bids.get(100 - ask) if ask is not None else None
+            )
+            quote["last"] = self.prices.get(ticker, {}).get("last")
+        if bid is not None and ask is not None:
+            quote["mid"] = round((bid + ask) / 2.0, 3)
+            quote["spread_c"] = round(ask - bid, 3)
+        return quote
+
+    def _event_quotes(self, ticker, depth=True):
+        """Every leg of the candidate's event, keyed by ticker."""
+        event = self.meta.get(ticker, {}).get("event")
+        legs = self.event_markets.get(event) or [ticker]
+        return {leg: self._leg_quote(leg, depth=depth) for leg in legs}
+
+    def _fillable(self, ticker, side):
+        """What a Gate-A entry would have taken, WITHOUT consuming anything.
+
+        Deliberately the same walk as `PaperDesk.try_enter`: ascending asks for
+        `side`, stop at `PRICE_CAP`, fill `NOTIONAL_USD`.  Recorded on declined
+        and unconfirmed rows too, so a refusal carries the fill it refused
+        rather than only the fact of the refusal.
+        """
+        book = self.books.get(ticker)
+        if book is None or not book.ok:
+            return None
+        try:
+            ladder = book.ask_ladder(side)
+        except Exception:
+            return None
+        want = config.NOTIONAL_USD
+        qty = cost = weighted = 0.0
+        levels = 0
+        for px, avail in ladder:
+            if px > config.PRICE_CAP or px <= 0:
+                break
+            take = min(avail, (want - cost) / (px / 100.0))
+            if take <= 0:
+                break
+            qty += take
+            cost += take * px / 100.0
+            weighted += take * px
+            levels += 1
+            if cost >= want - 0.01:
+                break
+        return {
+            "vwap": round(weighted / qty, 2) if qty > 0 else None,
+            "qty": round(qty, 1),
+            "levels": levels,
+            "notional_usd": want,
+            "price_cap": config.PRICE_CAP,
+        }
+
+    def _capture_context(self, cand, base):
+        """Extend the frame context with book, fillability and load state.
+
+        Pure in-memory work folded into the signal INSERT that already happens,
+        so no statement and no commit is added to the hot path (H2).
+
+        Capture is additive to collection and must never cost a row: a failure
+        here keeps the frame context and records the reason in the row itself,
+        which is visible in the data rather than swallowed.
+        """
+        context = dict(base or {})
+        ticker = cand.get("ticker")
+        try:
+            quotes = self._event_quotes(ticker)
+            context["books"] = quotes
+            own = quotes.get(ticker) or {}
+            context["spread_c"] = own.get("spread_c")
+            context["fillable"] = self._fillable(
+                ticker, "yes" if cand.get("dir", 1) >= 0 else "no",
+            )
+            context["load"] = {
+                "open_watches": len(self._signal_paths),
+                "open_positions": len(self.desk.positions),
+                "pending_candidates": len(self.pending),
+            }
+        except Exception as exc:  # noqa: BLE001 - recorded, never raised
+            context["capture_error"] = f"{type(exc).__name__}: {exc}"
+        confirmation = cand.get("confirmation")
+        if confirmation:
+            context["confirmation"] = confirmation
+        return context
+
     def process_trade(self, ticker, ts_ms, px, sz, taker, wall,
                       proc_wall=None, backlog=0):
         """Feed one trade into the detector.
@@ -799,7 +1012,9 @@ class Engine:
             still = []
             for p in self.pending:
                 if ticker in p["siblings"]:
-                    ok, lag = self.detector.confirm(p["cand"], p["siblings"])
+                    ok, lag, evidence = self.detector.confirm(
+                        p["cand"], p["siblings"])
+                    self._attach_confirmation(p["cand"], evidence)
                     if ok:
                         if time.time() - p["queued_at"] <= config.CONF_TRADE_MAX_AGE_S:
                             self.act_on_signal(p["cand"], lag)
@@ -817,7 +1032,8 @@ class Engine:
             self.pending = still
         if cand:
             sibs = self.siblings(ticker)
-            ok, lag = self.detector.confirm(cand, sibs)
+            ok, lag, evidence = self.detector.confirm(cand, sibs)
+            self._attach_confirmation(cand, evidence)
             if ok:
                 self.act_on_signal(cand, lag)
             elif sibs:
@@ -865,14 +1081,33 @@ class Engine:
                     },
                 },
                 "match_clock_snapshot": stamp,
-                "context": self._signal_context(
-                    observation.get("context"), observation.get("ts_ms")),
+                # Deliberately a cheap subset of `record_signal`'s context: the
+                # legs' top of book and the spread, with no depth, no ladder
+                # walk and no load state.  These rows are numerous by design
+                # (287 in a two-hour replay against 78 candidates), so the
+                # per-row cost has to stay near zero.
+                "context": self._subthreshold_context(observation),
                 # No forward path: these are numerous by design, and each watch
                 # costs a tracking slot and up to BID_PATH_MAX_SAMPLES rows.
                 "forward_path_started_ts": None,
             })
         except Exception as exc:
             self._record_error("subthreshold", exc)
+
+    def _subthreshold_context(self, observation):
+        context = dict(
+            self._signal_context(
+                observation.get("context"), observation.get("ts_ms"))
+            or {}
+        )
+        ticker = observation.get("ticker")
+        try:
+            quotes = self._event_quotes(ticker, depth=False)
+            context["books"] = quotes
+            context["spread_c"] = (quotes.get(ticker) or {}).get("spread_c")
+        except Exception as exc:  # noqa: BLE001 - recorded, never raised
+            context["capture_error"] = f"{type(exc).__name__}: {exc}"
+        return context or None
 
     def record_signal(self, cand, lag, outcome, announce=True):
         m = self.meta.get(cand["ticker"], {})
@@ -905,7 +1140,10 @@ class Engine:
             "conf_lag_ms": lag, "late": self.is_late(cand["ticker"]), "outcome": outcome,
             "detail": cand.get("detail") or {},
             "match_clock_snapshot": stamp,
-            "context": self._signal_context(cand.get("context"), cand.get("ts_ms")),
+            "context": self._capture_context(
+                cand, self._signal_context(cand.get("context"), cand.get("ts_ms")),
+            ),
+            "episode_id": self.episode_id(cand),
             "forward_path_started_ts": (
                 cand.get("local_ts") or time.time()
                 if config.SIGNAL_PATH_WINDOW_S else None
@@ -1149,18 +1387,51 @@ class Engine:
                 self.broadcast({"type": "log", "text": f"discovery error: {e!r}"})
             await asyncio.sleep(config.DISCOVERY_INTERVAL_S)
 
+    # Per-cycle request bound for the widened settlement poll.  Open positions
+    # are always polled; expired declined markets fill whatever budget is left,
+    # so widening the poll cannot turn into a rate-limit incident.
+    SETTLE_POLL_MAX = 50
+
+    def _settlement_poll_targets(self, now):
+        """Open-position markets, plus every watched market past expiration.
+
+        A settlement result must exist for episodes the bot DECLINED, not only
+        the ones it traded: without it the declined population -- which is most
+        of the funnel -- has no outcome label at all, and the whole
+        precision/recall question stays unanswerable.  Markets leave
+        `_watched_markets` `DROP_AFTER_CLOSE_MIN` past expiration, which bounds
+        the set on its own; `_settled_markets` stops re-polling a resolved one.
+        """
+        held = sorted({p.market for p in self.desk.positions.values()})
+        expired = []
+        for tk in sorted(self._watched_markets):
+            if tk in held or tk in self._settled_markets:
+                continue
+            expiration = parse_iso(self.meta.get(tk, {}).get("close_time") or "")
+            if expiration is not None and expiration <= now:
+                expired.append(tk)
+        # Bound memory: forget settlements for markets no longer watched.
+        self._settled_markets &= self._watched_markets | set(held)
+        return (held + expired)[:self.SETTLE_POLL_MAX]
+
     async def settle_poll_task(self):
-        """Fallback settlement detection for open paper positions."""
+        """Fallback settlement detection, and the durable market result."""
         while True:
             await asyncio.sleep(30)
             if self.mode != "live":
                 continue
-            tickers = {p.market for p in self.desk.positions.values()}
-            for tk in tickers:
+            now = time.time()
+            for tk in self._settlement_poll_targets(now):
                 try:
                     r = await self.client.get(f"/markets/{tk}")
                     mkt = r.get("market") or {}
                     if mkt.get("result") in ("yes", "no"):
+                        bid, ask = self._last_yes_quote(tk)
+                        await asyncio.to_thread(
+                            store.record_market_result, tk, mkt["result"],
+                            time.time(), bid, ask,
+                        )
+                        self._settled_markets.add(tk)
                         self.desk.settle_market(tk, mkt["result"])
                 except Exception as exc:
                     self._record_error(f"settlement:{tk}", exc)

@@ -131,6 +131,24 @@ PAPER_EXECUTION_V2 = _b("PAPER_EXECUTION_V2", False)
 PAPER_ENTRY_LATENCY_MS = _f("PAPER_ENTRY_LATENCY_MS", 150.0)
 PAPER_EXIT_LATENCY_MS = _f("PAPER_EXIT_LATENCY_MS", 150.0)
 PAPER_EXECUTION_POLL_MS = _f("PAPER_EXECUTION_POLL_MS", 5.0)
+# Maximum age, in milliseconds, of the order book a paper entry may fill
+# against, measured from that book's arrival in this process to the fill.
+#
+# 0 means RECORD ONLY: the age is measured and persisted on every fill, and no
+# entry is ever refused for it, so the default reproduces today's behaviour
+# exactly. Above zero, an entry whose book is older than the bound is finalised
+# as `stale_book` instead of filling.
+#
+# This is a strategy parameter, not an observability knob: raising it above
+# zero refuses entries, so it changes `config_id` and rows written under
+# different bounds must not pool.
+#
+# Why it exists: a raw L2 replay of 2026-09-04 20:00-22:00 (1.9 M frames, 78
+# Gate-A candidates) found the reconstructed book's best ask worse than a real
+# same-side executed price for 29 of 29 candidates (median +12c), with the
+# process running 5.6 s median behind the exchange across 18 sequence gaps and
+# 8 reconnects. An unaged fill price is therefore an unfalsifiable claim.
+PAPER_MAX_BOOK_AGE_MS = _f("PAPER_MAX_BOOK_AGE_MS", 0.0)
 
 # --- Read-only Kalshi goal/market latency observer ---
 # This never participates in signal generation or paper execution.  It polls
@@ -140,13 +158,51 @@ GOAL_LATENCY_OBSERVER = _b("GOAL_LATENCY_OBSERVER", True)
 GOAL_LATENCY_POLL_MS = _f("GOAL_LATENCY_POLL_MS", 250.0)
 GOAL_LATENCY_LOOKBACK_S = _f("GOAL_LATENCY_LOOKBACK_S", 10.0)
 GOAL_LATENCY_AFTER_S = _f("GOAL_LATENCY_AFTER_S", 2.0)
-EVENT_MATCH_WINDOW_S = _f("EVENT_MATCH_WINDOW_S", 20.0)
+# Diagnostic +-seconds for associating a signal with the nearest same-match
+# provider event.  An audit-window default, never an entry or exit input, and
+# deliberately excluded from `STRATEGY_PARAM_NAMES` (it is listed under
+# `exporter._OBSERVABILITY_NAMES` instead), so changing it does not move
+# `config_id` and cannot re-partition the study.
+#
+# Was 20, guessed rather than measured, against a documented 18.635 s
+# observation lag on the Al-Shabab case -- about 1.4 s of margin (see
+# SPEC_CORRECTIONS C6, which asks for it to be set from data). Measured since:
+# provider `occurence_ts` to first observation is p50 15 s, and goal
+# observation minus bot entry is typically +12..+50 s, because the Kalshi score
+# feed lands 10-40 s after the market moves. At 20 s most genuinely goal-driven
+# trades therefore recorded `no_nearby_same_match_event`, which reads as "no
+# goal" and is wrong.
+#
+# 90 covers the measured upper tail with margin. The cost is a looser label:
+# association was already only a ground-truth label and never an explanation of
+# any individual trade (C6), and a wider window admits more coincidental
+# matches. That is the correct direction for a recall-limited measurement --
+# the association is reported alongside `state_consistent` / `state_mismatch`,
+# which is what separates a real match from a coincidence.
+EVENT_MATCH_WINDOW_S = _f("EVENT_MATCH_WINDOW_S", 90.0)
 
 # Forward price window recorded after every signal, accepted or declined, so a
 # decline is a labelled observation rather than a dead record.  Collection only:
 # nothing in the trading path reads it.
 SIGNAL_PATH_WINDOW_S = _f("SIGNAL_PATH_WINDOW_S", 300.0)
 SIGNAL_PATH_MAX_TRACKED = _i("SIGNAL_PATH_MAX_TRACKED", 400)
+# Path sampling policy.  A flat 4,000-row cap is a budget spent in arrival
+# order, so the busiest markets exhausted it first: samples=3999 on every La
+# Liga trade and signal in the first live study, which collapsed the intended
+# 300 s forward window to 60-130 s exactly where activity was highest and the
+# answer mattered most.
+#
+# Time-based thinning instead: every change for the first PATH_THIN_AFTER_S
+# after the anchor, where the reaction being studied happens, then at most one
+# row per PATH_THIN_INTERVAL_MS.  A new peak or trough is ALWAYS recorded
+# regardless of thinning, so the extremes the exit study reads are never the
+# rows that get dropped.  `store.BID_PATH_MAX_SAMPLES` remains the hard
+# backstop.
+#
+# Collection only: nothing in the trading path reads a persisted path, so these
+# are deliberately not strategy parameters.
+PATH_THIN_AFTER_S = _f("PATH_THIN_AFTER_S", 10.0)
+PATH_THIN_INTERVAL_MS = _f("PATH_THIN_INTERVAL_MS", 250.0)
 # Maximum age of a persisted match-clock confirmation used by the 88+ gate.
 #
 # Was 2500 ms, derived as ten 250 ms poll intervals. Live capture measured
@@ -357,6 +413,9 @@ STRATEGY_PARAM_NAMES = (
     "SLEEVE_TIMEOUT_S", "PAPER_EXECUTION_V2", "PAPER_ENTRY_LATENCY_MS",
     "PAPER_EXIT_LATENCY_MS", "PAPER_EXECUTION_POLL_MS",
     "MATCH_CLOCK_MAX_AGE_MS", "SLEEVE_MIN_MINUTE", "PRICE_FLOOR",
+    # Above zero this refuses entries (`stale_book`), so it is a strategy
+    # parameter and a change to it is a new configuration identity.
+    "PAPER_MAX_BOOK_AGE_MS",
     "SOCCER_SERIES",
 )
 

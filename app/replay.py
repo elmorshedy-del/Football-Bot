@@ -80,6 +80,14 @@ class DemoReplay:
                      max(0.5, (100 - mid) - 9): 1600.0}
         b.ok = True
         b.last_seq = None
+        # Demo books are assembled here rather than through `apply_snapshot`, so
+        # the age fields have to be stamped explicitly or every demo fill would
+        # record `book_age_unknown`.  The exchange stamp is the ORIGINAL tape
+        # timestamp, so `book_exchange_lag_ms` in demo is the replay offset from
+        # August 2026 and not a live measurement -- the same caveat that already
+        # applies to `feed_lag_ms` in demo mode.
+        b.last_exchange_ts_ms = float(ts_ms) or None
+        b.last_arrival_wall = time.time()
         return b
 
     async def run(self):

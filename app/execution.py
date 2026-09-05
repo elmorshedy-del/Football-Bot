@@ -6,6 +6,7 @@ same displayed liquidity while later exchange deltas continue to advance the
 counterfactual book.
 """
 from dataclasses import dataclass, field
+import time
 
 
 _EPS = 1e-9
@@ -28,6 +29,11 @@ class ShadowBook:
         self._observed_no = {}
         self.ok = False
         self.seq = None
+        # Mirrored from the live book so a simulated fill can say how old the
+        # depth it consumed actually was.  The shadow is the book the fill
+        # walks, so the age has to travel with the shadow, not the live view.
+        self.last_exchange_ts_ms = None
+        self.last_arrival_wall = None
 
     @classmethod
     def from_live(cls, book):
@@ -48,6 +54,8 @@ class ShadowBook:
         self._observed_no = dict(book.no_bids)
         self.ok = bool(book.ok)
         self.seq = book.last_seq
+        self.last_exchange_ts_ms = getattr(book, "last_exchange_ts_ms", None)
+        self.last_arrival_wall = getattr(book, "last_arrival_wall", None)
 
     @staticmethod
     def _depletion(observed, shadow):
@@ -68,7 +76,7 @@ class ShadowBook:
     def invalidate(self):
         self.ok = False
 
-    def apply_delta(self, msg, seq=None):
+    def apply_delta(self, msg, seq=None, arrival_wall=None):
         if not self.ok:
             return
         px = float(msg["price_dollars"]) * 100
@@ -80,6 +88,10 @@ class ShadowBook:
         self._apply_size_delta(observed, px, delta)
         self._apply_size_delta(shadow, px, delta)
         self.seq = seq if seq is not None else self.seq
+        exchange = msg.get("ts_ms")
+        if isinstance(exchange, (int, float)) and not isinstance(exchange, bool):
+            self.last_exchange_ts_ms = float(exchange)
+        self.last_arrival_wall = time.time() if arrival_wall is None else float(arrival_wall)
 
     @staticmethod
     def _apply_size_delta(side, price, delta):
@@ -202,10 +214,10 @@ class ShadowBooks:
         else:
             shadow.reset(live_book, preserve_depletion=True)
 
-    def apply_delta(self, ticker, msg, seq=None):
+    def apply_delta(self, ticker, msg, seq=None, arrival_wall=None):
         shadow = self._books.get(ticker)
         if shadow is not None:
-            shadow.apply_delta(msg, seq)
+            shadow.apply_delta(msg, seq, arrival_wall=arrival_wall)
 
     def invalidate(self, tickers):
         for ticker in tickers:

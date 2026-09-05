@@ -518,6 +518,10 @@ async def trades(limit: int = 200, mode: str | None = None):
             # full path is served by /api/trades/{id}/path on demand.
             r["bid_path_summary"] = json_object(r.get("bid_path_summary")) or None
             r["bid_path_url"] = f"/api/trades/{r['id']}/path?mode={selector}"
+            # Book age at the fill, and the trigger values behind the exit
+            # label.  Decoded so the API serves objects rather than JSON text.
+            r["entry_context"] = json_object(r.get("entry_context")) or None
+            r["exit_context"] = json_object(r.get("exit_context")) or None
             mark = live_marks.get(r["id"])
             if r.get("status") == "open" and mark and r.get("mode") == engine_mode:
                 # Storage is the selector source of truth; in-memory state may only

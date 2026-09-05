@@ -23,16 +23,29 @@ across 9 files, `.env.example` +8, `README.md` +36 / -1. R2 archive pass
 `tests/test_raw_archive.py` is 852 new lines), `scripts/r2_probe.py` +104,
 `.env.example` +31, `README.md` +66.
 **Suite:** 394 tests OK before the platform pass (32.0 s), 425 after (40.1 s),
-459 after the R2 archive pass (52.1 s), under
+459 after the R2 archive pass (52.1 s), 504 after the capture pass, under
 `python -X dev -W error::RuntimeWarning -m unittest discover -s tests`.
 **Deployment status:** NOT DEPLOYED. Nothing here has run in production; every
 number quoted as production evidence was measured on the deployed 2026-09-04/05
 build, not on this one.
 
-This is the platform pass of the 2026-09-05 data-capture plan (plan items B1,
-B2, B8a, B8b, B8d, B8e). B3-B7 — signal/entry/exit context, path thinning,
-market results and score-observer correctness — are a separate later pass and
-are deliberately untouched here.
+The day carries three passes of the 2026-09-05 data-capture plan, developed
+concurrently and merged here:
+
+- **platform pass** (plan B1, B2, B8a/b/d/e), entries `-001` to `-006`, commits
+  `6cffcf8`, `c59010b`, `cddbaee`, `b7fe0fc`;
+- **R2 archive pass** (raw-feed continuity storage), entries `-007` and `-008`,
+  commits `aac510f`, `88dcf17`, `11e0fbc`;
+- **capture pass** (plan B3-B7, B9), entries `-009` to `-020`, commits
+  `b59cece`, `b5e0470`, `d743a17`, `a900e6d`, `e6f4c93`.
+
+**Numbering correction, recorded rather than hidden.** The archive and capture
+passes were written in parallel against the same base and both claimed
+`-007`/`-008`. The archive pass had already been pushed and its entry numbers
+cited, so the capture entries were renumbered `+2` (`-007`…`-018` became
+`-009`…`-020`) when the two were merged. Commit `e6f4c93`'s message therefore
+names the pre-merge range `-007` through `-018`; the entries it added are the
+ones now numbered `-009` through `-020`. No entry was rewritten, only renumbered.
 
 **Configuration identity.** No strategy parameter changed: `strategy_params()`
 is byte-identical before and after. But `engine.py`, `detector.py` and
@@ -65,6 +78,821 @@ written inline here because the harness is synchronous and has no event loop
 for `asyncio.to_thread` to dispatch to. In production those rows go to a worker
 thread and the loop does not pay for them, so the measured in-process gain is a
 conservative lower bound on the relief the event loop actually gets.
+
+### CHG-2026-09-05-020 — Record that `PRICE_FLOOR`'s rationale is now in doubt
+
+**Commit:** none. Observation only; no code changed.
+**Components:** none. This entry exists so the evidence is not lost.
+
+**Observed / original behaviour.** `PRICE_FLOOR` (CHG-2026-09-04-004) was
+introduced on the hypothesis that cheap legs lose money because they are cheap:
+sub-35c entries were 41% of trades and 73% of contract exposure, that bucket
+lost 22 of 27, and the counterfactual on the 68-trade history was
+-$843.60 -> +$85.38 from the price bound alone.
+
+A raw L2 replay of 2026-09-04 20:00-22:00 (1.9 M frames, 78 Gate-A candidates)
+re-ran the same trades under two sizing models with the entry model held fixed.
+Below 35c: **-$726 at $100 fixed notional, -$9.90 at a fixed 100 contracts.**
+Same trades, same entry model, same prices. The loss is a function of position
+size, not of entry price: a fixed dollar notional buys contracts as 1/price, so
+$100 is ~727 contracts at 13.8c against ~176 at 57c.
+
+**Root cause.** Design gap in the earlier reasoning, not a defect in the code.
+The 2026-09-04 counterfactual varied price and size together — refusing a cheap
+entry also refuses a large one — so it could not separate the two, and
+attributed the whole effect to price.
+
+**Why necessary.** Without this recorded, the next person reads
+CHG-2026-09-04-004 as settled and either leaves a possibly-unnecessary floor in
+place or removes it without knowing what actually has to change with it.
+
+**Exact change.** None. Nothing in this pass changes sizing, and `PRICE_FLOOR`
+keeps its default of 35.
+
+**Before / after.** No behavioural difference.
+
+**Reasoning and trade-offs.** Changing `NOTIONAL_USD` to a contract count was
+considered and rejected for this pass: it is a strategy change with its own
+economics, it needs its own reviewed change, and the capture work in this pass
+is exactly what would let it be judged on forward evidence rather than on
+another replay. Removing `PRICE_FLOOR` now was also rejected — the replay says
+the floor is not the *mechanism*, not that removing it is free.
+
+**Validation.** None; nothing was changed. The replay numbers above are the
+evidence, n=29 trades in the priced window, n=78 Gate-A candidates overall.
+
+**Risks / limitations.** The floor is currently doing work whose stated reason
+is wrong. It is still bounding exposure, so it is not harmful, but any claim
+that "the price bound fixed the cheap-leg loss" is unsupported and should not
+be repeated.
+
+**Follow-up.** Decide sizing explicitly — fixed contracts, or a notional that
+scales with price — in its own change, using the forward evidence this pass
+starts collecting.
+
+### CHG-2026-09-05-019 — Set the event-association window from measurement, 20 s -> 90 s
+
+**Commit:** `a900e6d`
+**Components:** `app/config.py`, `.env.example`, `README.md`,
+`tests/test_score_classification.py`
+
+**Observed / original behaviour.** `EVENT_MATCH_WINDOW_S = 20.0` is the ±window
+`audit.match_signal_event` uses to associate a signal with the nearest
+same-match provider event. SPEC_CORRECTIONS C7 already records it as
+"inherited", and C6 records that the documented Al-Shabab case had the provider
+observation arriving **18.635 s after the signal** — about 1.4 s of margin
+against a window that was guessed, not measured.
+
+Measured since: provider `occurence_ts` to first observation is **p50 15 s**,
+and goal observation minus bot entry is typically **+12..+50 s**, because the
+Kalshi score feed lands 10-40 s after the market moves. At 20 s, most genuinely
+goal-driven trades therefore recorded `no_nearby_same_match_event`, which reads
+as "no goal was near this trade" and is wrong.
+
+**Root cause.** The window was set from an unmeasured guess about feed timing,
+and the feed is structurally slower than the guess.
+
+**Why necessary.** The association is the only ground-truth label the study has
+for "was this candidate actually goal-driven". A window narrower than the
+measured lag makes that label systematically false-negative, and every
+precision/recall statement built on it is wrong in the same direction.
+
+**Exact change.** Default 20.0 -> 90.0, with the measurement recorded in the
+config comment and in `.env.example`. No code path changed: the value was
+already read from config by `audit.signal_event_window` and `main`.
+
+**Before / after.** A signal whose goal observation lands 35 s later reads
+`no_nearby_same_match_event` before and `state_consistent` /
+`temporally_associated` after. A signal with no same-match event within 90 s
+still reads `no_nearby_same_match_event`.
+
+**Reasoning and trade-offs.** 60 s was considered and rejected: it sits inside
+the measured +12..+50 s band's upper tail with no margin, which is the same
+mistake being corrected. 90 s covers the tail with room. The cost is a looser
+label — a wider window admits more coincidental matches — and that is the
+correct direction here, because C6 already establishes that proximity can never
+*explain* an individual trade, only label it, and the label is reported
+alongside `state_consistent` / `state_mismatch`, which is what separates a real
+match from a coincidence.
+
+**Validation.** `tests/test_score_classification.py::AuditWindowTests` pins the
+new default, that `EVENT_MATCH_WINDOW_S` stays out of `STRATEGY_PARAM_NAMES`,
+that patching it does not move `config_id`, and that the export manifest still
+reports it under `_OBSERVABILITY_NAMES`. **Confirmed: this is an audit-window
+default and is excluded from the strategy identity, so widening it does not
+re-partition the study.** Suite 504 OK.
+
+**Risks / limitations.** Historical rows keep the association computed at
+whatever window was active when they were read; the window is applied at read
+time, so re-reading old signals now applies 90 s. That is a presentation change
+on old rows, not a rewrite of stored data, but a saved screenshot from before
+this will disagree with the dashboard.
+
+**Follow-up.** None.
+
+### CHG-2026-09-05-018 — Stamp a poll sequence on every clock and score observation
+
+**Commit:** `a900e6d`
+**Components:** `app/goal_latency.py`, `app/match_clock.py`, `app/store.py`,
+`tests/test_score_classification.py`, `tests/test_production_migration.py`
+
+**Observed / original behaviour.** Each observation carries `observed_ts`,
+`poll_started_ts`, `previous_poll_ts` and `response_ms`, but nothing says which
+poll produced it. Two observations from the same `/live_data/batch` response are
+indistinguishable from two observations one poll apart, and a gap in the series
+cannot be told from a poll that returned nothing for that event.
+
+**Root cause.** Design gap. The observer already counted its polls
+(`GoalLatencyObserver.polls`); the counter was reported in `status()` and never
+written to a row.
+
+**Why necessary.** Poll cadence is the denominator for every latency claim the
+observer makes. Without it, "the clock was 6 s stale" cannot be separated into
+"the poll was late" and "the provider did not move".
+
+**Exact change.** `goal_latency_observations.poll_seq` and
+`match_clock_observations.poll_seq` (additive INTEGER columns).
+`GoalLatencyObserver._poll` increments `self.polls` before building `timing` and
+carries the value in `timing["poll_seq"]`; `MatchClockTracker.observe` and
+`_record_change` pass it through; both inserts write it. It is the same counter
+`status()["polls"]` already reports, so no second source of truth is created.
+
+**Before / after.** Before: two clock rows 6 s apart, no way to say whether one
+poll or twenty-four happened between them. After: `poll_seq` 41 and 42 says one.
+
+**Reasoning and trade-offs.** A UUID per poll was rejected: a monotonic integer
+sorts, subtracts and compresses, and the run boundary is already visible from
+the process restart. The counter restarts at 1 on a new process — that is what
+"per observer run" means, and it is deliberately not made globally monotonic,
+because a globally monotonic counter would need durable state that the observer
+does not otherwise keep.
+
+**Validation.** New tests assert the column is written and read back monotonic
+for both tables, and that a row written without one keeps NULL. The migration
+test asserts the columns appear, do not duplicate on remigration, and that
+**historical rows stay NULL — they are not backfilled**, because the counter did
+not exist when they were written and any value assigned now would be invented.
+Suite 504 OK.
+
+**Risks / limitations.** `poll_seq` is only comparable within one process run.
+Joining across a restart needs `observed_ts`.
+
+**Follow-up.** None.
+
+### CHG-2026-09-05-017 — Stop reading a period boundary as a goal
+
+**Commit:** `a900e6d`
+**Components:** `app/goal_latency.py`, `app/match_events.py`,
+`tests/test_score_classification.py`
+
+**Observed / original behaviour.** `classify_score_change` diffed the **whole**
+numeric signature with `before.get(key, 0.0)` as the default for an absent key,
+so any newly appearing numeric key read as a positive delta and returned
+`"goal"`. `score_signature` collects every numeric field at or below a key
+containing `score`, and Kalshi's `details.period_scores` is a list of
+`{away_score, home_score, number, type}` — so `period_scores` matches, and a
+second-half kickoff appending `period_scores[1]` introduces
+`period_scores.1.number = 2`, a period **ordinal**, and the row was labelled a
+goal.
+
+In the deployed study, **199 of 476 rows labelled `goal` carried
+`side=unknown` and an unchanged score**. Any goal-rate statistic computed from
+that table is inflated by roughly 2x.
+
+**Root cause.** A schema-flexible key matcher (correct, and deliberately so)
+feeding a value comparison that assumed every collected key was a score.
+
+**Why necessary.** Goal labelling is the ground truth for the entire
+price-only thesis. A label that fires on a period boundary makes the goal rate,
+the association rate and any precision claim built on them wrong by about a
+factor of two, and it fires exactly at half-time and second-half kickoff — which
+is inside the late-game window the strategy trades in.
+
+**Exact change.** `match_events.score_values()` filters a signature to
+score-valued keys only: `*_same_game_score`, `*_aggregate_score`,
+`period_scores.N.home_score` / `away_score` (matched on the last path segment
+with underscores stripped, so snake_case and camelCase resolve identically, and
+`score_home` / `score_away` are accepted for parity with `_primary_score`).
+`classify_score_change` diffs only that subset, with three rules and the
+original correction-beats-goal precedence:
+
+* a key present on both sides is a goal when it rises, a correction when it
+  falls;
+* a key that **appears** is a goal only when it appears **above zero**, so a new
+  period starting 0-0 is a `score_schema_change`;
+* a key that **disappears** is a `score_schema_change` — the provider stopped
+  reporting a field, it did not un-score a goal.
+
+**Before / after.** Same real-shaped payload, `home_same_game_score=1`,
+`away_same_game_score=0`, `period_scores` growing from one entry to two at the
+second-half kickoff: `"goal"` before, `"score_schema_change"` after, normalizing
+to `score_schema_change.unknown` with `side="unknown"` instead of
+`goal_observed.unknown`. A genuine 1-0 -> 1-1 goal is still `"goal"`, a 2-0 ->
+1-0 revision is still `"score_correction"`, and a goal in a newly appearing
+period (`period_scores[1].away_score` appearing as 1) is still `"goal"`.
+
+**Reasoning and trade-offs.** Narrowing `score_signature` itself was rejected:
+it is the raw evidence, the observation rows store it, and shrinking it would
+lose fields that a later re-analysis may want. Filtering at classification time
+keeps the recorded signature complete and makes the interpretation explicit.
+An allowlist of exact key paths was rejected as too brittle for a provider that
+documents `details` as flexible JSON; matching the final path segment keeps the
+schema tolerance the module was written for.
+
+**Validation.** `tests/test_score_classification.py` builds the fixture from the
+real payload shape — `home_same_game_score`, `away_same_game_score`,
+`period_scores` as a list of `{away_score, home_score, number, type}`, `half`,
+`status`, `status_text`, `time`, `last_play` — and asserts the structural key
+`period_scores.0.number` is present in the raw signature and absent from the
+filtered one; that a second-half kickoff is `score_schema_change` and not a
+goal; that a genuine goal, a genuine correction, correction-over-goal
+precedence, a goal in a new period, a disappearing key and a pure structural
+change all classify correctly. Suite 504 OK.
+
+**Risks / limitations.** **The 199 mislabelled historical rows are NOT
+rewritten.** They stay exactly as recorded, with their raw `score_before` /
+`score_after` intact, so anyone re-deriving the label gets the corrected answer
+from stored evidence. Any aggregate over `change_kind` that spans this deploy
+mixes two labelling rules and must be split at it. A provider that reports a
+score under a key whose last segment is none of the accepted forms would now be
+ignored where it was previously (accidentally) counted; the raw signature still
+records it, so that shows up as `score_schema_change` rather than silence.
+
+**Follow-up.** Re-derive the historical labels from the stored signatures when
+the goal-rate statistic is next quoted, and say which rule each row was written
+under.
+
+### CHG-2026-09-05-016 — Persist the settlement result of every watched market
+
+**Commit:** `d743a17`
+**Components:** `app/engine.py`, `app/store.py`, `tests/test_market_results.py`,
+`tests/test_production_migration.py`
+
+**Observed / original behaviour.** No market settlement result was persisted
+anywhere queryable. `handle_ws` read `settled_result` off a
+`market_lifecycle_v2` frame and passed it straight to `PaperDesk.settle_market`,
+which used it to close positions and then discarded it. `settle_poll_task`
+polled `/markets/{ticker}` only for tickers with an **open paper position**, so a
+market the bot declined never had its result observed at all.
+
+**Root cause.** Design gap. Settlement was treated as an input to closing a
+position rather than as an observation about a market.
+
+**Why necessary.** Most of the funnel is declined — 1,150 `unconfirmed` and
+several hundred sleeve refusals against 75 closed trades. Without a result for
+those markets the declined population has no outcome label, so "was declining
+right" is unanswerable from the database and can only be recovered by replaying
+raw tape.
+
+**Exact change.** Additive `markets.result`, `markets.settled_ts`,
+`markets.last_yes_bid`, `markets.last_yes_ask`.
+`store.record_market_result()` writes them with first-write-wins on
+`settled_ts` and `COALESCE` on the quotes, so a lifecycle frame and a later REST
+poll cannot degrade each other, and a result for an unregistered ticker writes
+nothing and returns 0 rather than inventing a market row.
+`Engine._record_market_result` captures the last YES bid/ask from the live book
+and dispatches the write to a worker thread when a loop is running — the
+platform pass removed the SQLite writes from `handle_ws` and this does not
+reintroduce one. `settle_poll_task` now polls open-position markets **plus**
+every watched market whose expected expiration has passed, capped at
+`SETTLE_POLL_MAX = 50` per 30 s cycle with open positions first, and skips
+markets already recorded via `_settled_markets`.
+
+**Before / after.** A declined market that settles YES: no row anywhere before;
+`markets.result='yes'` with `settled_ts` and the last observed quote after. A
+market with an open position is polled exactly as before, and is still polled
+after its result is recorded, so a settlement that failed to close a position
+keeps retrying.
+
+**Reasoning and trade-offs.** Writing `markets.status='settled'` was considered
+and rejected: discovery re-upserts `status` from `/markets`, so the two would
+fight, and the settlement fact belongs in its own column. Polling every watched
+market unconditionally was rejected on rate-limit grounds; markets leave
+`_watched_markets` `DROP_AFTER_CLOSE_MIN` (20 min) past expiration, which bounds
+the set on its own, and the explicit per-cycle cap bounds it again.
+
+**Validation.** New tests cover: a settled market with **no position** records
+its result and does not call `settle_market`; the lifecycle frame records the
+result and settles the desk; a market with no book records null quotes rather
+than a guess; first settlement time and a known quote are never degraded by a
+later null; a non-binary result writes nothing; an unregistered ticker invents
+nothing; the poll covers expired declined markets, skips already-settled ones,
+still covers open positions after recording, and is bounded per cycle; and the
+socket-side write is dispatched off the event loop rather than called inline.
+Suite 504 OK.
+
+**Risks / limitations.** Markets that expired and settled while the process was
+down are never observed — they drop out of `_watched_markets` before the poll
+sees them. Historical markets keep NULL results and are not backfilled.
+The widened poll adds up to 50 REST calls per 30 s in a busy window, against a
+previous bound of the open-position count.
+
+**Follow-up.** Reconcile results for markets that settled during downtime from
+the settlement endpoint, if a bulk one is available.
+
+### CHG-2026-09-05-015 — Spend the path budget on time, not on arrival order
+
+**Commit:** `d743a17`
+**Components:** `app/config.py`, `app/engine.py`, `app/paper.py`,
+`tests/test_path_thinning.py`, `tests/test_bid_path.py`
+
+**Observed / original behaviour.** Both path recorders — the forward watch in
+`engine._record_signal_paths` and the position path in
+`paper._record_exec_path` — recorded every change until a flat
+`store.BID_PATH_MAX_SAMPLES = 4000` cap, then dropped everything after it. A
+flat cap is a budget consumed fastest by the busiest markets: in the deployed
+study **every La Liga trade and signal recorded `samples=3999`**, so the
+intended 300 s forward window collapsed to 60-130 s of coverage exactly where
+activity — and therefore the answer — was highest.
+
+**Root cause.** Design gap. The cap bounds storage, which it should, but it was
+also acting as the sampling policy, which it should not: nothing said which
+4,000 of the available observations were the useful ones.
+
+**Why necessary.** The path exists to answer "what could this position have
+exited at, and when" (SPEC_CORRECTIONS C4/E1). A truncated path answers that for
+the first two minutes of a five-minute window and is silent afterwards, in
+precisely the markets where the exit rule matters most.
+
+**Exact change.** New knobs `PATH_THIN_AFTER_S` (10) and
+`PATH_THIN_INTERVAL_MS` (250), and a shared `paper.path_thins()` used by both
+recorders. Every change is recorded for the first `PATH_THIN_AFTER_S` after the
+anchor — the window the reaction happens in — then at most one row per
+`PATH_THIN_INTERVAL_MS`. Four exemptions, in order: an unpriced observation is
+an availability change and is always recorded; a new peak or trough is always
+recorded; nothing inside the early window is thinned; and an outage resets the
+interval so the quote that resumes availability is always kept.
+`BID_PATH_MAX_SAMPLES` remains the hard backstop, the reserved terminal slot is
+unchanged, and thinned rows are counted separately (`exec_path_thinned` /
+`watch["thinned"]`) so `truncated` and `dropped_samples` keep meaning exactly
+"the cap bit". `store.bid_path_summary` is unchanged.
+
+A thinned observation deliberately does **not** advance the dedupe signature,
+which now tracks what is durable rather than what was last seen, so the row
+written at the next interval carries the then-current quote instead of being
+deduplicated against one that was never persisted.
+
+**Before / after.** On the bundled real tape: 2,255 persisted path rows before,
+1,906 after (-15.5%), across the same 9 path owners, with the per-owner
+`(min bid, max bid)` **identical for all 9** — rows were removed, extremes were
+not. In a hot market the shape of the saving is much larger: 200 chop
+observations at 10 ms inside an already-seen range reach at most one row per
+250 ms.
+
+**Reasoning and trade-offs.** Raising `BID_PATH_MAX_SAMPLES` was rejected: it
+moves the wall without changing the policy, and multiplies storage on exactly
+the busiest markets. Reservoir sampling was rejected because it does not
+guarantee the extremes, and the extremes are the measurement. Thinning by price
+change size was rejected because it destroys time-at-price, which is what
+distinguishes a 90c quote resting 200 ms in size 1 from one resting 12 s in size
+500 (C4). These knobs are **not** strategy parameters: nothing in the trading
+path reads a persisted path, so changing them cannot change a decision.
+
+**Validation.** `tests/test_path_thinning.py` pins the rule directly (early
+window, interval, new peak, new trough, unpriced) and behaviourally on both
+recorders: every change kept inside the first 10 s; the rate bounded afterwards
+while a later peak and trough still survive; thinning never counted as
+truncation; the 4,000 backstop still bites with exactly one terminal row; the
+reserved terminal slot survives thinning; a quote resuming after an outage
+always recorded; and `bid_path_summary` on a thinned path still returns the true
+peak, trough, first and last bid with `truncated=False`. Plus the whole-tape
+extremes check above. Suite 504 OK.
+
+**Risks / limitations.** Between two recorded rows more than 250 ms apart, the
+in-between quotes are gone. Time-at-price is therefore quantised to 250 ms
+outside the first 10 s; `ms_at_peak` is still bounded by real recorded rows on
+both sides of the peak, because the peak itself is always recorded, but its
+resolution is coarser than before. Paths already persisted are untouched and
+were collected under the old policy, so a comparison of `samples` across this
+deploy is meaningless.
+
+**Follow-up.** None.
+
+### CHG-2026-09-05-014 — Add `PAPER_MAX_BOOK_AGE_MS`, default 0 (record only)
+
+**Commit:** `b5e0470`
+**Components:** `app/config.py`, `app/paper.py`, `app/store.py`,
+`.env.example`, `README.md`, `tests/test_book_age_context.py`
+
+**Observed / original behaviour.** A paper entry filled against whatever book
+was in memory, however old. The raw L2 replay of 2026-09-04 20:00-22:00 measured
+the process **5.6 s median behind the exchange** across 18 sequence gaps and 8
+reconnects, so "whatever book was in memory" was routinely several seconds
+stale, and there was no way to refuse on that basis or to measure what refusing
+would have cost.
+
+**Root cause.** Design gap, not a defect: staleness was never a modelled input
+to the entry decision.
+
+**Why necessary.** Every future P&L claim inherits the ambiguity of a fill taken
+from an unknown-age book. The bound has to exist before it can be studied, and
+it has to default to off so that studying it is a deliberate act.
+
+**Exact change.** `PAPER_MAX_BOOK_AGE_MS`, default **0.0 = record only**. At 0
+no entry is ever refused and behaviour is byte-identical. Above zero, an entry
+whose book age is known and exceeds the bound is finalised as a new outcome
+`stale_book` instead of filling, in **both** paper paths (`_execute_entry` and
+`try_enter`) so the two cannot disagree about eligibility, with the measured
+`entry_context` attached to the signal detail. `stale_book` is added to
+`store._strategy_summary`'s `confirmed_outcomes` alongside `no_book`, so raising
+the bound shows up as refusals rather than silently shrinking the K2
+denominator. **It is added to `config.STRATEGY_PARAM_NAMES`: it changes which
+entries are taken, so it changes `config_id`, and that is correct.**
+
+An **unknown** age never refuses. Unknown is not evidence of staleness, and
+refusing on it would turn a missing provider timestamp into a silent change in
+which entries are taken; the unknown is recorded as
+`book_age_unknown: "no_arrival_stamp"` instead.
+
+**Before / after.** At the default 0, a book 600 s old still fills, exactly as
+today. At 5,000, a 16 s-old book is refused as `stale_book` with
+`book_age_ms: 16000.0` in the signal detail, and a 0.5 s-old book still fills.
+
+**Reasoning and trade-offs.** Defaulting it to a live bound was rejected
+outright: this pass must not change which entries are taken. Refusing on unknown
+age was rejected for the reason above. Making it an observability knob was
+rejected because above zero it demonstrably refuses trades, and a knob that
+changes admissions belongs in the configuration identity even when its default
+is inert.
+
+**Validation.** New tests assert that 0 disables the bound entirely (a 600 s
+book still fills, signal outcome `filled`); that above the bound the entry is
+refused as `stale_book` with the measured age in the detail; that below the
+bound it still fills; that an unknown age never refuses; that both paper paths
+agree; that `stale_book` is counted in `k2_ci.n_signals` exactly like `no_book`
+and never like `unconfirmed`; and that the knob is in `STRATEGY_PARAM_NAMES` and
+moves `config_id`. The whole-tape regression above confirms no behaviour change
+at the default. Suite 504 OK.
+
+**Risks / limitations.** Adding the knob moves `config_id` even though its
+default is inert, so rows from before and after this deploy do not pool. That is
+the provenance stamp working as designed, but it is a real discontinuity in
+every current-configuration aggregate.
+
+**Follow-up.** Fit the bound from the `book_age_ms` distribution once forward
+data exists, in its own reviewed change.
+
+### CHG-2026-09-05-013 — Record the numbers behind every exit label, and the book at the exit fill
+
+**Commit:** `b5e0470`, plus the documentation commit that adds this entry (the
+exit-peak correction below).
+**Components:** `app/paper.py`, `app/store.py`, `app/main.py`,
+`tests/test_book_age_context.py`
+
+**Observed / original behaviour.** 75 closed trades, net -$836.90, and **66 of
+75 exits were the 180 s timeout**. The record carried the label and nothing
+else: not the bid the desk saw when it decided, not how long the position had
+been held, not how far it had ever run, and — for the four sleeve exits that
+SPEC_CORRECTIONS H1 calls historically unfalsifiable — not the computed scratch
+level that separated `sleeve_scratch` from `sleeve_profit_lock`.
+
+**Root cause.** Design gap. The exit reason is a *label* produced from four
+inputs that were all discarded at the moment they were evaluated.
+
+**Why necessary.** An exit rule cannot be re-tuned from labels. With 88% of
+exits carrying one label and no inputs, the dominant behaviour of the strategy
+is the least explicable part of the record.
+
+**Exact change.** Additive `trades.exit_context` JSON.
+`PaperDesk._exit_trigger` captures the reason, the observed bid, `elapsed_s`,
+the peak, the entry price and the remaining size at the moment the exit is
+decided, plus `scratch_c` (recomputed with the same
+`fee_aware_scratch_price`/`fee_dollars` the rule used) and `anchor_bid` for a
+sleeve position. It is stored on `PendingExit.trigger` — **`Position.bid_path`
+keeps its exact shape and length (H1); no new state is put on it.**
+`_execute_exit`, `close` and `settle_market` add `book_side_depth()`: the
+held-side and opposite-side **top-8** at the fill, plus the book-age fields and
+the feed lag/backlog. Where an exit is reached without a book in hand — timeout,
+flatten, settlement — the desk falls back to the last live book seen for that
+market (kept by reference in `PaperDesk._last_book`, updated in `on_book`) and
+labels it `book_source: "last_seen"` rather than claiming it is the fill book;
+with no book at all it records `book_age_unknown: "no_book_at_exit"`.
+`main.py` decodes `entry_context`/`exit_context` on `/api/trades` so the API
+serves objects rather than JSON text.
+
+**Correction made during validation.** The first implementation reported
+`Position.peak_bid` as the trigger's `peak_bid`. That field only advances inside
+`sleeve_exit_reason`, so on a Gate-A position it never leaves the entry price:
+the demo smoke run recorded `peak_bid: 43.0` on a trade whose bid reached 90c.
+It now reports `pos.max_executable_bid` (with `peak_bid_ts`), which
+`_observe_executable_high` maintains for **every** position, and reports
+`Position.peak_bid` separately as `sleeve_peak_bid` on sleeve positions, because
+that is the value three sleeve exits actually read.
+
+**Before / after.** A timeout exit before: `exit_reason='timeout'`. After:
+`{reason: "timeout", observed_bid: 50.0, elapsed_s: 180.0, peak_bid: 61.0,
+peak_bid_ts: ..., entry_px: 45.0, remaining: 100.0}` with the held-side and
+opposite-side top-8 at the fill, the book's age, and whether that book was the
+fill book or the last seen.
+
+**Reasoning and trade-offs.** Reconstructing the trigger at analysis time from
+`bid_path_samples` was rejected: the scratch level depends on the fee schedule
+and the remaining size at that instant and is not recoverable from the path, and
+the whole point of H1 is that the four sleeve exits were unfalsifiable precisely
+because their inputs were discarded. Extending `Position.bid_path` was rejected
+outright — H1 forbids it and four exit decisions read it. Recording the full
+ladder was rejected as unbounded; top-8 matches the existing entry-side
+`ShadowBook.SNAPSHOT_DEPTH` convention.
+
+**Validation.** New tests assert the trigger values on a close; the held/opposite
+top-8 at the fill (8 of 10 offered levels on each side, correct sides for a YES
+position); the computed scratch level and anchor on a sleeve exit; the
+`last_seen` fallback and its label on a timeout reached with no book in hand; a
+settlement recording its own context; that a Gate-A exit reports the executable
+high and not the entry price as the peak; and that `Position.bid_path` is still
+a `deque(maxlen=240)`. The whole-tape regression above confirms exit behaviour
+is unchanged. Suite 504 OK.
+
+**Risks / limitations.** For an exit reached without a book, the recorded book
+is the last one seen, which may be older than the fill; the row says so, but a
+consumer that ignores `book_source` will over-trust it. Closed trades from
+before this deploy keep NULL `exit_context` and are not backfilled — the inputs
+were never recorded and any value produced now would be invented.
+
+**Follow-up.** None.
+
+### CHG-2026-09-05-012 — Record the age of the book every paper fill used
+
+**Commit:** `b5e0470`
+**Components:** `app/books.py`, `app/execution.py`, `app/paper.py`,
+`app/engine.py`, `app/store.py`, `app/replay.py`,
+`tests/test_book_age_context.py`
+
+**Observed / original behaviour.** A paper fill recorded the arrival book it
+walked (`trades.book_at_entry`) but nothing about **when** that book was true.
+The raw L2 replay of 2026-09-04 20:00-22:00 (1.9 M frames, 78 Gate-A candidates)
+found the reconstructed book's best ask **worse than a real same-side executed
+price for 29 of 29 candidates, median +12c**, with the process running **5.6 s
+median behind the exchange** across 18 sequence gaps and 8 reconnects. On the
+same 29 trades, the entry assumption alone moved the total between
+**-$862.96, -$228.72 and +$550.33**.
+
+**Root cause.** Design gap. `Book` tracked `ts_ms` from deltas and used it
+nowhere; nothing recorded when a frame arrived in this process, so the two
+distinct quantities — how long the depth had been sitting here, and how far
+behind the exchange it was — could not be separated or even measured.
+
+**Why necessary.** This is the item the rest of the pass depends on. A fill
+price taken from a 16 s-old book is a different claim from one taken at the
+touch, and until each fill is labelled with which it was, **every** P&L
+statement the study makes inherits the same unresolvable ambiguity.
+
+**Exact change.** `Book` gains `last_exchange_ts_ms` (from the delta's `ts_ms`,
+which Kalshi supplies) and `last_arrival_wall`, stamped in `apply_snapshot` and
+`apply_delta` from the reader's arrival stamp that the platform pass already
+threads into `handle_ws`. A frame with no `ts_ms` leaves the exchange stamp
+untouched: a missing provider timestamp stays missing. `ShadowBook` mirrors both
+through `reset` and `apply_delta`, because the shadow is the book the fill
+actually walks. `paper.book_age_context()` derives `book_exchange_ts_ms`,
+`book_age_ms` (fill wall minus book arrival wall) and `book_exchange_lag_ms`
+(fill wall minus exchange stamp) for a fill, with an explicit
+`book_age_unknown` reason instead of a substituted value. Every entry persists
+these on a new additive `trades.entry_context` JSON column, together with the
+`feed_lag_ms` and `backlog` at the fill, supplied by an optional
+`PaperDesk(feed_state=...)` callable the engine passes.
+`replay.synth_book` stamps both fields so demo mode produces usable values.
+
+**Before / after.** Before: `entry_px 45.0` with no way to date the book behind
+it. After, from the demo smoke run: `book_exchange_ts_ms: 1787433675896.0,
+book_age_ms: 2.809, book_exchange_lag_ms: 1198154470.447` — the last being the
+replay offset, which is the same caveat `feed_lag_ms` already carries in demo
+and is documented as such.
+
+**Reasoning and trade-offs.** Reusing the existing `Book.ts_ms` alone was
+rejected: it is the exchange's stamp only, and the two lags answer different
+questions — one measures this process, the other measures the exchange link.
+Deriving the age at read time from `bid_path_samples` was rejected because the
+path is anchored at entry and does not carry the book's own provenance. Passing
+the arrival stamp explicitly (rather than defaulting to `time.time()` inside the
+book) keeps the reader's stamp authoritative in the live path while leaving
+isolated callers usable.
+
+**Validation.** New tests assert the exchange stamp and arrival wall on snapshot
+and delta; that a frame with no `ts_ms` leaves the stamp alone; that
+`ShadowBook` mirrors both through `reset` and `apply_delta`; that the realistic
+entry records age, exchange lag, feed lag and backlog; that the original paper
+path records the same fields; and that an unstamped book reports the age as
+unknown rather than as zero. The whole-tape regression above confirms entry
+behaviour is unchanged. Suite 504 OK.
+
+**Risks / limitations.** `book_age_ms` measures arrival into this process, not
+the exchange's own book time; a frame delayed on the wire before arrival is
+invisible to it, which is exactly why `book_exchange_lag_ms` is recorded beside
+it. Snapshot frames may not carry `ts_ms`, in which case the exchange stamp
+stays at whatever the last delta set, or NULL. Trades from before this deploy
+keep NULL `entry_context`.
+
+**Follow-up.** Compare `book_age_ms` at fill against `feed_lag_ms` over a live
+window to decide whether `PAPER_MAX_BOOK_AGE_MS` should ever be armed.
+
+### CHG-2026-09-05-011 — Key every row of one episode with `episode_id`
+
+**Commit:** `b59cece`
+**Components:** `app/engine.py`, `app/store.py`,
+`tests/test_signal_capture_context.py`, `tests/test_production_migration.py`
+
+**Observed / original behaviour.** In `parallel` mode one confirmed episode
+writes **two** signal rows — one `gate_a`, one `price_only_late_score` — with
+different ids, identical trigger fields and two independent forward watches, and
+nothing keyed them together. Joining a Gate-A row to its price-only twin meant
+matching on `(market, ts_ms, dl, levels)` and hoping.
+
+**Root cause.** Design gap introduced when the sleeves were made to run
+independently: the dispatch copies the candidate per strategy and the copies
+lost their shared identity at the row level.
+
+**Why necessary.** The whole point of `parallel` mode is to compare the two
+sleeves on the *same* episodes. Without a key that comparison is a heuristic
+join, and any episode where the heuristic is wrong silently biases the
+comparison.
+
+**Exact change.** Additive `signals.episode_id TEXT` plus an index on it.
+`Engine.episode_id(cand)` returns `<market>:<int(candidate ts_ms)>` — the
+exchange timestamp and market **are** the episode — and `record_signal` writes it
+on **every** row it produces: `gate_a`, `price_only`, `unconfirmed`,
+`confirmed_late`, `strategy_lockout`, every `sleeve_*` refusal and every paper
+outcome. `record_subthreshold` deliberately does not: a near miss is not an
+episode, and it stays NULL.
+
+**Before / after.** Two rows from one episode before: ids 811 and 812 with no
+shared field that is guaranteed unique. After: both carry
+`episode_id='KXLALIGAGAME-...-TIE:1787433761420'`.
+
+**Reasoning and trade-offs.** A generated UUID per episode was rejected: it is
+not derivable from the candidate, so it cannot be recomputed at analysis time or
+recovered if a row is written by a different path. Using the first row's signal
+id was rejected because it makes the second row depend on the first having been
+written. The chosen key is content-addressed and stable — re-deriving it from
+the same candidate gives the same string.
+
+**Validation.** New tests assert the parallel pair shares one key, that the key
+is stable under re-derivation, that every episode outcome carries it, that a
+sub-threshold row does not, and — explicitly — that `store.stats()` funnel counts
+are **unchanged**: they key on outcome per strategy, and the test asserts the
+combined and both per-sleeve `unconfirmed` counts across an episode pair. The
+migration test asserts legacy rows keep NULL. Suite 504 OK.
+
+**Risks / limitations.** Two genuinely distinct episodes on the same market with
+the same exchange millisecond would collide. `EPISODE_COOLDOWN_S` (5 s) makes
+that impossible for candidates from the same detector, and the key is scoped by
+market, so the residual case is a duplicate exchange timestamp, which would also
+break the existing lockout. Historical rows keep NULL.
+
+**Follow-up.** None.
+
+### CHG-2026-09-05-010 — Return and persist the evidence behind every confirmation decision
+
+**Commit:** `b59cece`
+**Components:** `app/detector.py`, `app/engine.py`,
+`tests/test_signal_capture_context.py`, `tests/test_confirmation_window.py`,
+`tests/test_detector_scan.py`
+
+**Observed / original behaviour.** `Detector.confirm` returned
+`(confirmed, lag_ms)`. **`unconfirmed` is 76% of the Gate-A funnel — 1,150 of
+1,511 rows — and carried no explanation whatsoever.** The three questions that
+decide whether the confirmation rule is right (was there a sibling burst at all;
+how far away in time; did it move the right way) could only be answered by
+replaying raw tape.
+
+**Root cause.** Design gap: the scan already computed everything needed and
+returned only its verdict.
+
+**Why necessary.** `CONF_MS` and `CONF_SIGN` are frozen Gate-A parameters. They
+cannot be re-fitted from a table whose dominant row type says only "no".
+
+**Exact change.** `confirm` returns `(confirmed, lag_ms, evidence)`. The
+decision is unchanged: same scan, same window, same sign rule, same nearest-lag
+tie-break. `evidence` carries `window_ms`, `sign_required`, `siblings`,
+`siblings_with_tape`, `bursts_scanned`, and `bursts`: for each sibling burst
+within `4 x CONF_MS` of the candidate, `{sibling_ticker, lag_ms, signed_dl,
+levels, in_window, opposite_sign}`. `MarketState.big_bursts` becomes
+`(ts_ms, signed_dl, levels)` so the burst's shape travels with it; the rule reads
+`[0]` and `[1]` only. The list is sorted by `|lag|` and capped at 12
+(`bursts_near` records how many were in range), so a hot market cannot grow the
+row. `Engine._attach_confirmation` puts it on the candidate — which
+`_strategy_candidate` copies, so one attachment reaches every row of the episode
+— and adds `attempts`, the number of times the scan actually ran, which is what
+separates "no sibling ever printed" from "the wait window expired before its
+frame arrived". `record_signal` persists it under `signals.context.confirmation`
+for **confirmed and unconfirmed rows alike**.
+
+**Before / after.** An `unconfirmed` row before: `conf_lag_ms=NULL`, nothing
+else. After, from the demo smoke run: one row with
+`bursts_scanned=17, bursts=12, siblings=2, attempts=1` (siblings printed, all
+rejected) and another with `bursts_scanned=0, siblings=2, attempts=1903` (the
+siblings never printed a big burst at all, across 1,903 re-checks). Those are
+two completely different failures that were previously the same row.
+
+**Reasoning and trade-offs.** Recording every retained burst was rejected: the
+5 s retention window can hold hundreds in a hot market and `confirm` is called
+once per sibling trade while a candidate is pending, so the row and the cost
+would scale with trade rate. Bounding capture to `4 x CONF_MS` keeps the
+plausible confirmations and the near misses — a burst 60 ms outside a 50 ms
+window is the interesting case, one 3 s away is not. A separate
+`confirm_evidence()` method was rejected because it would scan twice.
+
+**Validation.** New tests assert the evidence on a real unconfirmed scan
+(in-window same-sign burst and out-of-window opposite-sign burst both recorded
+with the right flags and level counts); that a confirmation still decides
+exactly as before; that the list is bounded to the 12 nearest in a hot market
+with `bursts_near` and `bursts_scanned` showing the truncation; and that the
+engine persists it on the row. `tests/test_confirmation_window.py` still pins
+confirmed / late-confirmed / unconfirmed semantics and was updated only for the
+new tuple width. `tests/test_detector_scan.py` compares `big_bursts` on the
+fields the confirmation rule reads, so the verbatim reference implementation is
+**not** back-dated; the bundled-tape equivalence it exists to prove is
+unaffected. The whole-tape regression above confirms the funnel is identical.
+Suite 504 OK.
+
+**Risks / limitations.** `attempts` counts scans, not distinct siblings, so a
+market printing 1,903 trades during the wait window reports 1,903 — that is the
+measurement, but it is not a count of opportunities. Only bursts within
+`4 x CONF_MS` are described, so a sibling that printed 2 s late leaves no trace
+beyond `bursts_scanned`. Historical `unconfirmed` rows stay unexplained; nothing
+can recover their sibling tape except a raw replay.
+
+**Follow-up.** Re-fit `CONF_MS` and `CONF_WAIT_S` from the recorded lag
+distribution once forward data exists.
+
+### CHG-2026-09-05-009 — Record the book, the fill it refused, and the load behind every signal
+
+**Commit:** `b59cece`
+**Components:** `app/engine.py`, `app/store.py`,
+`tests/test_signal_capture_context.py`, `tests/test_subthreshold_capture.py`
+
+**Observed / original behaviour.** A signal row recorded the burst (`dl`,
+`levels`, `size`, `ref`, `ext`) and, since the platform pass, the frame it
+arrived on (`feed_lag_ms`, `proc_lag_ms`, `backlog`). It recorded nothing about
+the market. **A declined signal therefore had no counterfactual at all**: 1,150
+`unconfirmed` rows, hundreds of sleeve refusals and every `rejected_cap` /
+`rejected_floor` row said what was refused but never what it would have filled
+at. The raw L2 replay showed why that matters: the same 29 trades price at
+-$862.96, -$228.72 or +$550.33 depending only on how entry is modelled.
+
+**Root cause.** Design gap. The books were in memory at the decision and were
+not read.
+
+**Why necessary.** Without the fill a decline would have taken, the declined
+population — most of the funnel — cannot be priced, so no threshold that
+produces declines can be re-fitted from the database.
+
+**Exact change.** `Engine.record_signal` extends the **existing**
+`signals.context` JSON (no second column) with:
+
+* `books`: per leg of the event, `{bid, ask, bid_size, ask_size, last, mid,
+  spread_c}` from the live books, or `null` for a leg with no usable book;
+* `spread_c`: the candidate's own leg;
+* `fillable`: `{vwap, qty, levels, notional_usd, price_cap}` from walking
+  `book.ask_ladder(side)` to `PRICE_CAP` for `NOTIONAL_USD` **without consuming
+  anything** — deliberately the same walk as `PaperDesk.try_enter`;
+* `load`: `{open_watches, open_positions, pending_candidates}`;
+* `confirmation`: see CHG-2026-09-05-010.
+
+`record_subthreshold` gets a deliberately cheap subset — the legs' top of book
+and the spread, with no depth, no ladder walk and no load state — because those
+rows are numerous by design (287 against 78 candidates in a two-hour replay).
+Recorded prices are rounded to 3dp, because `best_yes_ask` is `100 - max(no_bids)`
+in floating point and an exact 55c NO bid reads back as 44.99999999999999.
+
+**No score, goal or event field is put on a signal.** Goal labelling stays a
+join at analysis time, and the AST allowlist test
+(`test_engine_price_only_decision_path_reads_no_match_feed_content`) stays
+green.
+
+**Before / after.** A `rejected_floor` row before: the refusal and nothing else.
+After, from the demo smoke run: `fillable: {vwap: 7.03, qty: 1423.1, levels: 3,
+notional_usd: 100.0, price_cap: 58.0}` — 1,423 contracts at 7c, which is exactly
+the exposure `PRICE_FLOOR` exists to refuse, now visible on the row that refused
+it.
+
+**Reasoning and trade-offs.** A separate `signals.book_context` column was
+rejected: the platform pass established `context` as the per-signal capture
+column one day earlier and a second column would fragment it. Recording the full
+ladder was rejected as unbounded on 1,511 rows; `{vwap, qty, levels}` is what
+prices the entry. Giving sub-threshold rows the full context was rejected on
+volume. **Capture is additive to collection and must never cost a row**, so the
+enrichment is wrapped: a failure records `capture_error` in the row and keeps
+the frame context, which is visible in the data rather than swallowed.
+No statement and no commit is added to the hot path — the fields ride the
+`insert_signal` that already happens (H2).
+
+**Validation.** New tests assert the context on `filled`, `unconfirmed`,
+`rejected_cap`, `sleeve_clock_stale` and `strategy_lockout` rows; that a leg
+with no usable book is `null` and not invented; that `fillable` **equals what
+`PaperDesk.try_enter` actually fills** on a laddered book (same vwap, same
+quantity, three levels); that it respects `PRICE_CAP`; that a sub-threshold row
+gets top of book and spread and explicitly **not** `fillable` or `load`; and
+that a capture failure keeps the row and records the reason. The whole-tape
+regression above confirms the funnel is unchanged. Suite 504 OK.
+
+**Risks / limitations.** `fillable` mirrors `try_enter`, which is the non-V2
+entry model; the V2 adapter walks a shadow book that may already be depleted by
+an earlier fill, so on a market with a very recent fill the two can differ. The
+row records what an *unconsumed* book offered, which is the right
+counterfactual for a decline but is an upper bound for a second entry in quick
+succession. Historical rows keep whatever context they had.
+
+**Follow-up.** None.
 
 ### CHG-2026-09-05-008 — Serve and report the raw archive as one timeline
 
@@ -378,6 +1206,51 @@ volume pressure returns eventually from that side.
 service, then `scripts/r2_probe.py` run once to confirm connectivity, then the
 first backlog drain watched through `/api/archive` (`by_state`) and the
 feed-health ledger. A study-database retention pass is a separate change.
+**Capture pass (plan items B3-B7), same day, same branch.** The platform-pass
+preamble above is left exactly as written; it describes that pass and stays
+true of it. What follows is the second pass of the 2026-09-05 plan.
+
+**Commits:** `b59cece`, `b5e0470`, `d743a17`, `a900e6d`, plus the documentation
+commit that adds these entries.
+**Base:** `25edb0e` (head of the platform pass above).
+**Diff totals:** 24 files, +2,558 / -86 (this section excluded): `app/`
++916 / -72 across 12 files, `tests/` +1,580 / -9 across 10 files,
+`README.md` + `.env.example` +62 / -5.
+**Suite:** 425 tests OK before (39.2 s), 504 tests OK after (50.3 s), under
+`python -X dev -W error::RuntimeWarning -m unittest discover -s tests`.
+**Deployment status:** NOT DEPLOYED. Nothing in this pass has run in
+production. Every number quoted below as production evidence was measured on
+the deployed 2026-09-04/05 build or on raw tape recorded by it, never on this
+one.
+
+**Configuration identity.** One strategy parameter is added
+(`PAPER_MAX_BOOK_AGE_MS`, default 0), and six strategy sources change
+(`books.py`, `config.py`, `detector.py`, `engine.py`, `execution.py`,
+`paper.py`), so both halves of the identity move: `CODE_FINGERPRINT`
+`f74a5bed98d2` -> `34df105ef152` and `config_id` `01ed0f686eabf351` ->
+`b504892fe63910bb` in this environment. `STRATEGY_PARAM_NAMES` goes from 48 to
+49 entries. Rows written after this deploys will not pool with earlier rows in
+a current-configuration aggregate. That is the intended behaviour of the
+provenance stamp. `EVENT_MATCH_WINDOW_S` and the two `PATH_THIN_*` knobs are
+deliberately NOT in that list — see CHG-2026-09-05-019 and -013.
+
+**Whole-tape regression check.** The bundled real tape (all three legs of
+Espanyol vs Real Madrid, 26,845 prints merged and time-ordered) was replayed
+through a full `Engine` at default settings on `25edb0e` and on this tree, with
+`time.time` driven off the tape so the two runs are comparable. The traces are
+**identical row for row**: 49 signal rows with identical
+`(ts_ms, market, dir, dl, levels, size, ref, ext, conf_lag_ms, late, outcome)`
+— 41 `subthreshold`, 5 `unconfirmed`, 2 `rejected_floor`, 1 `filled` — and one
+closed trade with identical `entry_px`, `size`, `exit_px`, `exit_reason`,
+`gross`, `fees`, `net`, `mae` (net +$103.83, exit `target`). `strategy_params()`
+is byte-identical once the new knob is removed. That is the evidence that Gate A
+detection, confirmation, sizing, entry, exit, fee, lockout and settlement are
+unchanged.
+
+The one intended difference on the same tape is path volume: 2,255 persisted
+path rows before, 1,906 after (-15.5%), across the same 9 path owners, with the
+per-owner `(min bid, max bid)` identical for **all 9** — thinning removed rows,
+not extremes. See CHG-2026-09-05-015.
 
 ### CHG-2026-09-05-006 — Bound the detector's per-trade scan to its own windows
 
