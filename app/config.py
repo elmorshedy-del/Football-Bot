@@ -195,6 +195,54 @@ CLOCK_MAPPING_INTERVAL_S = _f("CLOCK_MAPPING_INTERVAL_S", 15.0)
 # decision, so it is deliberately not a strategy parameter.
 PROVIDER_EVENT_FLUSH_S = _f("PROVIDER_EVENT_FLUSH_S", 60.0)
 
+# --- Raw feed archive (Cloudflare R2) ---------------------------------------
+# The Railway volume is finite (4.08 GB, 4.00 GB used on 2026-09-05 with 176
+# hourly segments = 2.94 GB) while the raw feed grows at ~300 MB/day.  The
+# archive extends the SAME logical timeline onto object storage: a segment is
+# uploaded, verified, and only then may its local copy be removed.  These are
+# STORAGE knobs.  They are deliberately absent from `STRATEGY_PARAM_NAMES`,
+# because moving a recorded file cannot change a trading decision.
+RAW_ARCHIVE_ENABLED = _b("RAW_ARCHIVE_ENABLED", False)
+R2_ACCOUNT_ID = os.environ.get("R2_ACCOUNT_ID", "")
+R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
+# Secret.  Never logged, never exported, never returned by an API.
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
+R2_BUCKET = os.environ.get("R2_BUCKET", "football-bot-raw-feed")
+# Optional endpoint override.  Empty means the account's R2 endpoint; tests
+# point it at a local stub so no test ever needs the network.
+R2_ENDPOINT = os.environ.get("R2_ENDPOINT", "")
+# A verified segment stays on the volume this long so recent replays are served
+# from local disk; older ones are pruned to R2 (they remain downloadable).
+RAW_LOCAL_RETENTION_HOURS = _i("RAW_LOCAL_RETENTION_HOURS", 48)
+# Emergency floor: below this much free space on DATA_DIR, verified segments are
+# pruned oldest-first regardless of retention.  The failure this prevents is
+# silent write loss in the study database on a full volume.
+RAW_ARCHIVE_MIN_FREE_MB = _i("RAW_ARCHIVE_MIN_FREE_MB", 512)
+RAW_ARCHIVE_MAX_ATTEMPTS = _i("RAW_ARCHIVE_MAX_ATTEMPTS", 5)
+RAW_ARCHIVE_INTERVAL_S = _f("RAW_ARCHIVE_INTERVAL_S", 60.0)
+
+
+def r2_endpoint():
+    """Base URL of the S3-compatible endpoint, or "" when unconfigured."""
+    if R2_ENDPOINT:
+        return R2_ENDPOINT.rstrip("/")
+    if R2_ACCOUNT_ID:
+        return f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+    return ""
+
+
+def raw_archive_ready():
+    """True only when the archive is switched on AND fully credentialled.
+
+    Fail closed: without this the feature is inert -- no uploads, no state
+    writes, no deletions -- and the bot behaves exactly as it did before.
+    """
+    return bool(
+        RAW_ARCHIVE_ENABLED and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY
+        and R2_BUCKET and r2_endpoint()
+    )
+
+
 # --- Market discovery ---
 DISCOVERY_INTERVAL_S = _i("DISCOVERY_INTERVAL_S", 180)
 SUBSCRIBE_BEFORE_CLOSE_MIN = _i("SUBSCRIBE_BEFORE_CLOSE_MIN", 150)  # watch markets closing within this

@@ -242,7 +242,7 @@ def init():
     # migrate: add mode column to older DBs (persisted on a volume)
     for tbl in ("signals", "trades", "match_clock_observations",
                 "provider_match_events", "goal_latency_observations",
-                "latency", "paper_fills"):
+                "latency", "paper_fills", "raw_segments"):
         try:
             _conn.execute(f"ALTER TABLE {tbl} ADD COLUMN mode TEXT")
         except sqlite3.OperationalError:
@@ -415,6 +415,36 @@ def init():
              ON feed_events(ts);
            CREATE INDEX IF NOT EXISTS idx_feed_events_kind_ts
              ON feed_events(kind, ts);"""
+    )
+    # Raw-segment archive ledger.  This table -- not a directory listing -- is
+    # the source of truth for what the archive contains and where each segment
+    # is: `local` (on the volume, not yet uploaded), `uploaded` (verified in R2
+    # and still on the volume) or `pruned` (verified in R2, removed from the
+    # volume).  A segment is never deleted locally before `verified_ts` is set,
+    # so there is no state in which it is neither on the volume nor verified
+    # remotely.  Created here with the other observation tables; CREATE ... IF
+    # NOT EXISTS plus the `mode` ALTER above keep it idempotent.
+    _conn.executescript(
+        """CREATE TABLE IF NOT EXISTS raw_segments(
+             name TEXT PRIMARY KEY,
+             hour TEXT,
+             bytes INTEGER,
+             sha256 TEXT,
+             md5 TEXT,
+             state TEXT NOT NULL,
+             r2_key TEXT,
+             etag TEXT,
+             sealed_ts REAL,
+             uploaded_ts REAL,
+             verified_ts REAL,
+             pruned_ts REAL,
+             attempts INTEGER DEFAULT 0,
+             last_error TEXT,
+             mode TEXT);
+           CREATE INDEX IF NOT EXISTS idx_raw_segments_state
+             ON raw_segments(state, name);
+           CREATE INDEX IF NOT EXISTS idx_raw_segments_hour
+             ON raw_segments(hour);"""
     )
     _conn.executescript(
         """CREATE TABLE IF NOT EXISTS match_clock_observations(
@@ -689,6 +719,105 @@ def insert_feed_event(kind, detail=None, ts=None, mono=None):
     cur = ex("INSERT INTO feed_events(ts,mono,kind,detail,mode) VALUES(?,?,?,?,?)",
              (time.time() if ts is None else ts, mono, kind, detail, _mode))
     return cur.lastrowid
+
+
+# --- Raw-segment archive ledger ---------------------------------------------
+# The three states a recorded segment can be in.  They are exhaustive: every
+# registered segment is on the volume, verified in R2, or both.
+RAW_LOCAL = "local"
+RAW_UPLOADED = "uploaded"
+RAW_PRUNED = "pruned"
+RAW_STATES = (RAW_LOCAL, RAW_UPLOADED, RAW_PRUNED)
+
+
+def register_raw_segment(name, hour=None, size=None, sealed_ts=None):
+    """Record a sealed segment as `local`; return True when a row was created.
+
+    INSERT OR IGNORE, so re-registering a segment the archive already knows
+    about (startup reconcile, a repeated rotation) can never reset its state or
+    lose its verification stamps.
+    """
+    cur = ex(
+        """INSERT OR IGNORE INTO raw_segments(
+               name,hour,bytes,state,sealed_ts,attempts,mode)
+           VALUES(?,?,?,?,?,0,?)""",
+        (name, hour, size, RAW_LOCAL, sealed_ts, _mode),
+    )
+    return bool(cur.rowcount)
+
+
+def raw_segment(name):
+    """One archive row, or None.  Always re-read before acting on a segment."""
+    rows = q("SELECT * FROM raw_segments WHERE name=?", (name,))
+    return rows[0] if rows else None
+
+
+def raw_segment_rows(state=None, selector="all"):
+    """Archive rows ordered oldest-first by segment name.
+
+    Segment names sort chronologically (`feed-YYYYMMDD-HH`), so name order is
+    time order, which is what the backlog drain and the prune both need.
+    """
+    scope, scope_args = mode_clause(selector=selector)
+    where = " AND state=?" if state else ""
+    args = (*scope_args, *((state,) if state else ()))
+    return q(f"SELECT * FROM raw_segments WHERE 1=1{scope}{where} ORDER BY name",
+             args)
+
+
+def raw_segment_index():
+    """Every archive row keyed by name, or {} when the table is unreachable.
+
+    Read-only presentation helper for the export inventory and the download
+    path.  A missing or uninitialised database must degrade to "the volume is
+    all we know about", never break a listing that used to work.
+    """
+    try:
+        return {row["name"]: row for row in q("SELECT * FROM raw_segments")}
+    except Exception:  # noqa: BLE001 - inventory must survive a cold database
+        return {}
+
+
+def mark_raw_segment_uploaded(name, *, size, sha256, md5, r2_key, etag,
+                              uploaded_ts, verified_ts):
+    """Flip a segment to `uploaded` after BOTH remote checks passed.
+
+    Setting `verified_ts` is what authorises a later prune, so this is only
+    ever called once the returned ETag matched the local md5 and the HEAD
+    content length matched the local size.
+    """
+    ex(
+        """UPDATE raw_segments
+              SET state=?, bytes=?, sha256=?, md5=?, r2_key=?, etag=?,
+                  uploaded_ts=?, verified_ts=?, last_error=NULL
+            WHERE name=?""",
+        (RAW_UPLOADED, size, sha256, md5, r2_key, etag, uploaded_ts,
+         verified_ts, name),
+    )
+
+
+def mark_raw_segment_pruned(name, pruned_ts):
+    """Flip `uploaded` -> `pruned`; False when the row was not eligible.
+
+    The WHERE clause is the last durable guard before the local file is
+    deleted: it refuses any row that is not verified in R2.
+    """
+    cur = ex(
+        """UPDATE raw_segments SET state=?, pruned_ts=?
+            WHERE name=? AND state=? AND verified_ts IS NOT NULL""",
+        (RAW_PRUNED, pruned_ts, name, RAW_UPLOADED),
+    )
+    return bool(cur.rowcount)
+
+
+def record_raw_segment_error(name, error):
+    """Count one failed attempt and keep the reason. State is NOT changed."""
+    ex(
+        """UPDATE raw_segments
+              SET attempts=COALESCE(attempts,0)+1, last_error=?
+            WHERE name=?""",
+        (None if error is None else str(error)[:500], name),
+    )
 
 
 LATENCY_KIND_CANONICAL = {

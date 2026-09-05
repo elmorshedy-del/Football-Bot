@@ -125,6 +125,8 @@ TABLES = (
     "goal_latency_observations",
     # Created by the migration itself on a database that predates it.
     "feed_events",
+    # The raw-segment archive ledger, likewise created by the migration.
+    "raw_segments",
 )
 
 
@@ -201,6 +203,10 @@ class ProductionSchemaMigrationTests(unittest.TestCase):
             # Per-signal capture conditions (feed lag, processing lag, backlog).
             "signals": {"context"},
             "feed_events": {"ts", "mono", "kind", "detail"},
+            "raw_segments": {
+                "name", "hour", "bytes", "sha256", "md5", "state", "r2_key",
+                "etag", "sealed_ts", "uploaded_ts", "verified_ts", "pruned_ts",
+                "attempts", "last_error"},
             "match_clock_observations": {
                 "source", "confirmed_ts", "confirmation_previous_poll_ts"},
             "provider_match_events": {
@@ -263,6 +269,53 @@ class ProductionSchemaMigrationTests(unittest.TestCase):
         self.migrate()
         self.assertEqual(store.q("SELECT id, kind, detail, mode FROM feed_events"),
                          before, "remigration rewrote the ledger")
+
+    def test_the_archive_ledger_is_created_empty_and_survives_remigration(self):
+        """A production database that predates the archive gains the table
+        without inventing archive history, and a verified segment's stamps are
+        not disturbed by migrating again -- which is what stops a re-deploy from
+        making a pruned segment look local, or an unverified one look safe to
+        delete."""
+        self.migrate()
+        self.assertEqual(
+            store.q("SELECT COUNT(*) AS n FROM raw_segments")[0]["n"], 0,
+            "the migration invented archive history",
+        )
+
+        self.assertTrue(store.register_raw_segment(
+            "feed-20260901-10.jsonl.gz", "20260901-10", 1234, 1_777_777_777.0))
+        self.assertFalse(
+            store.register_raw_segment("feed-20260901-10.jsonl.gz"),
+            "re-registering an existing segment created a second row",
+        )
+        store.mark_raw_segment_uploaded(
+            "feed-20260901-10.jsonl.gz", size=1234, sha256="a" * 64,
+            md5="b" * 32, r2_key="raw/feed-20260901-10.jsonl.gz",
+            etag="b" * 32, uploaded_ts=10.0, verified_ts=11.0,
+        )
+        before = store.q("SELECT * FROM raw_segments")
+
+        self.migrate()
+        self.migrate()
+
+        self.assertEqual(store.q("SELECT * FROM raw_segments"), before,
+                         "remigration rewrote the archive ledger")
+        self.assertEqual(before[0]["state"], store.RAW_UPLOADED)
+        self.assertEqual(before[0]["mode"], "live")
+
+    def test_an_unverified_segment_can_never_be_marked_pruned(self):
+        """The durable guard in front of the only local delete."""
+        self.migrate()
+        store.register_raw_segment("feed-20260901-11.jsonl.gz", "20260901-11", 9)
+
+        self.assertFalse(
+            store.mark_raw_segment_pruned("feed-20260901-11.jsonl.gz", 12.0),
+            "a segment that was never verified in R2 was marked pruned",
+        )
+        self.assertEqual(
+            store.raw_segment("feed-20260901-11.jsonl.gz")["state"],
+            store.RAW_LOCAL,
+        )
 
     def test_legacy_rows_survive_a_live_boot(self):
         self.migrate()
