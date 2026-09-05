@@ -7,6 +7,7 @@ from collections import deque
 from datetime import datetime, timezone
 
 from . import config, store
+from .archive import RawArchive
 from .books import Book
 from .detector import Detector
 from .goal_latency import GoalLatencyObserver
@@ -140,7 +141,18 @@ class Engine:
         self.desk = PaperDesk(
             self.broadcast, self.on_paper_entry_result, error_result=self._record_error,
         )
-        self.recorder = RawRecorder(self.on_recorder_error, self.on_feed_event)
+        # The raw-feed archive.  Constructed unconditionally so `status()` can
+        # always describe the timeline, but completely inert -- no uploads, no
+        # ledger writes, no deletions -- unless RAW_ARCHIVE_ENABLED is set and
+        # R2 credentials are present.
+        self.archive = RawArchive(
+            on_event=self.on_feed_event, on_error=self._record_error,
+        )
+        self.recorder = RawRecorder(
+            self.on_recorder_error, self.on_feed_event, self.archive.on_sealed,
+        )
+        self.archive.bind_recorder(self.recorder)
+        self._archive_task = None
         self.books = {}
         self.meta = {}                 # ticker -> {event, series, title, close_time}
         self.fee_schedules = {}        # series -> (fee_type, fee_multiplier)
@@ -1350,6 +1362,12 @@ class Engine:
                                  else getattr(self, "feed_backlog", 0)),
                 "feed_backlog_max": (ws.max_backlog if ws is not None
                                      else getattr(self, "_backlog_tick", 0)),
+                # Continuity of the raw archive: the same block the study
+                # manifest and `GET /api/archive` carry, plus how the archive
+                # task itself is behaving.  Read from a cached snapshot the
+                # background task refreshes off the loop.
+                "archive": (archive.status()
+                            if (archive := getattr(self, "archive", None)) else {}),
                 "feed_event_failures": getattr(self, "_feed_event_failures", 0),
                 "feed_lag_p50": round(lat[len(lat) // 2], 1) if lat else None,
                 "feed_lag_p95": round(lat[int(0.95 * len(lat))], 1) if len(lat) > 20 else None}
@@ -1407,4 +1425,17 @@ class Engine:
             store.log_event("sys", "engine started in DEMO mode (replaying real Madrid tapes)")
         if config.PAPER_EXECUTION_V2:
             asyncio.create_task(self.paper_execution_task())
+        # One background archive task, in both modes.  It registers the
+        # existing backlog on its first pass and drains it oldest-first, one
+        # upload at a time.  Without credentials the task is never created and
+        # the feature does not exist as far as the process is concerned.
+        archive = getattr(self, "archive", None)
+        if archive is not None and archive.enabled:
+            self._archive_task = asyncio.create_task(archive.run())
+            store.log_event(
+                "sys",
+                f"raw archive enabled -> bucket {config.R2_BUCKET}; "
+                f"retention {config.RAW_LOCAL_RETENTION_HOURS}h, "
+                f"free floor {config.RAW_ARCHIVE_MIN_FREE_MB} MB",
+            )
         asyncio.create_task(self.periodic_task())

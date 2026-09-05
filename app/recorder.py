@@ -31,13 +31,18 @@ MARKER_TYPE = "recorder_marker"
 
 
 class RawRecorder:
-    def __init__(self, on_error=None, on_event=None):
+    def __init__(self, on_error=None, on_event=None, on_sealed=None):
         self.dir = os.path.join(config.DATA_DIR, "raw")
         self.on_error = on_error
         # Feed-health ledger callback: (kind, detail, marker=bool).  ``marker``
         # is False when the recorder must not be re-entered to write the
         # matching stream marker (a rotation forced from a worker thread).
         self.on_event = on_event
+        # Archive hook: called with the path of a segment that will never be
+        # appended to again.  The recorder stays thin -- it seals and tells --
+        # and the archive owns upload, verification, retention and pruning.
+        # It runs on the WebSocket path, so it must be O(1) and must not raise.
+        self.on_sealed = on_sealed
         self._fh = None
         self._hour = None
         self._n_since_flush = 0
@@ -70,6 +75,20 @@ class RawRecorder:
         except Exception:
             self.event_failures += 1
 
+    def _seal(self, path):
+        """Tell the archive a segment is finished.  Never raises, never blocks.
+
+        A failure here would be a failure to record the feed, so it is counted
+        and swallowed exactly like a ledger fault.  The archive also reconciles
+        the directory on every pass, so a missed hook costs promptness only.
+        """
+        if self.on_sealed is None:
+            return
+        try:
+            self.on_sealed(path)
+        except Exception:
+            self.event_failures += 1
+
     def _rotate(self):
         hour = time.strftime("%Y%m%d-%H", time.gmtime())
         if hour != self._hour:
@@ -83,6 +102,9 @@ class RawRecorder:
                 # checkpoint.  The marker lands in the new segment.
                 self._emit("recorder_rotate", {"reason": "hour",
                                                "previous": previous, "hour": hour})
+                # The previous hour can never be appended to again: the clock
+                # has moved past it.  Only now is it eligible for the archive.
+                self._seal(os.path.join(self.dir, f"feed-{previous}.jsonl.gz"))
 
     def _write_frame(self, frame, local_wall, counted=True):
         """Append one line.  `counted` keeps `total` a count of EXCHANGE frames,
@@ -189,6 +211,9 @@ class RawRecorder:
         self._emit("recorder_rotate", {"reason": "export", "hour": active_hour,
                                        "finalized": os.path.basename(finalized_path)},
                    marker=False)
+        # The finalized part is immutable by construction: the recorder reopens
+        # the hour under its original name, so nothing will ever append here.
+        self._seal(finalized_path)
         return finalized_path
 
     def close(self):
