@@ -15,7 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTask
 
-from . import config, exporter, store
+from . import archive, config, exporter, store
 from .audit import (
     build_trigger,
     json_object,
@@ -140,6 +140,14 @@ async def lifespan(_app):
             # cancelled or failed export cannot surface later as an unobserved
             # task exception during interpreter shutdown.
             await asyncio.gather(*pending, return_exceptions=True)
+        # Ask the archive to stop between segments before cancelling its task,
+        # so an in-flight upload is abandoned at a boundary rather than mid-PUT.
+        engine.archive.stop()
+        archive_task = getattr(engine, "_archive_task", None)
+        if archive_task is not None:
+            archive_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await archive_task
         with suppress(OSError):
             engine.recorder.close()
         await engine.client.close()
@@ -510,6 +518,10 @@ async def trades(limit: int = 200, mode: str | None = None):
             # full path is served by /api/trades/{id}/path on demand.
             r["bid_path_summary"] = json_object(r.get("bid_path_summary")) or None
             r["bid_path_url"] = f"/api/trades/{r['id']}/path?mode={selector}"
+            # Book age at the fill, and the trigger values behind the exit
+            # label.  Decoded so the API serves objects rather than JSON text.
+            r["entry_context"] = json_object(r.get("entry_context")) or None
+            r["exit_context"] = json_object(r.get("exit_context")) or None
             mark = live_marks.get(r["id"])
             if r.get("status") == "open" and mark and r.get("mode") == engine_mode:
                 # Storage is the selector source of truth; in-memory state may only
@@ -642,6 +654,55 @@ async def match_clocks(limit: int = 100, mode: str | None = None):
         if engine and getattr(engine, "clock_tracker", None) else {}
     )
     return {"coverage": coverage, "observations": rows}
+
+
+@app.get("/api/archive")
+async def archive_state(limit: int = 200, mode: str | None = None):
+    """Raw-feed archive continuity: one timeline across volume and R2.
+
+    `archive` is the same block the study manifest and `Engine.status()` carry:
+    counts by state, local and remote bytes, the first and last hour, and the
+    hours that are missing entirely.  `segments` is the mode-scoped ledger,
+    newest first.  No credential is reported here or anywhere else.
+    """
+    limit = max(1, min(limit, 1000))
+    selector = _mode_selector(mode)
+
+    def _load():
+        scope, scope_args = store.mode_clause(selector=selector)
+        rows = _label_modes(store.q(
+            f"SELECT * FROM raw_segments WHERE 1=1{scope}"
+            " ORDER BY name DESC LIMIT ?", (*scope_args, limit),
+        ))
+        return archive.archive_continuity(selector), rows
+
+    continuity, segments = await store.read(_load)
+    return {"archive": continuity, "segments": segments}
+
+
+@app.get("/api/feed-events")
+async def feed_events(limit: int = 200, mode: str | None = None):
+    """Feed-health ledger: connection, subscription, gap, snapshot, rotation.
+
+    Newest first and bounded, like the other mode-scoped observation reads.
+    """
+    limit = max(1, min(limit, 1000))
+    selector = _mode_selector(mode)
+
+    def _load():
+        scope, scope_args = store.mode_clause(selector=selector)
+        rows = _label_modes(store.q(
+            f"SELECT * FROM feed_events WHERE 1=1{scope}"
+            " ORDER BY id DESC LIMIT ?", (*scope_args, limit),
+        ))
+        for row in rows:
+            try:
+                row["detail"] = json.loads(row["detail"])
+            except (TypeError, json.JSONDecodeError):
+                pass
+        return rows
+
+    return {"events": await store.read(_load)}
 
 
 @app.get("/api/trades/{trade_id}/path")
@@ -1140,13 +1201,71 @@ async def download_raw_segment(
     if not header_ok and not cookie_ok:
         raise HTTPException(status_code=401, detail="invalid export authorization")
     path = exporter.safe_raw_segment_path(name)
-    if path is None:
+    if path is not None:
+        return _ranged_file_response(
+            str(path),
+            filename=path.name,
+            media_type="application/gzip",
+            range_header=range_header,
+        )
+    # Not on the volume: it may have been pruned to R2 after verification.  A
+    # caller must not need to know where a segment lives, so the same
+    # authorisation serves the same bytes from the archive.
+    return await _remote_raw_segment(name, range_header)
+
+
+async def _remote_raw_segment(name, range_header=None):
+    """Stream a pruned segment back from R2, passing Range straight through."""
+    if not archive.SEGMENT_NAME.match(name or ""):
         raise HTTPException(status_code=404, detail="Raw segment not found")
-    return _ranged_file_response(
-        str(path),
-        filename=path.name,
-        media_type="application/gzip",
-        range_header=range_header,
+    index = await asyncio.to_thread(store.raw_segment_index)
+    row = (index or {}).get(name)
+    if not row or not row.get("r2_key") or not row.get("verified_ts"):
+        raise HTTPException(status_code=404, detail="Raw segment not found")
+    client = archive.R2Client.from_config()
+    if client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Segment is archived off-volume and R2 is not configured",
+        )
+    try:
+        response, http_client = await client.open_stream(
+            row["r2_key"], range_header if isinstance(range_header, str) else None,
+        )
+    except Exception as exc:  # noqa: BLE001 - a transport fault is a 502, not a crash
+        if engine is not None:
+            engine._record_error("raw_archive_read", exc)
+        raise HTTPException(status_code=502,
+                            detail="Archived segment is unavailable") from exc
+    if response.status_code not in (200, 206):
+        status = response.status_code
+        await response.aclose()
+        await http_client.aclose()
+        raise HTTPException(
+            status_code=404 if status == 404 else 502,
+            detail="Archived segment is unavailable",
+        )
+
+    async def body():
+        try:
+            async for chunk in response.aiter_bytes(1024 * 1024):
+                yield chunk
+        finally:
+            await response.aclose()
+            await http_client.aclose()
+
+    headers = {
+        "Accept-Ranges": "bytes",
+        "Content-Disposition": f'attachment; filename="{name}"',
+        "X-Segment-Location": "r2",
+    }
+    for header in ("Content-Length", "Content-Range"):
+        value = response.headers.get(header)
+        if value:
+            headers[header] = value
+    return StreamingResponse(
+        body(), status_code=response.status_code,
+        media_type="application/gzip", headers=headers,
     )
 
 

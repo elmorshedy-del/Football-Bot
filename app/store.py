@@ -242,7 +242,7 @@ def init():
     # migrate: add mode column to older DBs (persisted on a volume)
     for tbl in ("signals", "trades", "match_clock_observations",
                 "provider_match_events", "goal_latency_observations",
-                "latency", "paper_fills"):
+                "latency", "paper_fills", "raw_segments"):
         try:
             _conn.execute(f"ALTER TABLE {tbl} ADD COLUMN mode TEXT")
         except sqlite3.OperationalError:
@@ -260,6 +260,13 @@ def init():
         ("max_executable_bid_ts", "REAL"),
         ("bid_path_summary", "TEXT"),
         ("mfe_c", "REAL"),
+        # Conditions at the entry fill: the age of the book it consumed, the
+        # exchange stamp behind that book, and the feed lag/backlog at the
+        # moment of the fill.  Additive JSON; see CHG-2026-09-05-008.
+        ("entry_context", "TEXT"),
+        # Conditions at the exit fill: the trigger values behind the recorded
+        # exit reason, and the held-side/opposite-side book at the fill.
+        ("exit_context", "TEXT"),
     ):
         try:
             _conn.execute(f"ALTER TABLE trades ADD COLUMN {column} {definition}")
@@ -270,6 +277,19 @@ def init():
             _conn.execute(f"ALTER TABLE markets ADD COLUMN {column} TEXT")
         except sqlite3.OperationalError:
             pass
+    # Settlement outcome, so a study can ask what actually happened to a market
+    # the bot watched -- including the ones it declined.  Nothing persisted the
+    # result anywhere queryable before; see CHG-2026-09-05-010.
+    for column, definition in (
+        ("result", "TEXT"),
+        ("settled_ts", "REAL"),
+        ("last_yes_bid", "REAL"),
+        ("last_yes_ask", "REAL"),
+    ):
+        try:
+            _conn.execute(f"ALTER TABLE markets ADD COLUMN {column} {definition}")
+        except sqlite3.OperationalError:
+            pass
     # Every new clock row records the exact source behind its stamp.  Legacy
     # rows keep a null source and are presented as legacy_unknown; they are
     # never relabeled as the current provider.
@@ -277,6 +297,7 @@ def init():
         ("source", "TEXT"),
         ("confirmed_ts", "REAL"),
         ("confirmation_previous_poll_ts", "REAL"),
+        ("poll_seq", "INTEGER"),
     ):
         try:
             _conn.execute(
@@ -288,6 +309,10 @@ def init():
         ("canonical_type", "TEXT"),
         ("canonical_side", "TEXT"),
         ("normalized_event", "TEXT"),
+        # Observer-run poll counter, so poll cadence is reconstructible from
+        # the rows.  Historical rows keep NULL: the counter did not exist when
+        # they were written and is never backfilled.
+        ("poll_seq", "INTEGER"),
     ):
         try:
             _conn.execute(
@@ -309,11 +334,27 @@ def init():
         except sqlite3.OperationalError:
             pass
     for column in ("match_clock_snapshot", "forward_path_summary",
-                   "path_incomplete_reason"):
+                   "path_incomplete_reason",
+                   # Per-signal capture conditions (feed lag, processing lag,
+                   # queue backlog).  Additive JSON so the row explains the
+                   # timing it was produced under; see CHG-2026-09-05-001.
+                   "context",
+                   # `<market>:<candidate ts_ms>`.  Written on every row of one
+                   # detected episode so the two rows `parallel` mode produces
+                   # join without heuristics; see CHG-2026-09-05-007.
+                   "episode_id"):
         try:
             _conn.execute(f"ALTER TABLE signals ADD COLUMN {column} TEXT")
         except sqlite3.OperationalError:
             pass
+    # Episodes are looked up by identity when a study joins the two sleeves'
+    # rows; without this that join is a full scan of the signals table.
+    try:
+        _conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_signals_episode ON signals(episode_id)"
+        )
+    except sqlite3.OperationalError:
+        pass
     # Configuration provenance.  Rows written before this existed keep a NULL
     # config_id: their configuration is unknown, not assumed to be the current
     # one, so they are never pooled into a current-configuration aggregate.
@@ -394,6 +435,53 @@ def init():
            CREATE UNIQUE INDEX IF NOT EXISTS idx_bid_path_signal_seq
              ON bid_path_samples(signal_id, kind, sample_seq)
            WHERE signal_id IS NOT NULL AND sample_seq IS NOT NULL;"""
+    )
+    # Feed-health ledger.  Connection, subscription, sequence-gap, snapshot and
+    # recorder-rotation events, so a gap in the study can be explained instead
+    # of guessed at.  Created here (not in SCHEMA) purely for locality with the
+    # other observation tables; CREATE ... IF NOT EXISTS keeps it idempotent.
+    _conn.executescript(
+        """CREATE TABLE IF NOT EXISTS feed_events(
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             ts REAL NOT NULL,
+             mono REAL,
+             kind TEXT NOT NULL,
+             detail TEXT,
+             mode TEXT);
+           CREATE INDEX IF NOT EXISTS idx_feed_events_ts
+             ON feed_events(ts);
+           CREATE INDEX IF NOT EXISTS idx_feed_events_kind_ts
+             ON feed_events(kind, ts);"""
+    )
+    # Raw-segment archive ledger.  This table -- not a directory listing -- is
+    # the source of truth for what the archive contains and where each segment
+    # is: `local` (on the volume, not yet uploaded), `uploaded` (verified in R2
+    # and still on the volume) or `pruned` (verified in R2, removed from the
+    # volume).  A segment is never deleted locally before `verified_ts` is set,
+    # so there is no state in which it is neither on the volume nor verified
+    # remotely.  Created here with the other observation tables; CREATE ... IF
+    # NOT EXISTS plus the `mode` ALTER above keep it idempotent.
+    _conn.executescript(
+        """CREATE TABLE IF NOT EXISTS raw_segments(
+             name TEXT PRIMARY KEY,
+             hour TEXT,
+             bytes INTEGER,
+             sha256 TEXT,
+             md5 TEXT,
+             state TEXT NOT NULL,
+             r2_key TEXT,
+             etag TEXT,
+             sealed_ts REAL,
+             uploaded_ts REAL,
+             verified_ts REAL,
+             pruned_ts REAL,
+             attempts INTEGER DEFAULT 0,
+             last_error TEXT,
+             mode TEXT);
+           CREATE INDEX IF NOT EXISTS idx_raw_segments_state
+             ON raw_segments(state, name);
+           CREATE INDEX IF NOT EXISTS idx_raw_segments_hour
+             ON raw_segments(hour);"""
     )
     _conn.executescript(
         """CREATE TABLE IF NOT EXISTS match_clock_observations(
@@ -656,6 +744,119 @@ def log_event(kind, text):
     ex("INSERT INTO eventlog(ts,kind,text) VALUES(?,?,?)", (time.time(), kind, text))
 
 
+def insert_feed_event(kind, detail=None, ts=None, mono=None):
+    """Append one feed-health event.
+
+    `detail` is stored as compact JSON when it is not already text, so the
+    ledger keeps whatever the emitter knew (sid, counts, exception type)
+    without a column per kind.
+    """
+    if detail is not None and not isinstance(detail, str):
+        detail = json.dumps(detail, separators=(",", ":"), default=str)
+    cur = ex("INSERT INTO feed_events(ts,mono,kind,detail,mode) VALUES(?,?,?,?,?)",
+             (time.time() if ts is None else ts, mono, kind, detail, _mode))
+    return cur.lastrowid
+
+
+# --- Raw-segment archive ledger ---------------------------------------------
+# The three states a recorded segment can be in.  They are exhaustive: every
+# registered segment is on the volume, verified in R2, or both.
+RAW_LOCAL = "local"
+RAW_UPLOADED = "uploaded"
+RAW_PRUNED = "pruned"
+RAW_STATES = (RAW_LOCAL, RAW_UPLOADED, RAW_PRUNED)
+
+
+def register_raw_segment(name, hour=None, size=None, sealed_ts=None):
+    """Record a sealed segment as `local`; return True when a row was created.
+
+    INSERT OR IGNORE, so re-registering a segment the archive already knows
+    about (startup reconcile, a repeated rotation) can never reset its state or
+    lose its verification stamps.
+    """
+    cur = ex(
+        """INSERT OR IGNORE INTO raw_segments(
+               name,hour,bytes,state,sealed_ts,attempts,mode)
+           VALUES(?,?,?,?,?,0,?)""",
+        (name, hour, size, RAW_LOCAL, sealed_ts, _mode),
+    )
+    return bool(cur.rowcount)
+
+
+def raw_segment(name):
+    """One archive row, or None.  Always re-read before acting on a segment."""
+    rows = q("SELECT * FROM raw_segments WHERE name=?", (name,))
+    return rows[0] if rows else None
+
+
+def raw_segment_rows(state=None, selector="all"):
+    """Archive rows ordered oldest-first by segment name.
+
+    Segment names sort chronologically (`feed-YYYYMMDD-HH`), so name order is
+    time order, which is what the backlog drain and the prune both need.
+    """
+    scope, scope_args = mode_clause(selector=selector)
+    where = " AND state=?" if state else ""
+    args = (*scope_args, *((state,) if state else ()))
+    return q(f"SELECT * FROM raw_segments WHERE 1=1{scope}{where} ORDER BY name",
+             args)
+
+
+def raw_segment_index():
+    """Every archive row keyed by name, or {} when the table is unreachable.
+
+    Read-only presentation helper for the export inventory and the download
+    path.  A missing or uninitialised database must degrade to "the volume is
+    all we know about", never break a listing that used to work.
+    """
+    try:
+        return {row["name"]: row for row in q("SELECT * FROM raw_segments")}
+    except Exception:  # noqa: BLE001 - inventory must survive a cold database
+        return {}
+
+
+def mark_raw_segment_uploaded(name, *, size, sha256, md5, r2_key, etag,
+                              uploaded_ts, verified_ts):
+    """Flip a segment to `uploaded` after BOTH remote checks passed.
+
+    Setting `verified_ts` is what authorises a later prune, so this is only
+    ever called once the returned ETag matched the local md5 and the HEAD
+    content length matched the local size.
+    """
+    ex(
+        """UPDATE raw_segments
+              SET state=?, bytes=?, sha256=?, md5=?, r2_key=?, etag=?,
+                  uploaded_ts=?, verified_ts=?, last_error=NULL
+            WHERE name=?""",
+        (RAW_UPLOADED, size, sha256, md5, r2_key, etag, uploaded_ts,
+         verified_ts, name),
+    )
+
+
+def mark_raw_segment_pruned(name, pruned_ts):
+    """Flip `uploaded` -> `pruned`; False when the row was not eligible.
+
+    The WHERE clause is the last durable guard before the local file is
+    deleted: it refuses any row that is not verified in R2.
+    """
+    cur = ex(
+        """UPDATE raw_segments SET state=?, pruned_ts=?
+            WHERE name=? AND state=? AND verified_ts IS NOT NULL""",
+        (RAW_PRUNED, pruned_ts, name, RAW_UPLOADED),
+    )
+    return bool(cur.rowcount)
+
+
+def record_raw_segment_error(name, error):
+    """Count one failed attempt and keep the reason. State is NOT changed."""
+    ex(
+        """UPDATE raw_segments
+              SET attempts=COALESCE(attempts,0)+1, last_error=?
+            WHERE name=?""",
+        (None if error is None else str(error)[:500], name),
+    )
+
+
 LATENCY_KIND_CANONICAL = {
     "feed_lag": "feed_ingress_ms",
     "paper_entry": "paper_entry_ms",
@@ -671,6 +872,10 @@ LATENCY_KIND_ALIASES = {
     "match_response_ms": ("match_response_ms",),
     "match_clock_age_ms": ("match_clock_age_ms",),
     "scheduler_lag_ms": ("scheduler_lag_ms",),
+    # Frames received but not yet processed, sampled once per stats tick.  A
+    # latency kind because it is the same measurement family: how far behind
+    # the exchange this process is running.
+    "backlog_frames": ("backlog_frames",),
 }
 LATENCY_KINDS = tuple(LATENCY_KIND_ALIASES)
 K4_THRESHOLD_MS = 250.0
@@ -1172,8 +1377,8 @@ def insert_goal_latency(row):
                observed_ts,event,milestone_id,change_kind,live_type,
                score_before,score_after,previous_poll_ts,poll_started_ts,response_ms,
                last_book_change_ts,last_book_lead_ms,last_trade_ts,last_trade_lead_ms,
-               canonical_type,canonical_side,normalized_event,detail,mode)
-             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               canonical_type,canonical_side,normalized_event,detail,mode,poll_seq)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             row["observed_ts"], row["event"], row["milestone_id"],
             row["change_kind"], row.get("live_type"),
@@ -1186,6 +1391,7 @@ def insert_goal_latency(row):
             json.dumps(normalized, separators=(",", ":")),
             json.dumps(row.get("detail") or {}, separators=(",", ":")),
             _mode,
+            row.get("poll_seq"),
         ),
     )
     return cur.lastrowid
@@ -1197,8 +1403,8 @@ def insert_match_clock(row):
                observed_ts,poll_started_ts,previous_poll_ts,response_ms,event,milestone_id,
                provider_period,provider_minute,provider_stoppage,provider_clock,
                provider_status,precision,raw_context,mode,source,confirmed_ts,
-               confirmation_previous_poll_ts)
-             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               confirmation_previous_poll_ts,poll_seq)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             row["observed_ts"], row["poll_started_ts"], row.get("previous_poll_ts"),
             row["response_ms"], row["event"], row["milestone_id"],
@@ -1210,6 +1416,7 @@ def insert_match_clock(row):
             row.get("source") or match_clock.CLOCK_SOURCE,
             row.get("confirmed_ts"),
             row.get("confirmation_previous_poll_ts"),
+            row.get("poll_seq"),
         ),
     )
     return cur.lastrowid
@@ -1275,6 +1482,41 @@ def upsert_provider_event(row):
     return cur.lastrowid, True
 
 
+def refresh_provider_events(rows):
+    """Batch-refresh the poll metadata of already-recorded fingerprints.
+
+    One transaction, one `executemany`, no per-event SELECT.  `upsert_provider_event`
+    still exists with its original semantics for the single-row path; this is the
+    batched form the observer uses so a poll that re-observes N known events costs
+    one commit instead of N SELECT+UPDATE+COMMIT round trips under the writer lock
+    (see CHG-2026-09-05-004).  Rows are matched on (event, fingerprint, mode) --
+    the same identity as the unique index -- so a demo observation can never
+    refresh a live one.  Returns the number of rows the UPDATE touched.
+    """
+    payload = [
+        (row["observed_ts"], row["poll_started_ts"], row.get("previous_poll_ts"),
+         row["response_ms"], row["event"], row["fingerprint"])
+        for row in rows or ()
+    ]
+    if not payload:
+        return 0
+    with _lock:
+        try:
+            cursor = _conn.executemany(
+                """UPDATE provider_match_events
+                      SET last_observed_ts=?, poll_started_ts=?,
+                          previous_poll_ts=?, response_ms=?
+                    WHERE event=? AND fingerprint=?
+                      AND COALESCE(mode,'legacy_unknown')=COALESCE(?,'legacy_unknown')""",
+                [(*args, _mode) for args in payload],
+            )
+            _conn.commit()
+        except Exception:
+            _conn.rollback()
+            raise
+        return cursor.rowcount
+
+
 SUBSTANTIVE_REVISION_TYPES = (
     "goal.observed", "penalty.scored",
 )
@@ -1328,6 +1570,40 @@ def upsert_market(ticker, event, series, title, close_time, status,
         display_game, display_leg))
 
 
+def record_market_result(ticker, result, settled_ts=None, last_yes_bid=None,
+                         last_yes_ask=None):
+    """Persist a market's settlement outcome and its last observed quote.
+
+    First observation wins for `settled_ts` and a known quote is never
+    overwritten with a null, so a lifecycle frame and a later REST poll can
+    both report the same settlement without either degrading the row.  A
+    result for a ticker that was never registered writes nothing and returns 0,
+    rather than inventing a market row.
+    """
+    if result not in ("yes", "no"):
+        return 0
+    cur = ex(
+        """UPDATE markets
+              SET result=?,
+                  settled_ts=COALESCE(settled_ts, ?),
+                  last_yes_bid=COALESCE(?, last_yes_bid),
+                  last_yes_ask=COALESCE(?, last_yes_ask)
+            WHERE ticker=?""",
+        (result, time.time() if settled_ts is None else settled_ts,
+         last_yes_bid, last_yes_ask, ticker),
+    )
+    return cur.rowcount
+
+
+def market_result(ticker):
+    rows = q(
+        "SELECT ticker,result,settled_ts,last_yes_bid,last_yes_ask"
+        " FROM markets WHERE ticker=?",
+        (ticker,),
+    )
+    return rows[0] if rows else None
+
+
 def _stamp_text(value):
     if value is None:
         return None
@@ -1339,13 +1615,14 @@ def _stamp_text(value):
 def insert_signal(s):
     cur = ex("""INSERT INTO signals(ts_ms,local_ts,market,event,series,dir,dl,levels,size,
                 ref,ext,conf_lag_ms,late,outcome,detail,mode,match_clock_snapshot,
-                forward_path_started_ts,config_id)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                forward_path_started_ts,config_id,context,episode_id)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
              (s["ts_ms"], s["local_ts"], s["market"], s["event"], s["series"], s["dir"],
               s["dl"], s["levels"], s["size"], s["ref"], s["ext"], s.get("conf_lag_ms"),
               1 if s.get("late") else 0, s["outcome"], json.dumps(s.get("detail") or {}), _mode,
               _stamp_text(s.get("match_clock_snapshot")),
-              s.get("forward_path_started_ts"), _config_id))
+              s.get("forward_path_started_ts"), _config_id,
+              _stamp_text(s.get("context")), s.get("episode_id")))
     return cur.lastrowid
 
 
@@ -1373,12 +1650,14 @@ def finish_paper_signal(signal_id, outcome, detail, latency_ms, order_arrival_ms
 
 def insert_trade(t):
     cur = ex("""INSERT INTO trades(signal_id,market,event,series,dir,side,entry_ts,entry_px,
-                size,cap,notional,book_at_entry,status,mode,strategy,config_id)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?,?,?)""",
+                size,cap,notional,book_at_entry,status,mode,strategy,config_id,
+                entry_context)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?,?,?,?)""",
              (t["signal_id"], t["market"], t["event"], t["series"], t["dir"], t["side"],
               t["entry_ts"], t["entry_px"], t["size"], t["cap"], t["notional"],
               json.dumps(t.get("book_at_entry") or {}), _mode,
-              t.get("strategy") or "gate_a", _config_id))
+              t.get("strategy") or "gate_a", _config_id,
+              _stamp_text(t.get("entry_context"))))
     return cur.lastrowid
 
 
@@ -1390,13 +1669,14 @@ def open_paper_trade(t, detail, fill_levels, entry_fee, latency_ms, order_arriva
                 """INSERT INTO trades(signal_id,market,event,series,dir,side,entry_ts,entry_px,
                        size,cap,notional,book_at_entry,status,mode,remaining,realized_gross,
                        accrued_fees,exit_qty,exit_vwap_num,fee_type,fee_multiplier,strategy,
-                       config_id)
-                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?, ?, 0, ?, 0, 0, ?, ?,?,?)""",
+                       config_id,entry_context)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?, 'open', ?, ?, 0, ?, 0, 0, ?, ?,?,?,?)""",
                 (t["signal_id"], t["market"], t["event"], t["series"], t["dir"], t["side"],
                  t["entry_ts"], t["entry_px"], t["size"], t["cap"], t["notional"],
                  json.dumps(t.get("book_at_entry") or {}), _mode, t["size"], entry_fee,
                  t.get("fee_type"), t.get("fee_multiplier"),
-                 t.get("strategy") or "gate_a", _config_id),
+                 t.get("strategy") or "gate_a", _config_id,
+                 _stamp_text(t.get("entry_context"))),
             )
             trade_id = cur.lastrowid
             _conn.execute("UPDATE signals SET outcome='filled', detail=? WHERE id=?",
@@ -1422,7 +1702,7 @@ def open_paper_trade(t, detail, fill_levels, entry_fee, latency_ms, order_arriva
 
 def record_paper_exit(tid, signal_id, side, ts, reason, fill_levels, progress,
                       latency_ms, final=None, path_rows=None, truncated=False,
-                      dropped_samples=0):
+                      dropped_samples=0, exit_context=None):
     """Atomically persist exit fills, position progress, and optional close.
 
     When `final` is supplied this is the trade's last write, so the remaining
@@ -1470,9 +1750,11 @@ def record_paper_exit(tid, signal_id, side, ts, reason, fill_levels, progress,
             if final is not None:
                 _conn.execute(
                     """UPDATE trades SET exit_ts=?, exit_px=?, exit_reason=?, gross=?, fees=?,
-                           net=?, mae=?, shadow_stop_px=?, status='closed' WHERE id=?""",
+                           net=?, mae=?, shadow_stop_px=?, exit_context=?,
+                           status='closed' WHERE id=?""",
                     (ts, final["exit_px"], reason, final["gross"], final["fees"],
-                     final["net"], final["mae"], final["shadow_stop_px"], tid),
+                     final["net"], final["mae"], final["shadow_stop_px"],
+                     _stamp_text(exit_context), tid),
                 )
             _conn.commit()
         except Exception:
@@ -1502,7 +1784,8 @@ def load_open_paper_positions():
 
 
 def close_trade(tid, exit_px, reason, gross, fees, net, mae, shadow_stop_px,
-                path_rows=None, truncated=False, dropped_samples=0):
+                path_rows=None, truncated=False, dropped_samples=0,
+                exit_context=None):
     """Close a simple (non-realistic) trade and its path in ONE transaction.
 
     Same contract as `record_paper_exit`: path rows, terminal row, summary and
@@ -1517,10 +1800,10 @@ def close_trade(tid, exit_px, reason, gross, fees, net, mae, shadow_stop_px,
             _conn.execute(
                 """UPDATE trades SET exit_ts=?, exit_px=?, exit_reason=?, gross=?,
                        fees=?, net=?, mae=?, shadow_stop_px=?, bid_path_summary=?,
-                       status='closed' WHERE id=?""",
+                       exit_context=?, status='closed' WHERE id=?""",
                 (time.time(), exit_px, reason, gross, fees, net, mae, shadow_stop_px,
                  json.dumps(summary, separators=(",", ":")) if summary else None,
-                 tid),
+                 _stamp_text(exit_context), tid),
             )
             _conn.commit()
         except Exception:
@@ -1668,9 +1951,13 @@ def _strategy_summary(closed, open_t, signals, latency_evidence):
     # it produced a fill. `rejected_floor` belongs here for the same reason
     # `rejected_cap` does: the episode was real and eligible, and the price
     # bound is what declined it.
+    # `stale_book` belongs here for the same reason `no_book` does: the episode
+    # was real and reached the execution stage, and the book-age bound is what
+    # declined it.  Leaving it out would let raising PAPER_MAX_BOOK_AGE_MS
+    # silently shrink the K2 denominator instead of showing up as refusals.
     confirmed_outcomes = {
-        "filled", "rejected_cap", "rejected_floor", "no_book", "killed",
-        "expired", "unsupported_fee",
+        "filled", "rejected_cap", "rejected_floor", "no_book", "stale_book",
+        "killed", "expired", "unsupported_fee",
     }
     n_conf = sum(count for outcome, count in signal_counts.items()
                  if outcome in confirmed_outcomes)

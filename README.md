@@ -82,14 +82,72 @@ to the defaults. Notable ones:
 | `PAPER_EXECUTION_V2` | false | opt into latency-aware paper arrivals, shadow liquidity, and entry/exit depth walking |
 | `GOAL_LATENCY_OBSERVER` | true | read-only Kalshi score-vs-market arrival experiment; never enters the signal path |
 | `GOAL_LATENCY_POLL_MS` | 250 | target interval for batched score polling; actual uncertainty is saved per observation |
-| `EVENT_MATCH_WINDOW_S` | 20 | fixed ±seconds for diagnostic signal/event consistency matching |
+| `EVENT_MATCH_WINDOW_S` | 90 | fixed ±seconds for diagnostic signal/event consistency matching; raised from 20 because the score feed lands 10-40 s after the market moves. Excluded from the strategy identity |
+| `PAPER_MAX_BOOK_AGE_MS` | 0 | max age of the book a paper entry may fill against. **0 = record only**; above zero an older book refuses the entry as `stale_book`. A strategy parameter: it changes `config_id` |
+| `PATH_THIN_AFTER_S` / `PATH_THIN_INTERVAL_MS` | 10 / 250 | forward/execution path sampling: every change for the first N seconds, then one row per interval, with every new peak and trough always kept |
 | `SUBTHRESHOLD_CAPTURE` | true | record bursts below the Gate-A floor as research observations |
 | `SUBTHRESHOLD_DL_MIN` / `_LEVELS_MIN` / `_SIZE_MIN` | 0.3 / 3 / 50 | the research floor those observations must clear |
+| `PROVIDER_EVENT_FLUSH_S` | 60 | how often already-recorded provider events have their "last seen at" refreshed, in one batched transaction |
 | `ADMIN_TOKEN` | empty | required `X-Admin-Token` for kill, flatten, and study export; empty fails closed |
 
 Recorder health is exposed at `/api/status` under `recorder`. A write failure
 marks it unhealthy, records the last error/failure count, alerts the dashboard,
 and retries on later messages instead of silently losing the raw feed.
+
+### Raw feed frames and the feed-health ledger
+
+The socket is split into a reader that only receives and stamps frames and a
+consumer that parses and routes them, so a recorded timestamp is the moment the
+frame **arrived** rather than the moment it was processed. Each line of a raw
+gzip segment is:
+
+| key | meaning |
+|---|---|
+| `at` / `am` | arrival wall and monotonic clock, stamped by the reader on receipt |
+| `lt` / `lm` | processing wall and monotonic clock, stamped when the consumer dequeued it (the original meaning of these keys, unchanged) |
+| `bl` | frames still queued behind this one — the measured processing backlog |
+| `m` | the exchange message |
+
+`at`/`am`/`bl` are omitted when unknown, so older readers and older segments
+stay valid. `lt - at` is the delay a frame suffered; before this existed that
+delay was silently folded into every timestamp derived from the frame.
+
+`feed_events` is the ledger of everything that interrupts the feed —
+`connected`, `disconnected`, `subscribed`, `resubscribed`, `gap`,
+`snapshot_requested`, `snapshot_complete`, `market_added`, `market_dropped`,
+`recorder_rotate` — readable at `/api/feed-events` and included in the study
+export. The same events are also written into the raw stream as
+`{"type": "recorder_marker", "kind": ..., "detail": ...}` frames, so a segment
+explains its own discontinuities without needing the database. `/api/status`
+reports the live queue depth as `feed_backlog`, and the `backlog_frames`
+latency series records the deepest queue seen in each 5 s window.
+
+Every signal row (**every** outcome, including `subthreshold` and
+`unconfirmed`) carries a `context` JSON column with `feed_lag_ms` (arrival minus
+the exchange stamp), `proc_lag_ms` (processing minus arrival) and `backlog` for
+the frame the burst was observed on. In demo mode `feed_lag_ms` is the replay
+offset from the recorded tape's original timestamps, not a live measurement.
+
+### What a captured row now answers
+
+| Column | Where | Answers |
+|---|---|---|
+| `signals.context.books` | every signal row | what every leg of the match was quoting at the decision — bid, ask, sizes, last, mid |
+| `signals.context.spread_c` | every signal row | how wide the candidate's own leg was |
+| `signals.context.fillable` | every signal row | **what a Gate-A entry would have filled at** — `{vwap, qty, levels}` from walking the asks to `PRICE_CAP` for `NOTIONAL_USD`, without consuming anything. A declined or unconfirmed signal therefore carries the trade it refused |
+| `signals.context.confirmation` | every signal row | the sibling bursts the confirmation scan weighed — `{sibling_ticker, lag_ms, signed_dl, levels, in_window, opposite_sign}` — so `unconfirmed` (76% of the funnel, 1,150 of 1,511 rows) says *why* |
+| `signals.context.load` | every signal row | open forward watches, open positions and pending candidates at the decision |
+| `signals.episode_id` | every signal row of one episode | `<market>:<candidate ts_ms>`, so the two rows `parallel` mode writes for one episode join without heuristics |
+| `trades.entry_context` | every entry fill | `book_exchange_ts_ms`, `book_age_ms` (fill wall minus book arrival), `book_exchange_lag_ms` (fill wall minus exchange stamp), and the feed lag/backlog at the fill — **a fill taken from a 16 s-old book is labelled as such** |
+| `trades.exit_context.exit_trigger` | every exit fill | the numbers behind the label: reason, observed bid, `elapsed_s`, the executable peak, and the computed scratch level for a sleeve exit |
+| `trades.exit_context.book` | every exit fill | held-side and opposite-side top-8 at the fill, with `book_source` saying whether that is the fill book or the last one seen |
+| `markets.result` / `settled_ts` / `last_yes_bid` / `last_yes_ask` | every watched market | how the market actually resolved — including the ones the bot **declined**, so the declined population has an outcome label |
+| `goal_latency_observations.poll_seq`, `match_clock_observations.poll_seq` | every observation | which poll produced it, so poll cadence is reconstructible |
+
+Rows written before a column existed keep `NULL`. Nothing is backfilled: an
+unrecorded condition stays unrecorded rather than being given a plausible value.
+In demo mode `book_exchange_lag_ms` carries the same caveat as `feed_lag_ms` —
+it is the replay offset from the tape's original timestamps.
 
 ### Realistic paper execution (opt-in)
 
@@ -205,19 +263,89 @@ as the selected raw gzip segments and return:
 
 - the database and SQL schema;
 - CSV and JSONL versions of markets, signals, trades, fills, latency, canonical match-event
-  observations, and event/error logs;
+  observations, the feed-health ledger, and event/error logs;
 - immutable raw WebSocket gzip files;
+- the raw-segment archive ledger and an `archive` continuity block, so a bundle
+  describes the whole raw timeline including the segments that live in R2 and
+  were not copied into it;
 - an allowlisted non-secret configuration, table counts, byte sizes, and SHA-256 hashes; and
 - the external [backtest architecture and validation contract](docs/PRICE_ONLY_BACKTEST_HANDOFF.md).
 
 Match-event observations remain post-trade diagnostics. They are explicitly prohibited as
 entry/exit inputs in the handoff contract.
 
+### Raw feed archive on Cloudflare R2 (opt-in)
+
+The Railway volume is finite. On 2026-09-05 it was 4.00 GB used of a 4.08 GB
+maximum, 2.94 GB of that being 176 hourly raw segments, and an audit export
+already failed with `study_export: database or disk is full`. At ~300 MB of new
+segments a day the next failure would be silent write loss in SQLite.
+
+`RAW_ARCHIVE_ENABLED=true` plus R2 credentials extends the volume onto object
+storage as **one logical archive with one timeline**, never two stores that can
+disagree:
+
+| Var | Default | Meaning |
+|---|---|---|
+| `RAW_ARCHIVE_ENABLED` | false | master switch; off means completely inert |
+| `R2_ACCOUNT_ID` | empty | Cloudflare account id; the endpoint is `https://<id>.r2.cloudflarestorage.com` |
+| `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | empty | R2 API token. **Never logged, never exported, never returned by an API** |
+| `R2_BUCKET` | `football-bot-raw-feed` | destination bucket; segments are stored under `raw/` |
+| `R2_ENDPOINT` | empty | optional endpoint override (tests point it at a local stub) |
+| `RAW_LOCAL_RETENTION_HOURS` | 48 | how long a verified segment stays on the volume |
+| `RAW_ARCHIVE_MIN_FREE_MB` | 512 | free-space floor below which verified segments are pruned early, oldest first |
+| `RAW_ARCHIVE_MAX_ATTEMPTS` | 5 | upload attempts before a segment is left alone (it is kept, never deleted) |
+| `RAW_ARCHIVE_INTERVAL_S` | 60 | archive pass interval |
+
+The contract, enforced in `app/archive.py` and the `raw_segments` table:
+
+- **Every segment is in exactly one known state**, recorded in SQLite and never
+  inferred from a directory listing: `local` (on the volume, not yet uploaded),
+  `uploaded` (verified in R2, still on the volume), `pruned` (verified in R2,
+  removed from the volume). Startup reconciles the directory into the table.
+- **Only sealed segments are uploaded.** The hour being appended to is never
+  uploaded and never pruned — neither the current wall-clock hour nor the hour
+  the recorder still holds open after a quiet boundary.
+- **Verify before prune.** A single PUT (R2 allows 5 GB; the largest segment
+  here is 118 MB) is checked twice: the returned `ETag` must equal the md5
+  computed while reading the file, then a `HEAD` must report the same content
+  length as the local file. Only then is `verified_ts` set. Any mismatch leaves
+  the row `local`, records `last_error`, and retries with backoff.
+- **Pruning is bounded**: retention or the free-space floor, oldest first, and a
+  live `HEAD` re-check immediately before the one place a local file is deleted.
+- **Reads are transparent.** `/api/export/raw` lists local and remote segments
+  as one inventory with a `location` of `local`, `both` or `r2`, and
+  `/api/export/raw/{name}` serves either, passing HTTP `Range` straight through
+  to R2 and relaying the `206`.
+- **Continuity is verifiable.** `/api/archive`, `/api/status` under `archive`,
+  and every study manifest carry the same block: counts by state, local and
+  remote bytes, the first and last hour, and the list of **missing hours** — an
+  hour with no segment at all, which is legitimate when the bot was down but
+  must be visible rather than interpolated.
+
+Uploads, hashing, verification and deletion all run off the event loop in a
+single background task; a failure records `last_error`, a `archive_error` feed
+event and a system error, and never touches the recorder, the WebSocket path or
+the paper desk. Without credentials, or with the switch off, nothing is
+registered, uploaded or deleted and the bot behaves exactly as before.
+
+After setting the variables, confirm connectivity once with
+`scripts/r2_probe.py` (reads the same env vars, writes and deletes one small
+object under `probe/`, and never touches `raw/`).
+
+These are storage knobs. They are deliberately excluded from
+`config.STRATEGY_PARAM_NAMES`: capturing or moving a recorded file cannot change
+a trading decision.
+
 ### Goal latency observer
 
 The observer resolves each watched event to a Kalshi milestone, polls every mapped
-milestone through one `/live_data/batch` request, and compares only numeric fields
-under score-shaped keys. It does not use a language model and has no reference to the
+milestone through one `/live_data/batch` request, and compares only **score-valued**
+fields — `*_same_game_score`, `*_aggregate_score` and `period_scores.N.home_score` /
+`away_score`. Structural keys (`number`, `type`) and list growth are ignored, and a
+newly appearing key counts as a goal only when it appears above zero, so a
+second-half kickoff appending `period_scores[1]` is a `score_schema_change` rather
+than a goal. It does not use a language model and has no reference to the
 detector or paper desk. The first response containing a changed score is bounded by
 the previous successful poll and current receipt; both timestamps and request duration
 are saved instead of claiming a more precise provider event time.

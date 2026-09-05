@@ -12,6 +12,7 @@ import time
 import zipfile
 
 from . import config, store
+from .archive import archive_continuity
 
 
 EXPORT_SCHEMA = "football.paper_study_export.v1"
@@ -25,6 +26,14 @@ TABLES = (
     "match_clock_observations",
     "provider_match_events",
     "bid_path_samples",
+    # Feed-health ledger: connection, gap, snapshot and rotation events, so a
+    # discontinuity in the exported observations has a recorded explanation.
+    "feed_events",
+    # The raw-segment archive ledger.  A bundle must describe the WHOLE
+    # archive, including the segments that live in R2 and were not copied into
+    # it, so a reader can tell "this hour was never recorded" from "this hour
+    # is archived elsewhere".
+    "raw_segments",
     "eventlog",
     # Resolves every config_id on a signal or trade to its parameters and code
     # fingerprint.  It carries no `mode`, so mode scoping keeps it whole: an
@@ -199,18 +208,61 @@ def raw_feed_paths():
             if path.is_file() and not path.is_symlink()]
 
 
+def _inventory_item(name, size, row):
+    """One inventory entry, whichever side of the archive it lives on."""
+    on_disk = size is not None
+    if row is None:
+        location = "local" if on_disk else "r2"
+        return {
+            "file": f"raw/{name}",
+            "name": name,
+            "bytes": size or 0,
+            "sha256": None,
+            "location": location,
+            "state": None,
+            "included": False,
+        }
+    remote = row.get("state") in (store.RAW_UPLOADED, store.RAW_PRUNED)
+    if on_disk and remote:
+        location = "both"
+    elif on_disk:
+        location = "local"
+    else:
+        location = "r2"
+    return {
+        "file": f"raw/{name}",
+        "name": name,
+        "bytes": size if on_disk else (row.get("bytes") or 0),
+        "sha256": row.get("sha256"),
+        "location": location,
+        "state": row.get("state"),
+        "included": False,
+    }
+
+
 def raw_inventory(paths=None):
-    """Return raw segment metadata without copying bodies."""
+    """Raw segment metadata for the whole archive, without copying bodies.
+
+    With no argument this is the UNION of the volume and the archive ledger, in
+    one ordered timeline: a caller must not need to know whether a segment is
+    still on disk (`location="local"`), verified in R2 and still on disk
+    (`"both"`), or pruned to R2 (`"r2"`).  Passing explicit `paths` keeps the
+    old scoped behaviour, enriched with whatever the ledger knows about them.
+    """
+    index = store.raw_segment_index()
     items = []
-    for path in (raw_feed_paths() if paths is None else [Path(p) for p in paths]):
+    if paths is None:
+        present = {}
+        for path in raw_feed_paths():
+            present[path.name] = path.stat().st_size
+        for name in sorted(set(present) | set(index)):
+            items.append(_inventory_item(name, present.get(name), index.get(name)))
+        return items
+    for path in [Path(p) for p in paths]:
         if not path.is_file() or path.is_symlink():
             continue
-        items.append({
-            "file": f"raw/{path.name}",
-            "name": path.name,
-            "bytes": path.stat().st_size,
-            "included": False,
-        })
+        items.append(_inventory_item(
+            path.name, path.stat().st_size, index.get(path.name)))
     return items
 
 
@@ -353,6 +405,14 @@ def build_study_bundle(output_path=None, mode=None, raw_paths=None, snapshot_pat
                 # snapshot are separate instants; anything that changed between
                 # them is inside the stated uncertainty interval.
                 "capture_boundary": _capture_boundary(boundary),
+                # Continuity of the raw archive as one timeline: how many
+                # segments exist, where they live, and which hours between the
+                # first and the last are missing entirely.  The same block is
+                # served by `GET /api/archive` and `Engine.status()`, so a
+                # bundle states honestly which parts of the timeline exist and
+                # which are archived off the volume rather than absent.  It
+                # carries no credentials.
+                "archive": archive_continuity(selector),
                 "configuration": non_secret_config(),
                 # The identity stamped on every signal and trade this process
                 # wrote.  Rows carrying a different config_id came from a
@@ -448,8 +508,17 @@ def build_study_bundle(output_path=None, mode=None, raw_paths=None, snapshot_pat
                             processed_segments=index + 1,
                             total_segments=total_segments,
                         )
+                    # Segments that have been pruned to R2 cannot be copied,
+                    # but they are part of the same timeline and the bundle
+                    # must say so rather than imply the hours never existed.
+                    copied = {item["name"] for item in manifest["raw_feed"]}
+                    for item in raw_inventory():
+                        if item["name"] not in copied and item["location"] == "r2":
+                            manifest["raw_feed"].append(item)
                 else:
-                    for item in raw_inventory(selected_raw):
+                    inventory = raw_inventory(
+                        None if raw_paths is None else selected_raw)
+                    for item in inventory:
                         manifest["raw_feed"].append(item)
                 # Every exported fill must point at an exported trade of the
                 # same mode.  An orphan means the scoping dropped one side of a

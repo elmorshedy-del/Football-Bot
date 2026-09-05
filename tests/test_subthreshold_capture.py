@@ -133,6 +133,10 @@ class SubthresholdEngineTests(unittest.TestCase):
                              "close_time": "2026-09-02T20:00:00Z"}}
         engine.mode = "live"
         engine.clock_tracker = MatchClockTracker()
+        # The cheap capture subset reads the event's legs and their books.
+        engine.event_markets = {"E": ["T"]}
+        engine.books = {}
+        engine.prices = {}
         engine._record_error = Mock()
         return engine
 

@@ -89,6 +89,7 @@ class ModeScopedApiTests(unittest.TestCase):
             "poll_started_ts": 999.9, "response_ms": 50.0, "detail": {},
         })
         store.add_latency("order_arrival_ms", 20.0)
+        store.insert_feed_event("connected", {"event": event}, 1000.0, 5.0)
         return {"signal_id": signal_id, "trade_id": trade_id}
 
     # ---------------------------------------------------------------- default
@@ -110,6 +111,11 @@ class ModeScopedApiTests(unittest.TestCase):
         goals = run(main.goal_latency())
         self.assertEqual({row["event"] for row in goals}, {"LIVE"})
 
+        feed = run(main.feed_events())["events"]
+        self.assertEqual({row["detail"]["event"] for row in feed}, {"LIVE"},
+                         "the feed-health ledger leaked another mode")
+        self.assertEqual({row["kind"] for row in feed}, {"connected"})
+
     def test_every_endpoint_accepts_the_four_safe_selectors(self):
         for selector in ("live", "demo", "legacy_unknown", "all"):
             with self.subTest(selector=selector):
@@ -118,6 +124,7 @@ class ModeScopedApiTests(unittest.TestCase):
                 self.assertIsNotNone(run(main.match_clocks(mode=selector)))
                 self.assertIsNotNone(run(main.provider_events(mode=selector)))
                 self.assertIsNotNone(run(main.goal_latency(mode=selector)))
+                self.assertIsNotNone(run(main.feed_events(mode=selector)))
                 self.assertIsNotNone(run(main.equity(mode=selector)))
                 self.assertIsNotNone(run(main.latency(mode=selector)))
                 self.assertIsNotNone(run(main.stats(mode=selector)))

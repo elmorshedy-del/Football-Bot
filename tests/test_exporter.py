@@ -113,6 +113,7 @@ class StudyExportTests(unittest.TestCase):
             "normalized_event": {"canonical_type": "penalty.scored"},
             "raw_payload": {"event_type": "score_change"},
         })
+        store.insert_feed_event("connected", {"connection": 1}, 1_777_777_777.0, 5.0)
         store.log_event("test", "export fixture")
         raw_dir = Path(directory) / "raw"
         raw_dir.mkdir()
@@ -129,6 +130,12 @@ class StudyExportTests(unittest.TestCase):
         else:
             with gzip.open(raw_path, "wt") as target:
                 target.write(payload)
+        # The archive ledger is part of the study: a bundle must describe the
+        # whole raw timeline, including segments that are no longer local.
+        store.register_raw_segment(
+            raw_path.name, "20260830-20", raw_path.stat().st_size,
+            1_777_777_777.0,
+        )
         return raw_path
 
     def _bundle_context(self, secret_markers):
@@ -236,7 +243,11 @@ class StudyExportTests(unittest.TestCase):
             self.assertFalse(manifest["include_raw"])
             self.assertEqual(manifest["raw_feed"][0]["name"], raw_path.name)
             self.assertFalse(manifest["raw_feed"][0]["included"])
-            self.assertNotIn("sha256", manifest["raw_feed"][0])
+            # An audit bundle does not copy segment bodies, so it does not hash
+            # them: the digest stays null until the archive computes one while
+            # uploading.  The location is still stated.
+            self.assertIsNone(manifest["raw_feed"][0]["sha256"])
+            self.assertEqual(manifest["raw_feed"][0]["location"], "local")
             with zipfile.ZipFile(output) as archive:
                 names = archive.namelist()
                 self.assertNotIn(f"raw/{raw_path.name}", names)

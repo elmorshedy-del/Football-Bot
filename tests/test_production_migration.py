@@ -117,13 +117,30 @@ LEGACY_ROWS = (
      [("position", 1, 1, "EV", 1.0, 0.0, 90.0, 100.0, 90.0, 10.0, "live"),
       ("position", 1, 1, "EV", 1.0, 100.0, None, None, None, 10.0, "live"),
       ("decline", None, 2, "EV", 1.0, 0.0, 80.0, 50.0, 80.0, 5.0, None)]),
+    ("markets",
+     "(ticker,event,series,title,close_time,status,added_ts,display_game,display_leg)",
+     [("T", "EV", "S", "T title", "2026-09-04T20:00:00Z", "open", 1.0,
+       "Alpha vs Beta", "Alpha")]),
+    ("trades",
+     "(signal_id,market,event,series,dir,side,entry_ts,entry_px,size,cap,"
+     "notional,status,mode)",
+     [(1, "T", "EV", "S", 1, "yes", 1.0, 45.0, 100.0, 58.0, 100.0, "closed", "live"),
+      (3, "T", "EV", "S", 1, "yes", 3.0, 45.0, 100.0, 58.0, 100.0, "open", None)]),
 )
 
 TABLES = (
     "signals", "trades", "paper_fills", "latency", "bid_path_samples",
     "match_clock_observations", "provider_match_events",
     "goal_latency_observations",
+    # Created by the migration itself on a database that predates it.
+    "feed_events",
+    # The raw-segment archive ledger, likewise created by the migration.
+    "raw_segments",
 )
+
+# `markets` carries additive settlement columns but no capture mode, so it is
+# checked for columns without the mode assertion the tables above get.
+COLUMN_TABLES = TABLES + ("markets",)
 
 
 class ProductionSchemaMigrationTests(unittest.TestCase):
@@ -164,6 +181,9 @@ class ProductionSchemaMigrationTests(unittest.TestCase):
              "id,observed_ts,event,fingerprint,canonical_type,raw_payload,mode"),
             ("goal_latency_observations", "id,observed_ts,event,change_kind,detail,mode"),
             ("bid_path_samples", "id,kind,trade_id,signal_id,dt_ms,bid,qty,mode"),
+            ("markets",
+             "ticker,event,series,title,close_time,status,display_game,display_leg"),
+            ("trades", "id,signal_id,market,entry_ts,entry_px,size,status,mode"),
         ):
             rows = store.q(f"SELECT {columns} FROM {table} ORDER BY rowid")
             counts[table] = len(rows)
@@ -196,19 +216,37 @@ class ProductionSchemaMigrationTests(unittest.TestCase):
 
         expected = {
             "latency": {"mode"},
+            # Per-signal capture conditions (feed lag, processing lag, backlog)
+            # and the episode key that joins the two parallel-mode rows.
+            "signals": {"context", "episode_id"},
+            # Book age and feed conditions at the entry fill; trigger values
+            # and the book at the exit fill.
+            "trades": {"entry_context", "exit_context"},
+            # Settlement outcome for every watched market, declined included.
+            "markets": {"result", "settled_ts", "last_yes_bid", "last_yes_ask"},
+            "feed_events": {"ts", "mono", "kind", "detail"},
+            "raw_segments": {
+                "name", "hour", "bytes", "sha256", "md5", "state", "r2_key",
+                "etag", "sealed_ts", "uploaded_ts", "verified_ts", "pruned_ts",
+                "attempts", "last_error"},
             "match_clock_observations": {
-                "source", "confirmed_ts", "confirmation_previous_poll_ts"},
+                "source", "confirmed_ts", "confirmation_previous_poll_ts",
+                "poll_seq"},
+            "goal_latency_observations": {"poll_seq"},
             "provider_match_events": {
                 "provider_occurrence_ts", "provider_occurrence_source",
                 "provider_occurrence_unavailable_reason"},
             "bid_path_samples": {"sample_seq", "availability", "terminal"},
         }
-        for table in TABLES:
+        for table in COLUMN_TABLES:
             names = [row["name"] for row in store.q(f"PRAGMA table_info({table})")]
             with self.subTest(table=table):
                 self.assertEqual(len(names), len(set(names)),
                                  f"{table} has duplicate columns")
-                self.assertIn("mode", names, f"{table} has no mode column")
+                if table in TABLES:
+                    # `markets` is not mode-scoped: a market is one exchange
+                    # object, observed in whatever mode happened to be running.
+                    self.assertIn("mode", names, f"{table} has no mode column")
                 for column in expected.get(table, set()):
                     self.assertIn(column, names, f"{table} is missing {column}")
 
@@ -238,6 +276,129 @@ class ProductionSchemaMigrationTests(unittest.TestCase):
             "a legacy clock row was relabeled with the current provider source",
         )
         self.assertEqual(store.present_mode(None), "legacy_unknown")
+
+    def test_the_new_ledger_and_column_appear_and_stay_empty_of_history(self):
+        """Additive: the migration creates them, twice, without touching a row."""
+        self.migrate()
+        self.migrate()
+
+        self.assertEqual(
+            store.q("SELECT COUNT(*) AS n FROM feed_events")[0]["n"], 0,
+            "the migration invented feed-health history",
+        )
+        contexts = [row["context"] for row in
+                    store.q("SELECT context FROM signals ORDER BY id")]
+        self.assertEqual(contexts, [None, None, None],
+                         "a legacy signal was given a capture context it never had")
+
+        store.insert_feed_event("connected", {"connection": 1})
+        before = store.q("SELECT id, kind, detail, mode FROM feed_events")
+        self.migrate()
+        self.assertEqual(store.q("SELECT id, kind, detail, mode FROM feed_events"),
+                         before, "remigration rewrote the ledger")
+
+    def test_the_archive_ledger_is_created_empty_and_survives_remigration(self):
+        """A production database that predates the archive gains the table
+        without inventing archive history, and a verified segment's stamps are
+        not disturbed by migrating again -- which is what stops a re-deploy from
+        making a pruned segment look local, or an unverified one look safe to
+        delete."""
+        self.migrate()
+        self.assertEqual(
+            store.q("SELECT COUNT(*) AS n FROM raw_segments")[0]["n"], 0,
+            "the migration invented archive history",
+        )
+
+        self.assertTrue(store.register_raw_segment(
+            "feed-20260901-10.jsonl.gz", "20260901-10", 1234, 1_777_777_777.0))
+        self.assertFalse(
+            store.register_raw_segment("feed-20260901-10.jsonl.gz"),
+            "re-registering an existing segment created a second row",
+        )
+        store.mark_raw_segment_uploaded(
+            "feed-20260901-10.jsonl.gz", size=1234, sha256="a" * 64,
+            md5="b" * 32, r2_key="raw/feed-20260901-10.jsonl.gz",
+            etag="b" * 32, uploaded_ts=10.0, verified_ts=11.0,
+        )
+        before = store.q("SELECT * FROM raw_segments")
+
+        self.migrate()
+        self.migrate()
+
+        self.assertEqual(store.q("SELECT * FROM raw_segments"), before,
+                         "remigration rewrote the archive ledger")
+        self.assertEqual(before[0]["state"], store.RAW_UPLOADED)
+        self.assertEqual(before[0]["mode"], "live")
+
+    def test_an_unverified_segment_can_never_be_marked_pruned(self):
+        """The durable guard in front of the only local delete."""
+        self.migrate()
+        store.register_raw_segment("feed-20260901-11.jsonl.gz", "20260901-11", 9)
+
+        self.assertFalse(
+            store.mark_raw_segment_pruned("feed-20260901-11.jsonl.gz", 12.0),
+            "a segment that was never verified in R2 was marked pruned",
+        )
+        self.assertEqual(
+            store.raw_segment("feed-20260901-11.jsonl.gz")["state"],
+            store.RAW_LOCAL,
+        )
+    def test_the_capture_columns_stay_null_on_history_that_never_had_them(self):
+        """Never backfilled: an unrecorded condition stays unrecorded."""
+        self.migrate()
+        self.migrate()
+
+        episodes = [row["episode_id"] for row in
+                    store.q("SELECT episode_id FROM signals ORDER BY id")]
+        self.assertEqual(episodes, [None, None, None])
+
+        trades = store.q(
+            "SELECT entry_context, exit_context FROM trades ORDER BY id")
+        self.assertEqual(len(trades), 2)
+        for row in trades:
+            self.assertIsNone(row["entry_context"])
+            self.assertIsNone(row["exit_context"])
+
+        market = store.q(
+            "SELECT result, settled_ts, last_yes_bid, last_yes_ask FROM markets")[0]
+        self.assertEqual(list(market.values()), [None, None, None, None])
+
+        for table in ("match_clock_observations", "goal_latency_observations"):
+            with self.subTest(table=table):
+                self.assertEqual(
+                    [row["poll_seq"] for row in
+                     store.q(f"SELECT poll_seq FROM {table} ORDER BY id")],
+                    [None, None],
+                )
+
+    def test_new_capture_columns_are_writable_after_remigration(self):
+        """Additive columns must be usable, not merely present."""
+        self.migrate()
+        self.migrate()
+        store.set_mode("live")
+
+        self.assertEqual(store.record_market_result("T", "yes", 5.0, 41.0, 46.0), 1)
+        sid = store.insert_signal({
+            "ts_ms": 9, "local_ts": 9.0, "market": "T", "event": "EV",
+            "series": "S", "dir": 1, "dl": 1.0, "levels": 6, "size": 300.0,
+            "ref": 40.0, "ext": 55.0, "outcome": "filled", "detail": {},
+            "episode_id": "T:9", "context": {"backlog": 1},
+        })
+        store.insert_trade({
+            "signal_id": sid, "market": "T", "event": "EV", "series": "S",
+            "dir": 1, "side": "yes", "entry_ts": 9.0, "entry_px": 45.0,
+            "size": 100.0, "cap": 58.0, "notional": 100.0,
+            "entry_context": {"book_age_ms": 12.0},
+        })
+
+        self.assertEqual(store.market_result("T")["result"], "yes")
+        self.assertEqual(
+            store.q("SELECT episode_id FROM signals WHERE id=?", (sid,))[0],
+            {"episode_id": "T:9"})
+        self.assertIn(
+            "book_age_ms",
+            store.q("SELECT entry_context FROM trades ORDER BY id DESC")[0]
+            ["entry_context"])
 
     def test_legacy_rows_survive_a_live_boot(self):
         self.migrate()

@@ -18,6 +18,15 @@ BURST_MS = 150
 REF_LO_MS, REF_HI_MS = 2100, 150
 BIG_DL, BIG_LEVELS = 0.25, 3
 
+# How much of the sibling tape `confirm` reports back as evidence.  The scan
+# itself is unchanged and still walks every retained burst; only the recorded
+# explanation is bounded, because a hot market can hold hundreds of bursts in
+# the 5 s retention window and a signal row must stay small.  The multiple of
+# CONF_MS is what makes a near miss legible: a burst 60 ms away against a 50 ms
+# window is the interesting case, one 3 s away is not.
+CONFIRM_EVIDENCE_WINDOW_MULT = 4.0
+CONFIRM_EVIDENCE_MAX = 12
+
 
 def logit(pc):
     p = min(max(pc / 100.0, 1e-4), 1 - 1e-4)
@@ -28,7 +37,17 @@ class MarketState:
     def __init__(self, ticker):
         self.ticker = ticker
         self.trades = deque()          # (ts_ms, px, sz, taker)
-        self.big_bursts = deque()      # (ts_ms, signed_dl) recent notable sweeps
+        # (ts_ms, signed_dl, levels) recent notable sweeps.  `levels` is carried
+        # so `confirm` can report the shape of the sibling burst it weighed, not
+        # only that one existed; the confirmation rule reads [0] and [1] only.
+        self.big_bursts = deque()
+        # True while every appended trade has a ts_ms >= the one before it, which
+        # is what lets the burst and reference windows be read as suffixes of the
+        # deque instead of scanning all 300 s of it.  One out-of-order print
+        # falls the market back to the exhaustive scan for the rest of its life,
+        # so the windows are identical to the full filter by construction.
+        self.ordered = True
+        self.last_ts_ms = None
         self.last_candidate_ms = -1e18
         # Separate from the trading cooldown so research capture can never
         # move a trading decision.
@@ -116,17 +135,65 @@ class Detector:
         for st in list(self.markets.values()):
             self._flush_subthreshold(st, now_ms)
 
-    def on_trade(self, ticker, ts_ms, px, sz, taker):
+    @staticmethod
+    def _burst_window(st, ts_ms):
+        """Trades within BURST_MS of `ts_ms`.
+
+        Same set as `[t for t in st.trades if t[0] >= ts_ms - BURST_MS]`; while
+        the deque is ordered it is read from the newest end and stopped at the
+        first trade outside the window, so the cost is the size of the burst
+        rather than of the whole 300 s deque.  Measured 33 us/trade normally and
+        813 us/trade with a 9,000-trade deque on 2026-09-04.
+        """
+        floor = ts_ms - BURST_MS
+        if not st.ordered:
+            return [t for t in st.trades if t[0] >= floor]
+        burst = []
+        for t in reversed(st.trades):
+            if t[0] < floor:
+                break
+            burst.append(t)
+        burst.reverse()
+        return burst
+
+    @staticmethod
+    def _reference_window(st, ts_ms):
+        """Sorted prices in [ts_ms-REF_LO_MS, ts_ms-REF_HI_MS).
+
+        Same multiset as the exhaustive filter, so the median below is the same
+        value; only the walk is bounded.
+        """
+        lo, hi = ts_ms - REF_LO_MS, ts_ms - REF_HI_MS
+        if not st.ordered:
+            return sorted(t[1] for t in st.trades if lo <= t[0] < hi)
+        prices = []
+        for t in reversed(st.trades):
+            if t[0] >= hi:
+                continue
+            if t[0] < lo:
+                break
+            prices.append(t[1])
+        prices.sort()
+        return prices
+
+    def on_trade(self, ticker, ts_ms, px, sz, taker, context=None):
         """Feed one trade. Returns a candidate dict when the sweep threshold is
-        crossed (sibling confirmation is the engine's job)."""
+        crossed (sibling confirmation is the engine's job).
+
+        `context` is opaque capture metadata (arrival stamp, processing stamp,
+        feed backlog) that is attached to whatever this trade produces.  It is
+        never read by the detector and cannot influence a decision."""
         st = self.state(ticker)
         # Any held near miss whose burst window has closed is settled before
         # this trade is considered part of a new burst.
         self._flush_subthreshold(st, ts_ms)
+        if st.last_ts_ms is not None and ts_ms < st.last_ts_ms:
+            st.ordered = False
+        st.last_ts_ms = ts_ms
         st.trades.append((ts_ms, px, sz, taker))
         st.evict(ts_ms)
 
-        burst = [t for t in st.trades if t[0] >= ts_ms - BURST_MS]
+        burst = self._burst_window(st, ts_ms)
         if not burst:
             return None
         buy = sum(t[2] for t in burst if t[3] == "yes")
@@ -135,8 +202,7 @@ class Detector:
         prices = [t[1] for t in burst]
         levels = len(set(round(p, 1) for p in prices))
         size = buy + sell
-        ref_w = sorted(t[1] for t in st.trades
-                       if ts_ms - REF_LO_MS <= t[0] < ts_ms - REF_HI_MS)
+        ref_w = self._reference_window(st, ts_ms)
         if not ref_w:
             return None
         ref = ref_w[len(ref_w) // 2]
@@ -150,13 +216,14 @@ class Detector:
         if dl >= BIG_DL and levels >= BIG_LEVELS:
             if not st.big_bursts or st.big_bursts[-1][0] < ts_ms - 5 or \
                     abs(st.big_bursts[-1][1]) < abs(signed):
-                st.big_bursts.append((ts_ms, signed))
+                st.big_bursts.append((ts_ms, signed, levels))
 
         if dl < config.DL_MIN or levels < config.LEVELS_MIN or size < config.SIZE_MIN:
             self._hold_subthreshold(st, {
                 "ticker": ticker, "ts_ms": ts_ms, "dir": d, "dl": round(dl, 3),
                 "signed": signed, "levels": levels, "size": round(size, 1),
                 "ref": round(ref, 2), "ext": ext, "local_ts": time.time(),
+                "context": context,
                 "below": sorted(
                     name for name, failed in (
                         ("dl", dl < config.DL_MIN),
@@ -180,22 +247,67 @@ class Detector:
         st.last_candidate_ms = ts_ms
         return {"ticker": ticker, "ts_ms": ts_ms, "dir": d, "dl": round(dl, 3),
                 "signed": signed, "levels": levels, "size": round(size, 1),
-                "ref": round(ref, 2), "ext": ext, "local_ts": time.time()}
+                "ref": round(ref, 2), "ext": ext, "local_ts": time.time(),
+                "context": context}
 
     def confirm(self, candidate, sibling_tickers):
         """Look for an opposite-sign big sweep on a sibling within +-CONF_MS.
-        Returns (confirmed, lag_ms)."""
+
+        Returns ``(confirmed, lag_ms, evidence)``.
+
+        The decision is byte-identical to the two-value form it replaces: the
+        same scan, the same window, the same sign rule, the same nearest-lag
+        tie-break.  What is new is that the scan now reports what it looked at.
+        76% of the first live study's Gate-A funnel (1,150 of 1,511 rows) ended
+        `unconfirmed` with nothing recorded about why, so the three questions
+        that matter -- was there a sibling burst at all, how far away in time,
+        and did it move the right way -- could only be answered by replaying raw
+        tape.  `evidence["bursts"]` answers them on the row itself.
+        """
         best = None
+        scanned = 0
+        with_state = 0
+        near = []
+        window = config.CONF_MS * CONFIRM_EVIDENCE_WINDOW_MULT
         for sib in sibling_tickers:
             st = self.markets.get(sib)
             if not st:
                 continue
-            for (bts, bsigned) in reversed(st.big_bursts):
+            with_state += 1
+            for burst in reversed(st.big_bursts):
+                bts, bsigned = burst[0], burst[1]
+                scanned += 1
                 lag = bts - candidate["ts_ms"]
-                if abs(lag) > config.CONF_MS:
+                in_window = abs(lag) <= config.CONF_MS
+                opposite = bsigned * candidate["signed"] < 0
+                # Bounded capture: only bursts close enough to be a plausible
+                # confirmation are described, so the row cannot grow with the
+                # market's trade rate.
+                if abs(lag) <= window:
+                    near.append({
+                        "sibling_ticker": sib,
+                        "lag_ms": round(lag, 3),
+                        "signed_dl": round(bsigned, 4),
+                        "levels": burst[2] if len(burst) > 2 else None,
+                        "in_window": in_window,
+                        "opposite_sign": opposite,
+                    })
+                if not in_window:
                     continue
-                if config.CONF_SIGN and bsigned * candidate["signed"] >= 0:
+                if config.CONF_SIGN and not opposite:
                     continue
                 if best is None or abs(lag) < abs(best):
                     best = lag
-        return (best is not None), best
+        near.sort(key=lambda row: abs(row["lag_ms"]))
+        evidence = {
+            "window_ms": config.CONF_MS,
+            "sign_required": bool(config.CONF_SIGN),
+            "siblings": len(sibling_tickers),
+            "siblings_with_tape": with_state,
+            "bursts_scanned": scanned,
+            "evidence_window_ms": round(window, 3),
+            "bursts": near[:CONFIRM_EVIDENCE_MAX],
+            "bursts_recorded": min(len(near), CONFIRM_EVIDENCE_MAX),
+            "bursts_near": len(near),
+        }
+        return (best is not None), best, evidence

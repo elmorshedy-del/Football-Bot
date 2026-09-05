@@ -13,8 +13,39 @@ from . import config, store
 
 # Samples buffered before an incremental write; bounds crash loss.
 BID_PATH_FLUSH_EVERY = 250
+
+
+def path_thins(dt_s, bid, peak, trough, now, last_written):
+    """True when this observation may be dropped by time-based thinning.
+
+    Four exemptions, in order:
+
+    * an unpriced observation is an availability change, not a sample, and is
+      always recorded -- an outage the path never traded through is evidence;
+    * a new peak or trough is always recorded, so the extremes every exit study
+      reads survive thinning by construction;
+    * nothing inside the first `PATH_THIN_AFTER_S` after the anchor is thinned,
+      because that is the window the reaction itself happens in;
+    * after that, one row per `PATH_THIN_INTERVAL_MS`.
+
+    Replaces spending a flat 4,000-row budget in arrival order, which exhausted
+    the cap in the busiest markets first (samples=3999 on every La Liga trade
+    and signal in the first live study) and collapsed a 300 s window to
+    60-130 s exactly where activity was highest.
+    """
+    if bid is None:
+        return False
+    if peak is None or trough is None or bid > peak or bid < trough:
+        return False
+    if dt_s <= config.PATH_THIN_AFTER_S:
+        return False
+    return (now - last_written) * 1000.0 < config.PATH_THIN_INTERVAL_MS
+# Slowest acceptable staleness for a trade high that no path flush or close has
+# written yet.  The high itself is authoritative in memory; this only bounds how
+# long the API/UI can read a stale column for an open position.
+TRADE_HIGH_PERSIST_S = 5.0
 from .execution import ShadowBook, ShadowBooks
-from .late_score_sleeve import sleeve_exit_reason
+from .late_score_sleeve import fee_aware_scratch_price, sleeve_exit_reason
 
 
 class UnsupportedFeeSchedule(ValueError):
@@ -90,7 +121,14 @@ class Position:
         # incremental flush, so a length check silently resets the cap.
         self.exec_path_total = 0
         self.exec_path_flush_failed = False
+        # Time-based thinning state.  Separate from `peak_bid`, which the sleeve
+        # exit rules own (SPEC_CORRECTIONS H1) and which only advances upward.
+        self.path_peak = None
+        self.path_trough = None
+        self.path_last_written = 0.0
+        self.exec_path_thinned = 0
         self.high_dirty = False
+        self.high_persisted_ts = 0.0
         self.max_executable_bid = None
         self.max_executable_bid_ts = None
         self.mfe_c = None
@@ -116,14 +154,69 @@ class PendingExit:
     reason: str
     price_floor: float
     attempts: int = 0
+    # The numbers that produced the label: observed bid, hold time, peak, and
+    # for a sleeve exit the computed scratch level.  Held here and not on
+    # `Position.bid_path`, whose shape and length four exit decisions depend on
+    # (see SPEC_CORRECTIONS H1).
+    trigger: dict | None = None
+
+
+def book_age_context(book, now_wall):
+    """Age inputs for the book a fill consumed.
+
+    `book_age_ms` is how long the depth had been sitting in this process;
+    `book_exchange_lag_ms` is how far behind the exchange's own stamp the fill
+    was.  Either can be null -- a book built from frames with no `ts_ms`, or an
+    isolated caller -- and a null stays null with `book_age_unknown` set rather
+    than being filled in with a plausible number.
+    """
+    exchange = getattr(book, "last_exchange_ts_ms", None)
+    arrival = getattr(book, "last_arrival_wall", None)
+    context = {
+        "book_exchange_ts_ms": exchange,
+        "book_age_ms": (round((now_wall - arrival) * 1000.0, 3)
+                        if isinstance(arrival, (int, float)) else None),
+        "book_exchange_lag_ms": (round(now_wall * 1000.0 - exchange, 3)
+                                 if isinstance(exchange, (int, float)) else None),
+        "book_seq": getattr(book, "last_seq", getattr(book, "seq", None)),
+    }
+    if context["book_age_ms"] is None:
+        context["book_age_unknown"] = "no_arrival_stamp"
+    return context
+
+
+def book_side_depth(book, held_side, depth=8):
+    """Top-`depth` of the held side and of the opposite side, at the fill."""
+    if book is None:
+        return None
+    yes = sorted(getattr(book, "yes_bids", {}).items(), reverse=True)[:depth]
+    no = sorted(getattr(book, "no_bids", {}).items(), reverse=True)[:depth]
+    held, opposite = (yes, no) if held_side == "yes" else (no, yes)
+    return {
+        "held_side": held_side,
+        "held": [[round(price, 3), size] for price, size in held],
+        "opposite": [[round(price, 3), size] for price, size in opposite],
+        "depth": depth,
+    }
 
 
 class PaperDesk:
-    def __init__(self, broadcast, entry_result=None, realistic=None, error_result=None):
+    def __init__(self, broadcast, entry_result=None, realistic=None, error_result=None,
+                 feed_state=None):
         self.positions = {}           # tid -> Position
         self.broadcast = broadcast
         self.entry_result = entry_result
         self.error_result = error_result
+        # Optional callable returning the engine's current feed lag and queue
+        # backlog, so a fill records the transport conditions it happened
+        # under.  Absent in isolated tests; the fields are then null.
+        self.feed_state = feed_state
+        # Last live book seen per market, by reference.  Exits reached from
+        # `check_timeouts`, `flatten_all` and `settle_market` have no book in
+        # hand, and 66 of 75 closed trades in the first live study exited on
+        # the 180 s timeout, so without this the dominant exit reason would be
+        # the one with no book evidence at all.
+        self._last_book = {}
         self.kill = False
         self.realistic = config.PAPER_EXECUTION_V2 if realistic is None else realistic
         self.shadow_books = {
@@ -203,15 +296,43 @@ class PaperDesk:
             for shadows in self.shadow_books.values():
                 shadows.invalidate(tickers)
 
+    def _remember_book(self, ticker, book):
+        """Keep a reference to the newest live book seen for a market.
+
+        Tolerates a desk built without `__init__` (the ownership tests build
+        partial desks deliberately), because capture must never be the reason a
+        close or a settlement fails.
+        """
+        cache = getattr(self, "_last_book", None)
+        if cache is None:
+            cache = self._last_book = {}
+        cache[ticker] = book
+
     def apply_book_snapshot(self, ticker, book):
+        self._remember_book(ticker, book)
         if self.realistic:
             for shadows in self.shadow_books.values():
                 shadows.reset(ticker, book)
 
-    def apply_book_delta(self, ticker, message, sequence=None):
+    def apply_book_delta(self, ticker, message, sequence=None, arrival_wall=None):
         if self.realistic:
             for shadows in self.shadow_books.values():
-                shadows.apply_delta(ticker, message, sequence)
+                shadows.apply_delta(ticker, message, sequence,
+                                    arrival_wall=arrival_wall)
+
+    def _feed_context(self):
+        """Feed lag and queue backlog at the fill, or nulls when unavailable."""
+        feed_state = getattr(self, "feed_state", None)
+        if feed_state is None:
+            return {"feed_lag_ms": None, "backlog": None}
+        try:
+            state = feed_state() or {}
+        except Exception:  # noqa: BLE001 - capture must never break a fill
+            return {"feed_lag_ms": None, "backlog": None}
+        return {
+            "feed_lag_ms": state.get("feed_lag_ms"),
+            "backlog": state.get("backlog"),
+        }
 
     def _shadow_for(self, strategy):
         try:
@@ -274,6 +395,11 @@ class PaperDesk:
         shadow = self._shadow_for(strategy).ensure(pending.sig["ticker"], book)
         if not shadow.ok:
             return self._finalize_entry_outcome(pending, "no_book", now_wall, [])
+        entry_context = self._entry_context(shadow, now_wall)
+        if self._book_too_stale(entry_context):
+            return self._finalize_entry_outcome(
+                pending, "stale_book", now_wall, [], entry_context=entry_context,
+            )
         side = "yes" if pending.sig["dir"] > 0 else "no"
         fill = shadow.buy(side, config.NOTIONAL_USD, config.PRICE_CAP, consume=False)
         if fill.quantity < 1 or fill.vwap is None:
@@ -327,6 +453,7 @@ class PaperDesk:
             "fee_type": fee_type,
             "fee_multiplier": fee_multiplier,
             "strategy": strategy,
+            "entry_context": entry_context,
         }
         pos = Position(
             0, pending.signal_id, pending.sig["ticker"], pending.meta["event"],
@@ -357,8 +484,32 @@ class PaperDesk:
         self._notify_entry(pending, "filled", detail)
         return True
 
-    def _finalize_entry_outcome(self, pending, outcome, now_wall, levels):
+    def _entry_context(self, book, now_wall):
+        """Conditions of the book an entry is about to fill against."""
+        context = book_age_context(book, now_wall)
+        context.update(self._feed_context())
+        context["max_book_age_ms"] = config.PAPER_MAX_BOOK_AGE_MS
+        return context
+
+    @staticmethod
+    def _book_too_stale(entry_context):
+        """True only when the bound is armed AND the age is known to exceed it.
+
+        An unknown age is not evidence of staleness, so it never refuses: the
+        alternative would turn a missing provider timestamp into a silent
+        change in which entries are taken.  The unknown is recorded instead.
+        """
+        bound = config.PAPER_MAX_BOOK_AGE_MS
+        if not bound or bound <= 0:
+            return False
+        age = entry_context.get("book_age_ms")
+        return isinstance(age, (int, float)) and age > bound
+
+    def _finalize_entry_outcome(self, pending, outcome, now_wall, levels,
+                                entry_context=None):
         latency_ms, order_arrival_ms, detail = self._entry_timing(pending, now_wall, levels)
+        if entry_context is not None:
+            detail["entry_context"] = entry_context
         store.finish_paper_signal(
             pending.signal_id, outcome, detail, latency_ms, order_arrival_ms,
         )
@@ -418,6 +569,13 @@ class PaperDesk:
             return "killed"
         if book is None or not book.ok:
             return "no_book"
+        now_wall = time.time()
+        self._remember_book(sig["ticker"], book)
+        entry_context = self._entry_context(book, now_wall)
+        # Same bound as the V2 adapter, so the two paths cannot disagree about
+        # which entries are eligible.
+        if self._book_too_stale(entry_context):
+            return "stale_book"
         side = "yes" if sig["dir"] > 0 else "no"
         ladder = book.ask_ladder(side)
         want_usd = config.NOTIONAL_USD
@@ -443,10 +601,11 @@ class PaperDesk:
         tid = store.insert_trade({
             "signal_id": signal_id, "market": sig["ticker"], "event": meta["event"],
             "series": meta["series"], "dir": sig["dir"], "side": side,
-            "entry_ts": time.time(), "entry_px": round(entry_px, 2), "size": round(size, 1),
+            "entry_ts": now_wall, "entry_px": round(entry_px, 2), "size": round(size, 1),
             "cap": config.PRICE_CAP, "notional": want_usd,
             "book_at_entry": book.snapshot_dict(),
             "strategy": sig.get("strategy") or "gate_a",
+            "entry_context": entry_context,
         })
         pos = Position(tid, signal_id, sig["ticker"], meta["event"], meta["series"],
                        sig["dir"], side, entry_px, size, sig["ref"], sig["ext"],
@@ -505,12 +664,24 @@ class PaperDesk:
         signature = (bid, bid_size, exec_px, qty)
         if signature == pos.exec_path_last:
             return
+        if path_thins(now - pos.entry_ts, bid, pos.path_peak, pos.path_trough,
+                      now, pos.path_last_written):
+            # Deliberately does NOT advance `exec_path_last`: that signature is
+            # what is durable, so the next row written carries the then-current
+            # quote rather than being deduplicated against one never persisted.
+            pos.exec_path_thinned += 1
+            return
         pos.exec_path_last = signature
         # One slot is reserved so the terminal row always fits inside the cap.
         if pos.exec_path_total >= store.BID_PATH_MAX_SAMPLES - 1:
             pos.exec_path_dropped += 1
             return
         pos.exec_path_total += 1
+        pos.path_last_written = now
+        if bid is not None:
+            pos.path_peak = bid if pos.path_peak is None else max(pos.path_peak, bid)
+            pos.path_trough = (bid if pos.path_trough is None
+                               else min(pos.path_trough, bid))
         pos.exec_path.append({
             "kind": "position", "trade_id": pos.tid, "signal_id": pos.signal_id,
             "event": pos.event, "market": pos.market, "side": pos.side,
@@ -541,6 +712,9 @@ class PaperDesk:
             pos.exec_path_dropped += 1
             return
         pos.exec_path_total += 1
+        # An outage ends the thinning interval, so the quote that resumes
+        # availability is always recorded rather than possibly thinned away.
+        pos.path_last_written = 0.0
         pos.exec_path.append({
             "kind": "position", "trade_id": pos.tid, "signal_id": pos.signal_id,
             "event": pos.event, "market": pos.market, "side": pos.side,
@@ -582,6 +756,9 @@ class PaperDesk:
         samples, and once more at close.  dt_ms is relative to the restored
         entry_ts, so partial flushes reassemble in dt_ms order.
         """
+        # The high rides along with the path: same cadence, one extra UPDATE
+        # per batch instead of one per new high.
+        self._persist_trade_high(pos)
         if pos.exec_path:
             rows = list(pos.exec_path)
             try:
@@ -623,31 +800,53 @@ class PaperDesk:
             )
 
     def _observe_executable_high(self, pos, bid, now=None):
-        """Record the highest executable held-side bid after entry fill."""
+        """Record the highest executable held-side bid after entry fill.
+
+        Held in memory and marked dirty; the write happens on the next path
+        flush, at close/settle, or at most once per TRADE_HIGH_PERSIST_S from
+        `check_timeouts`.  It used to commit on the event loop on every new
+        high of every open position, inside the WebSocket handler -- an fsync
+        per quote in exactly the fast markets the study cares about.  No
+        information is lost: the path rows already carry every quote, and the
+        closing transaction carries the final high.
+
+        The rule is unchanged: strictly greater than the current high, held-side
+        executable bid only, and an equal high keeps the first timestamp.
+        """
         if bid is None:
             return
         now = time.time() if now is None else now
         if pos.max_executable_bid is not None and bid <= pos.max_executable_bid:
             return
-        candidate_bid = float(bid)
-        candidate_ts = now
-        candidate_mfe = max(0.0, candidate_bid - pos.entry_px)
+        pos.max_executable_bid = float(bid)
+        pos.max_executable_bid_ts = now
+        pos.mfe_c = max(0.0, float(bid) - pos.entry_px)
+        pos.high_dirty = True
+
+    def _persist_trade_high(self, pos):
+        """Write the buffered high.  A failure leaves the row dirty to retry.
+
+        `store.update_trade_high` keeps its own strictly-greater guard, so a
+        replay of the same high is a no-op rather than a rewrite.
+        """
+        if not pos.high_dirty or pos.max_executable_bid is None:
+            return False
+        # Stamped on the attempt, not on success, so a failing write retries on
+        # the same bounded cadence instead of on every tick.
+        pos.high_persisted_ts = time.time()
         try:
-            store.update_trade_high(pos.tid, candidate_bid, candidate_ts)
+            store.update_trade_high(
+                pos.tid, pos.max_executable_bid, pos.max_executable_bid_ts,
+            )
         except Exception as exc:
-            # Do not advance the in-memory high on a failed write.  Doing so
-            # made every later quote compare against a high the database never
-            # accepted, so the write was never retried and the high was lost.
-            pos.high_dirty = True
             self._report_error("trade_high", exc)
-            return
-        pos.max_executable_bid = candidate_bid
-        pos.max_executable_bid_ts = candidate_ts
-        pos.mfe_c = candidate_mfe
+            return False
         pos.high_dirty = False
+        return True
 
     def on_book(self, ticker, book):
         """Mark open positions on this market; handle target exits + shadow metrics."""
+        self._remember_book(ticker, book)
         for pos in [p for p in self.positions.values() if p.market == ticker]:
             bid = book.best_yes_bid() if pos.side == "yes" else book.best_no_bid()
             if bid is None:
@@ -672,15 +871,15 @@ class PaperDesk:
                     pos.shadow_stop_hit_px = bid
                 if config.USE_STOP:
                     if self.realistic:
-                        self._queue_exit(pos, "stop", 0.0)
+                        self._queue_exit(pos, "stop", 0.0, bid=bid)
                     else:
-                        self.close(pos, bid, "stop")
+                        self.close(pos, bid, "stop", book=book, bid=bid)
                     continue
             if bid >= config.TARGET:
                 if self.realistic:
-                    self._queue_exit(pos, "target", config.TARGET)
+                    self._queue_exit(pos, "target", config.TARGET, bid=bid)
                 else:
-                    self.close(pos, config.TARGET, "target")
+                    self.close(pos, config.TARGET, "target", book=book, bid=bid)
                 continue
             reason = sleeve_exit_reason(pos, bid, time.time(), fee_dollars)
             if reason:
@@ -688,22 +887,65 @@ class PaperDesk:
                     # The trigger uses the observed executable bid.  A zero floor
                     # models a taker exit after latency instead of assuming the
                     # scratch or trailing level remains available.
-                    self._queue_exit(pos, reason, 0.0)
+                    self._queue_exit(pos, reason, 0.0, bid=bid)
                 else:
-                    self.close(pos, bid, reason)
+                    self.close(pos, bid, reason, book=book, bid=bid)
 
     def check_timeouts(self):
         now = time.time()
         for pos in list(self.positions.values()):
+            # Bounded staleness for the column the API and UI read while the
+            # position is open; at most one UPDATE per position per interval.
+            if pos.high_dirty and now - pos.high_persisted_ts >= TRADE_HIGH_PERSIST_S:
+                self._persist_trade_high(pos)
             timeout_s = config.SLEEVE_TIMEOUT_S if pos.sleeve else config.TIMEOUT_S
             if now - pos.entry_ts > timeout_s:
                 reason = "sleeve_timeout" if pos.sleeve else "timeout"
                 if self.realistic:
-                    self._queue_exit(pos, reason, 0.0)
+                    self._queue_exit(pos, reason, 0.0, bid=pos.best_bid, now=now)
                 else:
-                    self.close(pos, pos.best_bid, reason)
+                    self.close(pos, pos.best_bid, reason, bid=pos.best_bid, now=now)
 
-    def _queue_exit(self, pos, reason, price_floor):
+    def _exit_trigger(self, pos, reason, bid, now):
+        """The numbers behind the label, captured where the label is decided.
+
+        66 of 75 closed trades in the first live study exited on the 180 s
+        timeout and the record said only "timeout": not the bid it saw, not how
+        long it had held, not how far the trade had ever run.  Those are the
+        four inputs every exit rule in this desk actually reads, so they are
+        captured at the decision rather than reconstructed afterwards.
+        """
+        trigger = {
+            "reason": reason,
+            "observed_bid": round(bid, 3) if isinstance(bid, (int, float)) else None,
+            "elapsed_s": round(now - pos.entry_ts, 3),
+            # The executable high, which `_observe_executable_high` maintains
+            # for EVERY position.  `Position.peak_bid` is not the peak of the
+            # trade: it only advances inside `sleeve_exit_reason`, so on a
+            # Gate-A position it never leaves the entry price.  It is reported
+            # too, under its own name, because it is the value three sleeve
+            # exits actually read.
+            "peak_bid": pos.max_executable_bid,
+            "peak_bid_ts": pos.max_executable_bid_ts,
+            "entry_px": round(pos.entry_px, 3),
+            "remaining": round(pos.remaining, 3),
+        }
+        if pos.sleeve:
+            trigger["sleeve_peak_bid"] = pos.peak_bid
+        if pos.sleeve and isinstance(bid, (int, float)):
+            # The scratch level is the discriminator for three of the four
+            # sleeve exits, and it is recomputed per quote from fees that are
+            # not otherwise recoverable from the row.
+            try:
+                trigger["scratch_c"] = round(
+                    fee_aware_scratch_price(pos, bid, fee_dollars), 3)
+            except Exception:  # noqa: BLE001 - capture must never block an exit
+                trigger["scratch_c"] = None
+            trigger["anchor_bid"] = pos.sleeve_anchor_bid
+        return trigger
+
+    def _queue_exit(self, pos, reason, price_floor, bid=None, now=None):
+        now = time.time() if now is None else now
         priority = {
             "target": 1,
             "timeout": 2,
@@ -724,6 +966,7 @@ class PaperDesk:
             queued_wall=time.time(),
             reason=reason,
             price_floor=price_floor,
+            trigger=self._exit_trigger(pos, reason, bid, now),
         )
 
     @staticmethod
@@ -731,6 +974,31 @@ class PaperDesk:
         order.attempts += 1
         order.queued_wall = now_wall
         order.due_mono = now_mono + config.PAPER_EXIT_LATENCY_MS / 1000.0
+
+    def _exit_context(self, pos, reason, book, trigger, now_wall, source="fill"):
+        """Everything the exit decision and its fill can be re-judged from.
+
+        `book` is the book the fill actually walked when there is one.  A
+        timeout, flatten or settlement reached without a book in hand falls
+        back to the last live book seen for the market, labelled as such, so
+        the row never claims the fill book when it only has the last one.
+        """
+        if book is None:
+            book = (getattr(self, "_last_book", None) or {}).get(pos.market)
+            source = "last_seen" if book is not None else "unavailable"
+        context = {
+            "exit_trigger": trigger or self._exit_trigger(
+                pos, reason, pos.best_bid, now_wall),
+            "book_source": source,
+        }
+        context.update(book_age_context(book, now_wall) if book is not None else {
+            "book_exchange_ts_ms": None, "book_age_ms": None,
+            "book_exchange_lag_ms": None, "book_seq": None,
+            "book_age_unknown": "no_book_at_exit",
+        })
+        context["book"] = book_side_depth(book, pos.side)
+        context.update(self._feed_context())
+        return context
 
     def _execute_exit(self, tid, order, live_books, now_mono, now_wall):
         pos = self.positions.get(tid)
@@ -781,6 +1049,9 @@ class PaperDesk:
             # Last write for this trade: the terminal row joins the same
             # transaction as the final fill, progress and closed fields.
             self._record_exec_terminal(pos, final["exit_px"], now_wall)
+            # Before the closing transaction, so the closed row carries the
+            # final high rather than the last flushed one.
+            self._persist_trade_high(pos)
         try:
             store.record_paper_exit(
                 pos.tid, pos.signal_id, pos.side, now_wall, order.reason, fees, progress,
@@ -788,6 +1059,9 @@ class PaperDesk:
                 path_rows=list(pos.exec_path) if final is not None else None,
                 truncated=bool(pos.exec_path_dropped),
                 dropped_samples=pos.exec_path_dropped,
+                exit_context=(self._exit_context(pos, order.reason, shadow,
+                                                 order.trigger, now_wall)
+                              if final is not None else None),
             )
         except Exception:
             source.clear()
@@ -849,6 +1123,9 @@ class PaperDesk:
                 )
                 settled_at = time.time()
                 self._record_exec_terminal(pos, final["exit_px"], settled_at)
+                # Settlement never sets a high; it only makes the observed one
+                # durable before the trade closes.
+                self._persist_trade_high(pos)
                 try:
                     store.record_paper_exit(
                         pos.tid, pos.signal_id, pos.side, settled_at, "settle",
@@ -856,6 +1133,11 @@ class PaperDesk:
                         path_rows=list(pos.exec_path),
                         truncated=bool(pos.exec_path_dropped),
                         dropped_samples=pos.exec_path_dropped,
+                        exit_context=self._exit_context(
+                            pos, "settle", None,
+                            self._exit_trigger(pos, "settle", pos.best_bid, settled_at),
+                            settled_at,
+                        ),
                     )
                 except Exception as exc:
                     # Settlement is the same all-or-nothing contract: keep the
@@ -900,17 +1182,25 @@ class PaperDesk:
         }})
         self._safe_log("trade", f"CLOSE {pos.market} {reason} net ${final['net']:+.2f}")
 
-    def close(self, pos, exit_px, reason):
+    def close(self, pos, exit_px, reason, book=None, bid=None, now=None):
         exit_px = min(max(exit_px, 0.0), 100.0)
         gross = (exit_px - pos.entry_px) * pos.size / 100.0
         fees = fee_dollars(pos.size, pos.entry_px)
         if reason != "settle" and config.FEE_EXIT_TAKER:
             fees += fee_dollars(pos.size, exit_px)
         net = gross - fees
+        now = time.time() if now is None else now
+        exit_context = self._exit_context(
+            pos, reason, book,
+            self._exit_trigger(
+                pos, reason, pos.best_bid if bid is None else bid, now),
+            now,
+        )
         # Terminal row first, then ONE transaction covering path, summary and
         # the closed-trade fields.  Closing before flushing the path left a
         # closed trade whose final rows had no owner when the write failed.
         self._record_exec_terminal(pos, round(exit_px, 2), time.time())
+        self._persist_trade_high(pos)
         try:
             store.close_trade(
                 pos.tid, round(exit_px, 2), reason, round(gross, 2),
@@ -919,6 +1209,7 @@ class PaperDesk:
                 path_rows=list(pos.exec_path),
                 truncated=bool(pos.exec_path_dropped),
                 dropped_samples=pos.exec_path_dropped,
+                exit_context=exit_context,
             )
         except Exception as exc:
             # Nothing committed: keep owning the position so a later attempt can
@@ -952,6 +1243,6 @@ class PaperDesk:
     def flatten_all(self, reason="flatten"):
         for pos in list(self.positions.values()):
             if self.realistic:
-                self._queue_exit(pos, reason, 0.0)
+                self._queue_exit(pos, reason, 0.0, bid=pos.best_bid)
             else:
-                self.close(pos, pos.best_bid, reason)
+                self.close(pos, pos.best_bid, reason, bid=pos.best_bid)
