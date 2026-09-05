@@ -13,6 +13,10 @@ from . import config, store
 
 # Samples buffered before an incremental write; bounds crash loss.
 BID_PATH_FLUSH_EVERY = 250
+# Slowest acceptable staleness for a trade high that no path flush or close has
+# written yet.  The high itself is authoritative in memory; this only bounds how
+# long the API/UI can read a stale column for an open position.
+TRADE_HIGH_PERSIST_S = 5.0
 from .execution import ShadowBook, ShadowBooks
 from .late_score_sleeve import sleeve_exit_reason
 
@@ -91,6 +95,7 @@ class Position:
         self.exec_path_total = 0
         self.exec_path_flush_failed = False
         self.high_dirty = False
+        self.high_persisted_ts = 0.0
         self.max_executable_bid = None
         self.max_executable_bid_ts = None
         self.mfe_c = None
@@ -582,6 +587,9 @@ class PaperDesk:
         samples, and once more at close.  dt_ms is relative to the restored
         entry_ts, so partial flushes reassemble in dt_ms order.
         """
+        # The high rides along with the path: same cadence, one extra UPDATE
+        # per batch instead of one per new high.
+        self._persist_trade_high(pos)
         if pos.exec_path:
             rows = list(pos.exec_path)
             try:
@@ -623,28 +631,49 @@ class PaperDesk:
             )
 
     def _observe_executable_high(self, pos, bid, now=None):
-        """Record the highest executable held-side bid after entry fill."""
+        """Record the highest executable held-side bid after entry fill.
+
+        Held in memory and marked dirty; the write happens on the next path
+        flush, at close/settle, or at most once per TRADE_HIGH_PERSIST_S from
+        `check_timeouts`.  It used to commit on the event loop on every new
+        high of every open position, inside the WebSocket handler -- an fsync
+        per quote in exactly the fast markets the study cares about.  No
+        information is lost: the path rows already carry every quote, and the
+        closing transaction carries the final high.
+
+        The rule is unchanged: strictly greater than the current high, held-side
+        executable bid only, and an equal high keeps the first timestamp.
+        """
         if bid is None:
             return
         now = time.time() if now is None else now
         if pos.max_executable_bid is not None and bid <= pos.max_executable_bid:
             return
-        candidate_bid = float(bid)
-        candidate_ts = now
-        candidate_mfe = max(0.0, candidate_bid - pos.entry_px)
+        pos.max_executable_bid = float(bid)
+        pos.max_executable_bid_ts = now
+        pos.mfe_c = max(0.0, float(bid) - pos.entry_px)
+        pos.high_dirty = True
+
+    def _persist_trade_high(self, pos):
+        """Write the buffered high.  A failure leaves the row dirty to retry.
+
+        `store.update_trade_high` keeps its own strictly-greater guard, so a
+        replay of the same high is a no-op rather than a rewrite.
+        """
+        if not pos.high_dirty or pos.max_executable_bid is None:
+            return False
+        # Stamped on the attempt, not on success, so a failing write retries on
+        # the same bounded cadence instead of on every tick.
+        pos.high_persisted_ts = time.time()
         try:
-            store.update_trade_high(pos.tid, candidate_bid, candidate_ts)
+            store.update_trade_high(
+                pos.tid, pos.max_executable_bid, pos.max_executable_bid_ts,
+            )
         except Exception as exc:
-            # Do not advance the in-memory high on a failed write.  Doing so
-            # made every later quote compare against a high the database never
-            # accepted, so the write was never retried and the high was lost.
-            pos.high_dirty = True
             self._report_error("trade_high", exc)
-            return
-        pos.max_executable_bid = candidate_bid
-        pos.max_executable_bid_ts = candidate_ts
-        pos.mfe_c = candidate_mfe
+            return False
         pos.high_dirty = False
+        return True
 
     def on_book(self, ticker, book):
         """Mark open positions on this market; handle target exits + shadow metrics."""
@@ -695,6 +724,10 @@ class PaperDesk:
     def check_timeouts(self):
         now = time.time()
         for pos in list(self.positions.values()):
+            # Bounded staleness for the column the API and UI read while the
+            # position is open; at most one UPDATE per position per interval.
+            if pos.high_dirty and now - pos.high_persisted_ts >= TRADE_HIGH_PERSIST_S:
+                self._persist_trade_high(pos)
             timeout_s = config.SLEEVE_TIMEOUT_S if pos.sleeve else config.TIMEOUT_S
             if now - pos.entry_ts > timeout_s:
                 reason = "sleeve_timeout" if pos.sleeve else "timeout"
@@ -781,6 +814,9 @@ class PaperDesk:
             # Last write for this trade: the terminal row joins the same
             # transaction as the final fill, progress and closed fields.
             self._record_exec_terminal(pos, final["exit_px"], now_wall)
+            # Before the closing transaction, so the closed row carries the
+            # final high rather than the last flushed one.
+            self._persist_trade_high(pos)
         try:
             store.record_paper_exit(
                 pos.tid, pos.signal_id, pos.side, now_wall, order.reason, fees, progress,
@@ -849,6 +885,9 @@ class PaperDesk:
                 )
                 settled_at = time.time()
                 self._record_exec_terminal(pos, final["exit_px"], settled_at)
+                # Settlement never sets a high; it only makes the observed one
+                # durable before the trade closes.
+                self._persist_trade_high(pos)
                 try:
                     store.record_paper_exit(
                         pos.tid, pos.signal_id, pos.side, settled_at, "settle",
@@ -911,6 +950,7 @@ class PaperDesk:
         # the closed-trade fields.  Closing before flushing the path left a
         # closed trade whose final rows had no owner when the write failed.
         self._record_exec_terminal(pos, round(exit_px, 2), time.time())
+        self._persist_trade_high(pos)
         try:
             store.close_trade(
                 pos.tid, round(exit_px, 2), reason, round(gross, 2),

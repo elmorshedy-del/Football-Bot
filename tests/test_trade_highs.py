@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from app.books import Book
+from app import paper as paper_module
 from app.paper import PaperDesk, Position
 from app import store
 
@@ -65,6 +66,12 @@ class TradeHighTests(unittest.TestCase):
         self.assertEqual(pos.max_executable_bid, 57.0)
         self.assertEqual(pos.max_executable_bid_ts, first_ts)
         self.assertEqual(pos.mfe_c, 7.0)
+        # The high is held in memory and persisted by the next flush, so no
+        # commit lands on the quote path itself.
+        pending = store.q(
+            "SELECT max_executable_bid FROM trades WHERE id=?", (pos.tid,))[0]
+        self.assertIsNone(pending["max_executable_bid"])
+        desk._flush_exec_path(pos)
         row = store.q("SELECT max_executable_bid, mfe_c FROM trades WHERE id=?", (pos.tid,))[0]
         self.assertEqual(row["max_executable_bid"], 57.0)
         self.assertEqual(row["mfe_c"], 7.0)
@@ -96,6 +103,31 @@ class TradeHighTests(unittest.TestCase):
         self.assertEqual(pos.max_executable_bid, 51.0)
         desk.settle_market("T", "yes")
         self.assertEqual(pos.max_executable_bid, 51.0)
+        # The closing transaction carries the observed high, never the
+        # settlement price.
+        row = store.q("SELECT max_executable_bid FROM trades WHERE id=?", (pos.tid,))[0]
+        self.assertEqual(row["max_executable_bid"], 51.0)
+
+    def test_a_quiet_open_position_is_refreshed_on_a_bounded_cadence(self):
+        """The API reads the column while a position is open, so it cannot
+        stay indefinitely behind a high no flush has reached yet."""
+        desk = PaperDesk(lambda *_: None, realistic=False)
+        pos = self.open_position()
+        # Fresh entry so check_timeouts exercises only the high refresh.
+        pos.entry_ts = time.time()
+        desk.positions[pos.tid] = pos
+        desk.on_book("T", held_book(yes_bid=53.0, yes_ask=55.0))
+        self.assertTrue(pos.high_dirty)
+
+        pos.high_persisted_ts = time.time()
+        desk.check_timeouts()
+        self.assertTrue(pos.high_dirty, "refreshed before the interval elapsed")
+
+        pos.high_persisted_ts = time.time() - paper_module.TRADE_HIGH_PERSIST_S - 1.0
+        desk.check_timeouts()
+        self.assertFalse(pos.high_dirty)
+        row = store.q("SELECT max_executable_bid FROM trades WHERE id=?", (pos.tid,))[0]
+        self.assertEqual(row["max_executable_bid"], 53.0)
 
     def test_high_below_entry_is_visible_with_zero_mfe(self):
         desk = PaperDesk(lambda *_: None, realistic=False)
@@ -104,6 +136,7 @@ class TradeHighTests(unittest.TestCase):
         desk.on_book("T", held_book(yes_bid=47.0, yes_ask=49.0))
         self.assertEqual(pos.max_executable_bid, 47.0)
         self.assertEqual(pos.mfe_c, 0.0)
+        desk._flush_exec_path(pos)
         row = store.q("SELECT max_executable_bid, mfe_c FROM trades WHERE id=?", (pos.tid,))[0]
         self.assertEqual(row["max_executable_bid"], 47.0)
         self.assertEqual(row["mfe_c"], 0.0)
@@ -118,6 +151,7 @@ class TradeHighTests(unittest.TestCase):
         pos = self.open_position()
         desk.positions[pos.tid] = pos
         desk.on_book("T", held_book(yes_bid=61.0, yes_ask=63.0))
+        desk._flush_exec_path(pos)
         restored = PaperDesk(lambda *_: None, realistic=True)
         restored.restore_open_positions(store.load_open_paper_positions())
         loaded = restored.positions[pos.tid]

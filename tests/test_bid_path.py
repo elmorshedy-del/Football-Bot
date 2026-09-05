@@ -222,18 +222,34 @@ class ArchitectBlockerFourTests(unittest.TestCase):
             desk._flush_exec_path(pos)
         self.assertEqual(pos.exec_path, [])
 
+    def test_observing_a_high_writes_nothing_until_a_flush(self):
+        """H2: a new high must not put a commit on the WebSocket path."""
+        desk, pos = _desk(), _position()
+        with patch("app.store.update_trade_high") as write:
+            for tick, bid in enumerate((80.0, 85.0, 90.0, 88.0), start=1):
+                desk._observe_executable_high(pos, bid, now=float(tick))
+            write.assert_not_called()
+            self.assertEqual(pos.max_executable_bid, 90.0)
+            self.assertEqual(pos.max_executable_bid_ts, 3.0)
+            self.assertTrue(pos.high_dirty)
+            desk._flush_exec_path(pos)
+            write.assert_called_once_with(pos.tid, 90.0, 3.0)
+        self.assertFalse(pos.high_dirty)
+
     def test_a_failed_high_write_is_retried(self):
-        """Memory must not claim a high the database never accepted."""
+        """A failed write stays pending; the retry writes the held high."""
         desk, pos = _desk(), _position()
         with patch("app.store.update_trade_high", side_effect=RuntimeError("disk full")):
             desk._observe_executable_high(pos, 90.0, now=1.0)
-        self.assertIsNone(pos.max_executable_bid)
-        self.assertTrue(pos.high_dirty)
+            desk._persist_trade_high(pos)
+        self.assertEqual(pos.max_executable_bid, 90.0,
+                         "the observed high is authoritative in memory")
+        self.assertTrue(pos.high_dirty, "a failed write must stay pending")
         calls = []
         with patch("app.store.update_trade_high", side_effect=lambda *a: calls.append(a)):
-            desk._observe_executable_high(pos, 88.0, now=2.0)
-        self.assertTrue(calls, "a lower bid after a failed write must still be attempted")
-        self.assertEqual(pos.max_executable_bid, 88.0)
+            desk._persist_trade_high(pos)
+        self.assertEqual(calls, [(pos.tid, 90.0, 1.0)],
+                         "the retry must write the held high, not a later quote")
         self.assertFalse(pos.high_dirty)
 
     def test_missing_bids_and_the_exit_are_recorded(self):

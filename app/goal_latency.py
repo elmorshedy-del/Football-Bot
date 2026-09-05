@@ -119,6 +119,13 @@ class GoalLatencyObserver:
         self.clocks_recorded = 0
         self.provider_events_recorded = 0
         self.seen_fingerprints = {}     # event -> set of fingerprints
+        # (event, fingerprint) -> newest poll metadata for an already-recorded
+        # occurrence.  Held in memory and flushed in one transaction; see
+        # `_flush_provider_refreshes`.
+        self.pending_refreshes = {}
+        self.last_refresh_flush = 0.0
+        self.refresh_flushes = 0
+        self.refreshes_written = 0
         self.lifecycle_state = {}       # event -> {period, status}
         # event -> fingerprint of the last substantive event, so a correction
         # arriving on a later poll still links to what it revises.
@@ -127,12 +134,19 @@ class GoalLatencyObserver:
     async def _resolve_new_events(self):
         now = time.time()
         active = set(self.event_tickers())
-        for event in set(self.milestones) - active:
+        dropped = set(self.milestones) - active
+        if dropped:
+            # The event is leaving the watch list, so its buffered observation
+            # times must reach SQLite before the in-memory state is discarded.
+            await self._flush_provider_refreshes(force=True)
+        for event in dropped:
             milestone_id = self.milestones.pop(event)
             self.events_by_milestone.pop(milestone_id, None)
             self.scores.pop(milestone_id, None)
             self.last_poll_ts.pop(milestone_id, None)
             self.seen_fingerprints.pop(event, None)
+            for key in [k for k in self.pending_refreshes if k[0] == event]:
+                self.pending_refreshes.pop(key, None)
             self.lifecycle_state.pop(event, None)
             self.last_substantive_fingerprint.pop(event, None)
             self.clock_tracker.drop_event(event)
@@ -274,24 +288,20 @@ class GoalLatencyObserver:
         for item in candidates:
             fingerprint = item["fingerprint"]
             if fingerprint in seen:
-                await asyncio.to_thread(store.upsert_provider_event, {
+                # Already recorded.  Only the poll metadata changes, so it is
+                # buffered and written in one batch (see
+                # `_flush_provider_refreshes`).  Writing it here cost a
+                # SELECT+UPDATE+COMMIT under the writer lock per known event per
+                # poll: with five mapped matches and dozens of events each, the
+                # 250 ms poll measured 5.7 s p50 / 30 s max on 2026-09-04.
+                self.pending_refreshes[(event, fingerprint)] = {
                     "observed_ts": timing["received_wall"],
                     "poll_started_ts": timing["started_wall"],
                     "previous_poll_ts": self.last_poll_ts.get(milestone_id),
                     "response_ms": timing["response_ms"],
                     "event": event,
-                    "milestone_id": milestone_id,
                     "fingerprint": fingerprint,
-                    "previous_fingerprint": None,
-                    "canonical_type": item["canonical_type"],
-                    "canonical_side": item.get("side"),
-                    "provider_period": parsed.provider_period if parsed else None,
-                    "provider_minute": item.get("provider_minute"),
-                    "provider_stoppage": item.get("provider_stoppage"),
-                    "provider_clock": item.get("provider_clock"),
-                    "normalized_event": item,
-                    "raw_payload": item.get("raw") or live_data,
-                })
+                }
                 continue
             seen.add(fingerprint)
             row = {
@@ -324,6 +334,34 @@ class GoalLatencyObserver:
                 self.provider_events_recorded += 1
                 previous_fingerprint = fingerprint
             _ = inserted
+
+    async def _flush_provider_refreshes(self, force=False, now=None):
+        """Write the buffered `last_observed_ts` refreshes in one transaction.
+
+        New fingerprints still insert immediately, because the insert carries
+        the observation itself.  A repeat sighting carries nothing new except
+        when it was last seen, which is exactly what can wait for a batch.
+
+        On failure the buffer is kept and retried on the next flush, so a
+        transient database problem loses no observation time.
+        """
+        if not self.pending_refreshes:
+            return 0
+        now = time.time() if now is None else now
+        interval = max(float(config.PROVIDER_EVENT_FLUSH_S), 1.0)
+        if not force and now - self.last_refresh_flush < interval:
+            return 0
+        rows = list(self.pending_refreshes.values())
+        self.last_refresh_flush = now
+        try:
+            written = await asyncio.to_thread(store.refresh_provider_events, rows)
+        except Exception as exc:  # noqa: BLE001 - retried on the next flush
+            self.last_error = f"provider refresh: {type(exc).__name__}: {exc}"
+            return 0
+        self.pending_refreshes.clear()
+        self.refresh_flushes += 1
+        self.refreshes_written += int(written or 0)
+        return written
 
     async def _poll(self):
         milestone_ids = sorted(self.events_by_milestone)
@@ -414,6 +452,9 @@ class GoalLatencyObserver:
                 await self._poll()
                 await self._finish_pending()
                 self.last_error = None
+                # After the poll's own error state is cleared, so a flush
+                # failure is reported rather than immediately overwritten.
+                await self._flush_provider_refreshes()
             # An observer failure must never terminate or affect the trading loop.
             except Exception as exc:  # noqa: BLE001
                 self.last_error = f"{type(exc).__name__}: {exc}"
@@ -431,6 +472,9 @@ class GoalLatencyObserver:
             "corrections": self.corrections,
             "clocks_recorded": self.clocks_recorded,
             "provider_events_recorded": self.provider_events_recorded,
+            "provider_refreshes_pending": len(self.pending_refreshes),
+            "provider_refresh_flushes": self.refresh_flushes,
+            "provider_refreshes_written": self.refreshes_written,
             "last_poll_ts": self.last_poll_wall,
             "last_response_ms": self.last_response_ms,
             "last_error": self.last_error,
