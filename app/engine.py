@@ -13,7 +13,7 @@ from .goal_latency import GoalLatencyObserver
 from .kalshi import KalshiClient, KalshiWS
 from .late_score_sleeve import PriceOnlyLateScoreSleeve
 from .match_clock import MatchClockGate, MatchClockTracker, unusable_stamp
-from .paper import PaperDesk
+from .paper import BID_PATH_FLUSH_EVERY, PaperDesk
 from .recorder import RawRecorder
 
 
@@ -140,7 +140,7 @@ class Engine:
         self.desk = PaperDesk(
             self.broadcast, self.on_paper_entry_result, error_result=self._record_error,
         )
-        self.recorder = RawRecorder(self.on_recorder_error)
+        self.recorder = RawRecorder(self.on_recorder_error, self.on_feed_event)
         self.books = {}
         self.meta = {}                 # ticker -> {event, series, title, close_time}
         self.fee_schedules = {}        # series -> (fee_type, fee_multiplier)
@@ -150,6 +150,22 @@ class Engine:
         self.pending = []              # candidates awaiting sibling confirmation
         self.last_entry_ms = {}        # (strategy, ticker) -> exchange signal timestamp
         self.feed_lag = deque(maxlen=600)
+        # Feed lag sampled since the last stats tick, and the deepest arrival
+        # queue seen in the same interval.  One latency row per tick replaces
+        # the every-20th-trade commit that put 4-5 fsyncs/s on the event loop
+        # at peak (measured 2026-09-04 20:47-21:05).
+        # Bounded like `feed_lag` itself: if the stats tick is ever starved --
+        # exactly the condition this measures -- the buffer must not grow
+        # without limit.  A 5 s interval holds a few hundred trade samples at
+        # the measured peak, so the cap only ever bites during a stall, where
+        # the most recent samples are the ones worth reporting.
+        self._feed_lag_tick = deque(maxlen=20_000)
+        self._backlog_tick = 0
+        self.feed_backlog = 0
+        self._feed_event_failures = 0
+        self._feed_event_tasks = set()
+        self._path_write_tasks = set()
+        self._watched_markets = set()
         self.market_observations = {}  # event -> recent locally timestamped price changes
         self._last_market_state = {}   # (kind, ticker) -> tuple, suppress unchanged frames
         self.goal_latency = None
@@ -204,6 +220,54 @@ class Engine:
         self.ws_state = state
         if str(state).startswith("disconnected"):
             self._record_error("websocket", state)
+
+    # ---------- feed-health ledger ----------
+    def on_feed_event(self, kind, detail=None, marker=True):
+        """Record one feed-health event in the ledger and the raw stream.
+
+        Called from the socket reader/consumer, the recorder and discovery, so
+        it must never raise into any of them and must never put an fsync on the
+        event loop: the SQLite insert is dispatched to a worker thread when a
+        loop is running and only falls back to a synchronous write when there
+        is none (tests, and the synchronous replay harness).
+
+        `marker` is False when the caller is already inside the recorder or on
+        another thread, where re-entering the gzip handle would race it.
+        """
+        ts, mono = time.time(), time.monotonic()
+        if marker:
+            try:
+                self.recorder.write_marker(kind, detail, ts, mono)
+            except Exception as exc:
+                self._feed_event_failures += 1
+                self._record_error("feed_event_marker", exc)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            try:
+                store.insert_feed_event(kind, detail, ts, mono)
+            except Exception as exc:
+                self._feed_event_failures += 1
+                self._record_error("feed_event", exc)
+            return
+
+        async def _write():
+            try:
+                await asyncio.to_thread(store.insert_feed_event, kind, detail, ts, mono)
+            except Exception as exc:
+                self._feed_event_failures += 1
+                self._record_error("feed_event", exc)
+
+        task = loop.create_task(_write())
+        # Without a strong reference the loop may drop the task mid-flight.
+        self._feed_event_tasks.add(task)
+        task.add_done_callback(self._feed_event_tasks.discard)
+
+    def on_ws_feed_event(self, kind, detail=None):
+        """Socket-side adapter: the WebSocket client passes (kind, detail)."""
+        self.on_feed_event(kind, detail)
 
     def register_market(self, ticker, event, series, title, close_time,
                         fee_type="quadratic", fee_multiplier=1.0, leg_title=None,
@@ -297,7 +361,18 @@ class Engine:
                 if lower <= row["mono"] <= upper]
 
     # ---------- ws routing ----------
-    def handle_ws(self, msg, wall, mono):
+    def handle_ws(self, msg, wall, mono, backlog=0):
+        """Route one exchange frame.
+
+        `wall`/`mono` are ARRIVAL stamps, taken by the socket reader the moment
+        the frame was received.  The processing stamps are taken here, so a
+        frame that waited in the arrival queue carries both and the delay is
+        measurable instead of being folded into every downstream timestamp.
+        """
+        proc_wall, proc_mono = time.time(), time.monotonic()
+        self.feed_backlog = backlog
+        if backlog > self._backlog_tick:
+            self._backlog_tick = backlog
         t = msg.get("type")
         body = msg.get("msg") or {}
         if t == "orderbook_gap":
@@ -320,7 +395,8 @@ class Engine:
             self.n_foreign += 1
             return
         if t in ("orderbook_snapshot", "orderbook_delta", "trade", "market_lifecycle_v2"):
-            self.recorder.write(msg, wall, mono)
+            self.recorder.write(msg, proc_wall, proc_mono,
+                                arrival_wall=wall, arrival_mono=mono, backlog=backlog)
         if t == "orderbook_snapshot":
             b = self.books.setdefault(ticker, Book())
             b.apply_snapshot(body, msg.get("seq"))
@@ -341,11 +417,13 @@ class Engine:
             ts_ms = body.get("ts_ms") or (body.get("ts", 0) * 1000)
             px = float(body.get("yes_price_dollars", 0)) * 100
             sz = float(body.get("count_fp") or 0)
+            # Arrival, not processing: during a backlog the two differ by
+            # seconds and only the arrival stamp measures the exchange lag.
             lag = wall * 1000 - ts_ms
             self.feed_lag.append(lag)
-            if self.n_trades % 20 == 0:
-                store.add_latency("feed_lag", lag)
-            self.process_trade(ticker, int(ts_ms), px, sz, body.get("taker_side"), wall)
+            self._feed_lag_tick.append(lag)
+            self.process_trade(ticker, int(ts_ms), px, sz, body.get("taker_side"), wall,
+                               proc_wall=proc_wall, backlog=backlog)
             self._record_market_observation(ticker, "trade", wall, mono)
         elif t == "market_lifecycle_v2":
             res = body.get("settled_result") or body.get("result")
@@ -374,8 +452,8 @@ class Engine:
         self._evict_signal_paths()
 
     def _record_signal_paths(self, ticker, book, now):
-        for watch in self._signal_paths:
-            if watch.get("retry_only"):
+        for watch in list(self._signal_paths):
+            if watch.get("retry_only") or watch.get("finalizing"):
                 continue
             if watch["market"] != ticker:
                 continue
@@ -416,6 +494,64 @@ class Engine:
                 "sample_seq": watch["total"], "availability": availability,
                 "terminal": 0,
             })
+            # H2: never one commit per quote.  The buffer is written in
+            # BID_PATH_FLUSH_EVERY batches, off the event loop, so a 300 s
+            # window no longer lands as 4,000 rows in a single synchronous
+            # finalization inside the WebSocket handler.
+            if len(watch["rows"]) >= BID_PATH_FLUSH_EVERY:
+                self._flush_signal_path(watch)
+
+    def _dispatch_path_write(self, watch, work, done):
+        """Run one path write off the event loop, keeping the watch owned.
+
+        Returns True when the write was scheduled (the watch stays owned and
+        `done` runs later on the loop thread) and False when it completed
+        inline.  With no running loop -- the synchronous replay harness and the
+        ownership tests -- the write happens here, exactly as before, so the
+        release semantics those tests pin are unchanged.
+
+        `done(exc)` is always called on the event-loop thread, so every mutation
+        of watch/engine state stays single-threaded; only the SQLite call itself
+        moves to a worker.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            try:
+                work()
+            except Exception as exc:  # noqa: BLE001 - reported through `done`
+                done(exc)
+            else:
+                done(None)
+            return False
+
+        watch["in_flight"] = True
+
+        async def runner():
+            try:
+                await asyncio.to_thread(work)
+            except Exception as exc:  # noqa: BLE001 - reported through `done`
+                error = exc
+            else:
+                error = None
+            watch["in_flight"] = False
+            watch["finalizing"] = False
+            done(error)
+
+        task = loop.create_task(runner())
+        self._path_write_tasks.add(task)
+        task.add_done_callback(self._path_write_tasks.discard)
+        return True
+
+    def _drop_watch(self, watch):
+        """Remove a finalized watch by identity, wherever it now sits."""
+        for index, candidate in enumerate(self._signal_paths):
+            if candidate is watch:
+                del self._signal_paths[index]
+                return True
+        return False
 
     def _mark_signal_path_failure(self, signal_id, exc):
         self._signal_path_failed_owners.add(signal_id)
@@ -428,61 +564,121 @@ class Engine:
             self.signal_path_fault = None
 
     def _flush_signal_path(self, watch, final=False):
-        """Incremental flush. Returns True when the buffer is durable."""
+        """Incremental flush.  Returns True when the buffer is durable.
+
+        The INSERT runs on a worker thread whenever an event loop is running,
+        because `on_book` calls this from inside the WebSocket handler and a
+        `bid_path_samples` commit there is an fsync on the feed path.  A
+        scheduled flush returns False -- not durable *yet* -- and the rows stay
+        in the buffer until the write reports back.
+        """
         if final:
             return self._finalize_signal_path(watch)
-        if not watch["rows"]:
-            return True
+        if not watch["rows"] or watch.get("in_flight"):
+            return not watch["rows"]
         rows = list(watch["rows"])
-        try:
-            written = store.insert_bid_path(rows)
-        except Exception as exc:
-            # Keep the rows and the owning watch. A sequence conflict is a
-            # current health fault until this exact owner later commits.
-            self._mark_signal_path_failure(watch["signal_id"], exc)
-            return False
-        if isinstance(written, int) and written < len(rows):
-            exc = RuntimeError(
-                f"signal {watch['signal_id']}: short path persistence "
-                f"{written}/{len(rows)}"
-            )
-            self._mark_signal_path_failure(watch["signal_id"], exc)
-            return False
-        watch["rows"] = watch["rows"][len(rows):]
-        self._mark_signal_path_success(watch["signal_id"])
-        return True
+        outcome = {}
 
-    def _finalize_signal_path(self, watch, incomplete_reason=None):
+        def work():
+            outcome["written"] = store.insert_bid_path(rows)
+
+        def done(exc):
+            if exc is not None:
+                # Keep the rows and the owning watch. A sequence conflict is a
+                # current health fault until this exact owner later commits.
+                self._mark_signal_path_failure(watch["signal_id"], exc)
+                outcome["ok"] = False
+                return
+            written = outcome.get("written")
+            if isinstance(written, int) and written < len(rows):
+                self._mark_signal_path_failure(watch["signal_id"], RuntimeError(
+                    f"signal {watch['signal_id']}: short path persistence "
+                    f"{written}/{len(rows)}"
+                ))
+                outcome["ok"] = False
+                return
+            # Slice, never clear: a book update may have appended while the
+            # write was in flight, and those rows are not yet durable.
+            watch["rows"] = watch["rows"][len(rows):]
+            self._mark_signal_path_success(watch["signal_id"])
+            outcome["ok"] = True
+
+        if self._dispatch_path_write(watch, work, done):
+            return False
+        return bool(outcome.get("ok"))
+
+    def _finalize_signal_path(self, watch, incomplete_reason=None, sync=False):
         """Persist remaining rows, summary and the durable finalized marker.
 
-        One transaction.  The caller releases the watch only when this returns
-        True, so a failed write always leaves an owner to retry.  Recovery
-        metadata belongs to the watch owner as well: a failed first attempt
-        must not lose the reason when the same watch retries later.
+        One transaction, run off the event loop when one is running.  The
+        caller releases the watch only when this returns True, so a failed or
+        still-running write always leaves an owner to retry.  Recovery metadata
+        belongs to the watch owner as well: a failed first attempt must not
+        lose the reason when the same watch retries later.
+
+        `sync=True` forces the inline write.  Startup reconciliation
+        (`rebuild_signal_paths`) uses it: it must report how many watches it
+        actually resolved before the feed starts, and it is not on the hot path.
         """
+        if watch.get("in_flight"):
+            return False
         if incomplete_reason is None:
             incomplete_reason = watch.get("incomplete_reason")
-        try:
+        rows = list(watch["rows"])
+        finalized = {}
+
+        def work():
             store.finalize_signal_path(
                 watch["signal_id"],
-                path_rows=list(watch["rows"]),
+                path_rows=rows,
                 truncated=bool(watch.get("dropped")),
                 dropped_samples=watch.get("dropped", 0),
                 incomplete_reason=incomplete_reason,
             )
-        except Exception as exc:
-            self._mark_signal_path_failure(watch["signal_id"], exc)
+
+        def done(exc):
+            if exc is not None:
+                self._mark_signal_path_failure(watch["signal_id"], exc)
+                finalized["ok"] = False
+                return
+            watch["rows"] = watch["rows"][len(rows):]
+            self._mark_signal_path_success(watch["signal_id"])
+            finalized["ok"] = True
+            if watch.get("scheduled_release"):
+                watch["scheduled_release"] = False
+                self._drop_watch(watch)
+
+        if sync:
+            try:
+                work()
+            except Exception as exc:  # noqa: BLE001 - reported through `done`
+                done(exc)
+            else:
+                done(None)
+            return bool(finalized.get("ok"))
+        watch["finalizing"] = True
+        if self._dispatch_path_write(watch, work, done):
             return False
-        watch["rows"] = []
-        self._mark_signal_path_success(watch["signal_id"])
-        return True
+        watch["finalizing"] = False
+        return bool(finalized.get("ok"))
 
     def _release_finalized(self, index=0):
-        """Finalize the watch at `index`, popping it only after it commits."""
+        """Finalize the watch at `index`, popping it only after it commits.
+
+        A watch whose finalization is in flight is neither re-finalized nor
+        popped: the completion callback drops it, so exactly one finalization
+        per watch reaches SQLite.
+        """
         watch = self._signal_paths[index]
-        if not self._finalize_signal_path(watch):
+        if watch.get("in_flight"):
             return False
-        del self._signal_paths[index]
+        # The completion callback is the single place a watch is removed, so
+        # the inline and the scheduled paths cannot both pop it.
+        watch["scheduled_release"] = True
+        if not self._finalize_signal_path(watch):
+            if not watch.get("in_flight"):
+                watch["scheduled_release"] = False
+            return False
         return True
 
     def _expire_signal_paths(self, now):
@@ -512,7 +708,7 @@ class Engine:
                 "expires_at": 0.0, "retry_only": True,
                 "incomplete_reason": "in_memory_tail_lost_on_restart",
             }
-            if self._finalize_signal_path(watch):
+            if self._finalize_signal_path(watch, sync=True):
                 rebuilt += 1
             else:
                 # Startup failure must retain an owned retry object.  A local
@@ -534,7 +730,46 @@ class Engine:
         self.desk.on_book(ticker, b)
 
     # ---------- signal flow ----------
-    def process_trade(self, ticker, ts_ms, px, sz, taker, wall):
+    @staticmethod
+    def _frame_context(arrival_wall, proc_wall, backlog):
+        """Capture conditions of the frame a burst was observed on.
+
+        Carried on the candidate (and on a held near miss) so the row records
+        the frame it actually came from, not the frame that happened to flush
+        it.  Kept deliberately small: the capture pass adds more keys to the
+        same `signals.context` column.
+        """
+        if arrival_wall is None:
+            return None
+        proc_wall = arrival_wall if proc_wall is None else proc_wall
+        return {
+            "arrival_wall": round(arrival_wall, 6),
+            "proc_wall": round(proc_wall, 6),
+            "backlog": int(backlog or 0),
+        }
+
+    @staticmethod
+    def _signal_context(frame, ts_ms):
+        """Turn a frame capture into the persisted `signals.context` JSON."""
+        if not frame:
+            return None
+        arrival = frame.get("arrival_wall")
+        proc = frame.get("proc_wall", arrival)
+        context = {"backlog": frame.get("backlog", 0)}
+        if arrival is not None and isinstance(ts_ms, (int, float)):
+            context["feed_lag_ms"] = round(arrival * 1000.0 - ts_ms, 3)
+        if arrival is not None and proc is not None:
+            context["proc_lag_ms"] = round((proc - arrival) * 1000.0, 3)
+        return context
+
+    def process_trade(self, ticker, ts_ms, px, sz, taker, wall,
+                      proc_wall=None, backlog=0):
+        """Feed one trade into the detector.
+
+        `wall` is the frame's ARRIVAL stamp; `proc_wall` is when this call
+        began.  Both travel with the candidate so every signal row records the
+        conditions it was produced under (see `_frame_context`).
+        """
         self.n_trades += 1
         ps = self.price_state(ticker)
         ps["last"] = px
@@ -543,7 +778,10 @@ class Engine:
         self.broadcast({"type": "tape", "ticker": ticker, "px": px, "sz": round(sz, 1),
                         "taker": taker, "ts_ms": ts_ms})
         self._observe_sleeve(ticker, wall * 1000.0)
-        cand = self.detector.on_trade(ticker, ts_ms, px, sz, taker)
+        cand = self.detector.on_trade(
+            ticker, ts_ms, px, sz, taker,
+            context=self._frame_context(wall, proc_wall, backlog),
+        )
         # re-check pending candidates whose siblings include this market
         if self.pending:
             still = []
@@ -615,6 +853,8 @@ class Engine:
                     },
                 },
                 "match_clock_snapshot": stamp,
+                "context": self._signal_context(
+                    observation.get("context"), observation.get("ts_ms")),
                 # No forward path: these are numerous by design, and each watch
                 # costs a tracking slot and up to BID_PATH_MAX_SAMPLES rows.
                 "forward_path_started_ts": None,
@@ -653,6 +893,7 @@ class Engine:
             "conf_lag_ms": lag, "late": self.is_late(cand["ticker"]), "outcome": outcome,
             "detail": cand.get("detail") or {},
             "match_clock_snapshot": stamp,
+            "context": self._signal_context(cand.get("context"), cand.get("ts_ms")),
             "forward_path_started_ts": (
                 cand.get("local_ts") or time.time()
                 if config.SIGNAL_PATH_WINDOW_S else None
@@ -872,6 +1113,17 @@ class Engine:
                                                  mkt.get("expiration_value"),
                                                  market_game_title(mkt))
                             want.add(tk)
+                previous = self._watched_markets
+                added, dropped = sorted(want - previous), sorted(previous - want)
+                self._watched_markets = set(want)
+                if previous and added:
+                    self.on_feed_event("market_added",
+                                       {"count": len(added), "markets": added[:20],
+                                        "watched": len(want)})
+                if dropped:
+                    self.on_feed_event("market_dropped",
+                                       {"count": len(dropped), "markets": dropped[:20],
+                                        "watched": len(want)})
                 if self.ws:
                     await self.ws.set_markets(want)
                 self.watched_events = {
@@ -931,12 +1183,32 @@ class Engine:
                 self.broadcast({"type": "prices", "prices": dirty})
             if now - last_stats > 5:
                 last_stats = now
+                self._flush_feed_latency()
                 # The event-clustered bootstrap in store.stats() is computed off
                 # the event loop; running it inline here stalled live collection
                 # and every dashboard request for its whole duration every 5s.
                 stats = await store.read(store.stats)
                 self.broadcast({"type": "stats", "stats": stats,
                                 "status": self.status()})
+
+    def _flush_feed_latency(self):
+        """One feed-lag and one backlog sample per stats tick.
+
+        Replaces the every-20th-trade `add_latency("feed_lag")` commit, which
+        put 4-5 fsyncs/s on the event loop at the measured 2026-09-04 peak of
+        64.7k frames/min.  The per-signal `feed_lag_ms` in `signals.context` is
+        the row-level evidence; this series is the runtime trend.
+        """
+        samples = sorted(self._feed_lag_tick)
+        backlog = self._backlog_tick
+        self._feed_lag_tick.clear()
+        self._backlog_tick = 0
+        try:
+            if samples:
+                store.add_latency("feed_lag", samples[len(samples) // 2])
+            store.add_latency("backlog_frames", backlog)
+        except Exception as exc:
+            self._record_error("feed_latency", exc)
 
     async def paper_execution_task(self):
         """Low-jitter clock for opt-in paper order arrivals."""
@@ -956,6 +1228,7 @@ class Engine:
 
     def status(self):
         lat = sorted(self.feed_lag)
+        ws = getattr(self, "ws", None)
         recorder = self.recorder.status()
         goal = (self.goal_latency.status() if self.goal_latency else {"enabled": False})
         tracker = getattr(self, "clock_tracker", None)
@@ -1073,6 +1346,11 @@ class Engine:
                     "checks": checks,
                     "recent_errors": list(reversed(recent_errors[-20:])),
                 },
+                "feed_backlog": (ws.backlog if ws is not None
+                                 else getattr(self, "feed_backlog", 0)),
+                "feed_backlog_max": (ws.max_backlog if ws is not None
+                                     else getattr(self, "_backlog_tick", 0)),
+                "feed_event_failures": getattr(self, "_feed_event_failures", 0),
                 "feed_lag_p50": round(lat[len(lat) // 2], 1) if lat else None,
                 "feed_lag_p95": round(lat[int(0.95 * len(lat))], 1) if len(lat) > 20 else None}
 
@@ -1099,7 +1377,7 @@ class Engine:
                         "ticker": pos.market,
                         "ts_ms": pos.entry_ts * 1000.0,
                     })
-            self.ws = KalshiWS(self.handle_ws, self.on_ws_state)
+            self.ws = KalshiWS(self.handle_ws, self.on_ws_state, self.on_ws_feed_event)
             asyncio.create_task(self.ws.run())
             asyncio.create_task(self.discovery_task())
             asyncio.create_task(self.settle_poll_task())

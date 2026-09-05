@@ -29,6 +29,13 @@ class MarketState:
         self.ticker = ticker
         self.trades = deque()          # (ts_ms, px, sz, taker)
         self.big_bursts = deque()      # (ts_ms, signed_dl) recent notable sweeps
+        # True while every appended trade has a ts_ms >= the one before it, which
+        # is what lets the burst and reference windows be read as suffixes of the
+        # deque instead of scanning all 300 s of it.  One out-of-order print
+        # falls the market back to the exhaustive scan for the rest of its life,
+        # so the windows are identical to the full filter by construction.
+        self.ordered = True
+        self.last_ts_ms = None
         self.last_candidate_ms = -1e18
         # Separate from the trading cooldown so research capture can never
         # move a trading decision.
@@ -116,17 +123,65 @@ class Detector:
         for st in list(self.markets.values()):
             self._flush_subthreshold(st, now_ms)
 
-    def on_trade(self, ticker, ts_ms, px, sz, taker):
+    @staticmethod
+    def _burst_window(st, ts_ms):
+        """Trades within BURST_MS of `ts_ms`.
+
+        Same set as `[t for t in st.trades if t[0] >= ts_ms - BURST_MS]`; while
+        the deque is ordered it is read from the newest end and stopped at the
+        first trade outside the window, so the cost is the size of the burst
+        rather than of the whole 300 s deque.  Measured 33 us/trade normally and
+        813 us/trade with a 9,000-trade deque on 2026-09-04.
+        """
+        floor = ts_ms - BURST_MS
+        if not st.ordered:
+            return [t for t in st.trades if t[0] >= floor]
+        burst = []
+        for t in reversed(st.trades):
+            if t[0] < floor:
+                break
+            burst.append(t)
+        burst.reverse()
+        return burst
+
+    @staticmethod
+    def _reference_window(st, ts_ms):
+        """Sorted prices in [ts_ms-REF_LO_MS, ts_ms-REF_HI_MS).
+
+        Same multiset as the exhaustive filter, so the median below is the same
+        value; only the walk is bounded.
+        """
+        lo, hi = ts_ms - REF_LO_MS, ts_ms - REF_HI_MS
+        if not st.ordered:
+            return sorted(t[1] for t in st.trades if lo <= t[0] < hi)
+        prices = []
+        for t in reversed(st.trades):
+            if t[0] >= hi:
+                continue
+            if t[0] < lo:
+                break
+            prices.append(t[1])
+        prices.sort()
+        return prices
+
+    def on_trade(self, ticker, ts_ms, px, sz, taker, context=None):
         """Feed one trade. Returns a candidate dict when the sweep threshold is
-        crossed (sibling confirmation is the engine's job)."""
+        crossed (sibling confirmation is the engine's job).
+
+        `context` is opaque capture metadata (arrival stamp, processing stamp,
+        feed backlog) that is attached to whatever this trade produces.  It is
+        never read by the detector and cannot influence a decision."""
         st = self.state(ticker)
         # Any held near miss whose burst window has closed is settled before
         # this trade is considered part of a new burst.
         self._flush_subthreshold(st, ts_ms)
+        if st.last_ts_ms is not None and ts_ms < st.last_ts_ms:
+            st.ordered = False
+        st.last_ts_ms = ts_ms
         st.trades.append((ts_ms, px, sz, taker))
         st.evict(ts_ms)
 
-        burst = [t for t in st.trades if t[0] >= ts_ms - BURST_MS]
+        burst = self._burst_window(st, ts_ms)
         if not burst:
             return None
         buy = sum(t[2] for t in burst if t[3] == "yes")
@@ -135,8 +190,7 @@ class Detector:
         prices = [t[1] for t in burst]
         levels = len(set(round(p, 1) for p in prices))
         size = buy + sell
-        ref_w = sorted(t[1] for t in st.trades
-                       if ts_ms - REF_LO_MS <= t[0] < ts_ms - REF_HI_MS)
+        ref_w = self._reference_window(st, ts_ms)
         if not ref_w:
             return None
         ref = ref_w[len(ref_w) // 2]
@@ -157,6 +211,7 @@ class Detector:
                 "ticker": ticker, "ts_ms": ts_ms, "dir": d, "dl": round(dl, 3),
                 "signed": signed, "levels": levels, "size": round(size, 1),
                 "ref": round(ref, 2), "ext": ext, "local_ts": time.time(),
+                "context": context,
                 "below": sorted(
                     name for name, failed in (
                         ("dl", dl < config.DL_MIN),
@@ -180,7 +235,8 @@ class Detector:
         st.last_candidate_ms = ts_ms
         return {"ticker": ticker, "ts_ms": ts_ms, "dir": d, "dl": round(dl, 3),
                 "signed": signed, "levels": levels, "size": round(size, 1),
-                "ref": round(ref, 2), "ext": ext, "local_ts": time.time()}
+                "ref": round(ref, 2), "ext": ext, "local_ts": time.time(),
+                "context": context}
 
     def confirm(self, candidate, sibling_tickers):
         """Look for an opposite-sign big sweep on a sibling within +-CONF_MS.

@@ -1,6 +1,7 @@
 """Kalshi REST + WebSocket client with RSA-PSS request signing."""
 import asyncio
 import base64
+import inspect
 import json
 import re
 import time
@@ -137,13 +138,55 @@ class KalshiClient:
         await self._http.aclose()
 
 
-class KalshiWS:
-    """Authenticated WebSocket with subscribe/update helpers and reconnect."""
+def _backlog_call_style(callback):
+    """Decide how ``backlog`` is handed to an ``on_message`` callback.
 
-    def __init__(self, on_message, on_state=None):
+    Older callers take ``(msg, wall, mono)``; the engine takes an explicit
+    ``backlog`` keyword.  The signature is inspected once at construction so
+    the per-frame dispatch is a plain call.
+    """
+    try:
+        params = list(inspect.signature(callback).parameters.values())
+    except (TypeError, ValueError):
+        return "none"
+    for param in params:
+        if param.kind is inspect.Parameter.VAR_KEYWORD:
+            return "keyword"
+        if param.name == "backlog" and param.kind in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
+            return "keyword"
+    if any(param.kind is inspect.Parameter.VAR_POSITIONAL for param in params):
+        return "positional"
+    positional = [param for param in params if param.kind in (
+        inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+    return "positional" if len(positional) >= 4 else "none"
+
+
+# Frames the consumer processes between two voluntary yields.  The reader and
+# the websockets keepalive task only run when the consumer yields, so a busy
+# consumer must give the loop back regularly; sixteen frames is well under a
+# millisecond of handler time and keeps arrival stamps within that of receipt.
+CONSUMER_YIELD_EVERY = 16
+RECONNECT_DELAY_S = 3.0
+
+
+class KalshiWS:
+    """Authenticated WebSocket with subscribe/update helpers and reconnect.
+
+    Receipt and processing are split into two coroutines.  The reader only
+    does ``recv`` and stamps each raw frame with its arrival time before
+    queueing it; the consumer parses and routes.  The queue is unbounded on
+    purpose: its depth is the measured processing backlog, reported as
+    ``backlog`` and exported per frame, so that falling behind the exchange
+    is visible instead of being folded into every downstream timestamp.
+    """
+
+    def __init__(self, on_message, on_state=None, on_feed_event=None):
         self._key = _load_private_key()
         self.on_message = on_message
+        self._call_style = _backlog_call_style(on_message)
         self.on_state = on_state or (lambda s: None)
+        self.on_feed_event = on_feed_event
         self._ws = None
         self._cmd_id = 0
         self._orderbook_sid = None
@@ -154,6 +197,41 @@ class KalshiWS:
         self._recovering_orderbooks = {}
         self._lock = asyncio.Lock()
         self.connected = False
+        self._queue = None
+        self.frames_received = 0
+        self.frames_consumed = 0
+        self.frames_discarded = 0
+        self.connections = 0
+        self.disconnects = 0
+        self.max_backlog = 0
+        self.feed_event_failures = 0
+
+    @property
+    def backlog(self):
+        """Frames received but not yet processed (current queue depth)."""
+        return self._queue.qsize() if self._queue is not None else 0
+
+    def _dispatch(self, message, wall, mono, backlog):
+        if self._call_style == "keyword":
+            self.on_message(message, wall, mono, backlog=backlog)
+        elif self._call_style == "positional":
+            self.on_message(message, wall, mono, backlog)
+        else:
+            self.on_message(message, wall, mono)
+
+    def _emit(self, kind, detail=None):
+        """Report a feed-health event; a ledger fault is counted, never raised.
+
+        Emission sits on the socket path, so a database or recorder problem
+        must not disconnect the feed.  The count is reported in `status()` so
+        a silent ledger is visible rather than assumed complete.
+        """
+        if self.on_feed_event is None:
+            return
+        try:
+            self.on_feed_event(kind, detail)
+        except Exception:
+            self.feed_event_failures += 1
 
     def _headers(self):
         ts = str(int(time.time() * 1000))
@@ -217,6 +295,8 @@ class KalshiWS:
                 pending.intersection_update(want)
                 if not pending:
                     self._recovering_orderbooks.pop(recovery_sid, None)
+                    self._emit("snapshot_complete",
+                               {"sid": recovery_sid, "reason": "targets_dropped"})
 
     def _subscription_sids(self):
         return tuple(dict.fromkeys(sid for sid in (
@@ -234,6 +314,10 @@ class KalshiWS:
     async def request_snapshot(self, ticker):
         async with self._lock:
             if self._orderbook_sid is not None and ticker in self._subscribed:
+                # Deliberately not a ledger event: this fires once per rejected
+                # delta, which is unbounded while a book is being rebuilt.  The
+                # ledger records recovery (`gap` -> `snapshot_requested`), which
+                # is what explains a discontinuity in the study.
                 await self._send("update_subscription", {"sid": self._orderbook_sid,
                                                          "action": "get_snapshot",
                                                          "market_tickers": [ticker]})
@@ -251,17 +335,22 @@ class KalshiWS:
                 return
             tickers = sorted(self._subscribed)
             self._recovering_orderbooks[active_sid] = set(tickers)
-            self.on_message({
+            self._emit("gap", {"sid": active_sid, "expected": expected,
+                               "received": received, "invalidated": len(tickers),
+                               "backlog": self.backlog})
+            self._dispatch({
                 "type": "orderbook_gap",
                 "msg": {"sid": active_sid, "expected": expected, "received": received,
                         "market_tickers": tickers},
-            }, time.time(), time.monotonic())
+            }, time.time(), time.monotonic(), self.backlog)
             if tickers:
                 await self._send("update_subscription", {
                     "sid": active_sid,
                     "action": "get_snapshot",
                     "market_tickers": tickers,
                 })
+                self._emit("snapshot_requested",
+                           {"sid": active_sid, "markets": len(tickers), "reason": "gap"})
 
     async def _accept_orderbook_frame(self, message):
         """Validate and recovery-gate one order-book frame."""
@@ -290,8 +379,56 @@ class KalshiWS:
             pending.remove(ticker)
             if not pending:
                 self._recovering_orderbooks.pop(sid, None)
+                self._emit("snapshot_complete", {"sid": sid, "reason": "snapshots_received"})
             return True
         return ticker not in pending
+
+    async def _handle_raw(self, raw, wall, mono, backlog):
+        """Parse and route one received frame (the former inline run() body)."""
+        m = json.loads(raw)
+        t = m.get("type")
+        if t == "subscribed":
+            ch = (m.get("msg") or {}).get("channel")
+            sid = (m.get("msg") or {}).get("sid")
+            if ch == "orderbook_delta":
+                if self._orderbook_sid != sid and self._sequences.last(sid) is None:
+                    self._sequences.reset(sid)
+            self._record_subscription(ch, sid)
+            self._emit("subscribed", {"channel": ch, "sid": sid,
+                                      "markets": len(self._subscribed)})
+        if (t in ("orderbook_snapshot", "orderbook_delta")
+                and not await self._accept_orderbook_frame(m)):
+            return
+        self._dispatch(m, wall, mono, backlog)
+
+    async def _read(self, ws, queue):
+        """Receive frames and stamp their arrival; nothing else runs here."""
+        async for raw in ws:
+            queue.put_nowait((raw, time.time(), time.monotonic()))
+            self.frames_received += 1
+
+    async def _consume(self, queue):
+        """Drain the arrival queue; yields periodically so the reader keeps up."""
+        since_yield = 0
+        while True:
+            raw, wall, mono = await queue.get()
+            backlog = queue.qsize()
+            if backlog > self.max_backlog:
+                self.max_backlog = backlog
+            await self._handle_raw(raw, wall, mono, backlog)
+            self.frames_consumed += 1
+            since_yield += 1
+            if since_yield >= CONSUMER_YIELD_EVERY:
+                since_yield = 0
+                await asyncio.sleep(0)
+
+    def _discard_backlog(self):
+        queue, self._queue = self._queue, None
+        if queue is None:
+            return 0
+        discarded = queue.qsize()
+        self.frames_discarded += discarded
+        return discarded
 
     async def run(self):
         """Connect-consume-reconnect loop."""
@@ -302,29 +439,56 @@ class KalshiWS:
                                               max_size=2 ** 23) as ws:
                     self._ws = ws
                     self.connected = True
+                    self.connections += 1
                     self._orderbook_sid = self._trade_sid = self._lifecycle_sid = None
                     self._sequences.reset()
                     self._recovering_orderbooks.clear()
                     subs = self._subscribed
                     self._subscribed = set()
+                    self._queue = asyncio.Queue()
                     self.on_state("connected")
+                    self._emit("connected", {"connection": self.connections,
+                                             "resubscribe": len(subs)})
                     if subs:
                         await self.set_markets(subs)
-                    async for raw in ws:
-                        m = json.loads(raw)
-                        t = m.get("type")
-                        if t == "subscribed":
-                            ch = (m.get("msg") or {}).get("channel")
-                            sid = (m.get("msg") or {}).get("sid")
-                            if ch == "orderbook_delta":
-                                if self._orderbook_sid != sid and self._sequences.last(sid) is None:
-                                    self._sequences.reset(sid)
-                            self._record_subscription(ch, sid)
-                        if (t in ("orderbook_snapshot", "orderbook_delta")
-                                and not await self._accept_orderbook_frame(m)):
-                            continue
-                        self.on_message(m, time.time(), time.monotonic())
+                        self._emit("resubscribed", {"markets": len(subs)})
+                    tasks = (asyncio.ensure_future(self._read(ws, self._queue)),
+                             asyncio.ensure_future(self._consume(self._queue)))
+                    try:
+                        done, _pending = await asyncio.wait(
+                            tasks, return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    finally:
+                        # Whichever side finished first, or an outer cancellation
+                        # at shutdown, must not leave the other task orphaned.
+                        for task in tasks:
+                            if not task.done():
+                                task.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                    for task in done:
+                        # Re-raise the reader's close error or a consumer fault so
+                        # the disconnect is recorded and the connection rebuilt.
+                        task.result()
+                    raise ConnectionError("websocket stream ended")
             except Exception as e:
                 self.connected = False
+                self.disconnects += 1
+                discarded = self._discard_backlog()
                 self.on_state(f"disconnected: {type(e).__name__}")
-                await asyncio.sleep(3)
+                self._emit("disconnected", {"error": type(e).__name__,
+                                            "message": str(e)[:200],
+                                            "backlog_discarded": discarded})
+                await asyncio.sleep(RECONNECT_DELAY_S)
+
+    def status(self):
+        return {
+            "connected": self.connected,
+            "backlog": self.backlog,
+            "max_backlog": self.max_backlog,
+            "frames_received": self.frames_received,
+            "frames_consumed": self.frames_consumed,
+            "frames_discarded": self.frames_discarded,
+            "connections": self.connections,
+            "disconnects": self.disconnects,
+            "feed_event_failures": self.feed_event_failures,
+        }
