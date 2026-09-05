@@ -188,6 +188,13 @@ SLEEVE_MIN_MINUTE = _i("SLEEVE_MIN_MINUTE", 80)
 # inside the clock poll loop blocked the refresh for seconds at a time.
 CLOCK_MAPPING_INTERVAL_S = _f("CLOCK_MAPPING_INTERVAL_S", 15.0)
 
+# How often the observer flushes the buffered `last_observed_ts` refreshes for
+# provider events it has already recorded.  Writing one per already-seen event
+# per poll was the dominant cost of the clock poll (5.7 s p50 against a 250 ms
+# target, measured 2026-09-04).  Observability only: it cannot change a
+# decision, so it is deliberately not a strategy parameter.
+PROVIDER_EVENT_FLUSH_S = _f("PROVIDER_EVENT_FLUSH_S", 60.0)
+
 # --- Market discovery ---
 DISCOVERY_INTERVAL_S = _i("DISCOVERY_INTERVAL_S", 180)
 SUBSCRIBE_BEFORE_CLOSE_MIN = _i("SUBSCRIBE_BEFORE_CLOSE_MIN", 150)  # watch markets closing within this

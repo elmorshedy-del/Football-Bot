@@ -309,7 +309,11 @@ def init():
         except sqlite3.OperationalError:
             pass
     for column in ("match_clock_snapshot", "forward_path_summary",
-                   "path_incomplete_reason"):
+                   "path_incomplete_reason",
+                   # Per-signal capture conditions (feed lag, processing lag,
+                   # queue backlog).  Additive JSON so the row explains the
+                   # timing it was produced under; see CHG-2026-09-05-001.
+                   "context"):
         try:
             _conn.execute(f"ALTER TABLE signals ADD COLUMN {column} TEXT")
         except sqlite3.OperationalError:
@@ -394,6 +398,23 @@ def init():
            CREATE UNIQUE INDEX IF NOT EXISTS idx_bid_path_signal_seq
              ON bid_path_samples(signal_id, kind, sample_seq)
            WHERE signal_id IS NOT NULL AND sample_seq IS NOT NULL;"""
+    )
+    # Feed-health ledger.  Connection, subscription, sequence-gap, snapshot and
+    # recorder-rotation events, so a gap in the study can be explained instead
+    # of guessed at.  Created here (not in SCHEMA) purely for locality with the
+    # other observation tables; CREATE ... IF NOT EXISTS keeps it idempotent.
+    _conn.executescript(
+        """CREATE TABLE IF NOT EXISTS feed_events(
+             id INTEGER PRIMARY KEY AUTOINCREMENT,
+             ts REAL NOT NULL,
+             mono REAL,
+             kind TEXT NOT NULL,
+             detail TEXT,
+             mode TEXT);
+           CREATE INDEX IF NOT EXISTS idx_feed_events_ts
+             ON feed_events(ts);
+           CREATE INDEX IF NOT EXISTS idx_feed_events_kind_ts
+             ON feed_events(kind, ts);"""
     )
     _conn.executescript(
         """CREATE TABLE IF NOT EXISTS match_clock_observations(
@@ -656,6 +677,20 @@ def log_event(kind, text):
     ex("INSERT INTO eventlog(ts,kind,text) VALUES(?,?,?)", (time.time(), kind, text))
 
 
+def insert_feed_event(kind, detail=None, ts=None, mono=None):
+    """Append one feed-health event.
+
+    `detail` is stored as compact JSON when it is not already text, so the
+    ledger keeps whatever the emitter knew (sid, counts, exception type)
+    without a column per kind.
+    """
+    if detail is not None and not isinstance(detail, str):
+        detail = json.dumps(detail, separators=(",", ":"), default=str)
+    cur = ex("INSERT INTO feed_events(ts,mono,kind,detail,mode) VALUES(?,?,?,?,?)",
+             (time.time() if ts is None else ts, mono, kind, detail, _mode))
+    return cur.lastrowid
+
+
 LATENCY_KIND_CANONICAL = {
     "feed_lag": "feed_ingress_ms",
     "paper_entry": "paper_entry_ms",
@@ -671,6 +706,10 @@ LATENCY_KIND_ALIASES = {
     "match_response_ms": ("match_response_ms",),
     "match_clock_age_ms": ("match_clock_age_ms",),
     "scheduler_lag_ms": ("scheduler_lag_ms",),
+    # Frames received but not yet processed, sampled once per stats tick.  A
+    # latency kind because it is the same measurement family: how far behind
+    # the exchange this process is running.
+    "backlog_frames": ("backlog_frames",),
 }
 LATENCY_KINDS = tuple(LATENCY_KIND_ALIASES)
 K4_THRESHOLD_MS = 250.0
@@ -1275,6 +1314,41 @@ def upsert_provider_event(row):
     return cur.lastrowid, True
 
 
+def refresh_provider_events(rows):
+    """Batch-refresh the poll metadata of already-recorded fingerprints.
+
+    One transaction, one `executemany`, no per-event SELECT.  `upsert_provider_event`
+    still exists with its original semantics for the single-row path; this is the
+    batched form the observer uses so a poll that re-observes N known events costs
+    one commit instead of N SELECT+UPDATE+COMMIT round trips under the writer lock
+    (see CHG-2026-09-05-004).  Rows are matched on (event, fingerprint, mode) --
+    the same identity as the unique index -- so a demo observation can never
+    refresh a live one.  Returns the number of rows the UPDATE touched.
+    """
+    payload = [
+        (row["observed_ts"], row["poll_started_ts"], row.get("previous_poll_ts"),
+         row["response_ms"], row["event"], row["fingerprint"])
+        for row in rows or ()
+    ]
+    if not payload:
+        return 0
+    with _lock:
+        try:
+            cursor = _conn.executemany(
+                """UPDATE provider_match_events
+                      SET last_observed_ts=?, poll_started_ts=?,
+                          previous_poll_ts=?, response_ms=?
+                    WHERE event=? AND fingerprint=?
+                      AND COALESCE(mode,'legacy_unknown')=COALESCE(?,'legacy_unknown')""",
+                [(*args, _mode) for args in payload],
+            )
+            _conn.commit()
+        except Exception:
+            _conn.rollback()
+            raise
+        return cursor.rowcount
+
+
 SUBSTANTIVE_REVISION_TYPES = (
     "goal.observed", "penalty.scored",
 )
@@ -1339,13 +1413,14 @@ def _stamp_text(value):
 def insert_signal(s):
     cur = ex("""INSERT INTO signals(ts_ms,local_ts,market,event,series,dir,dl,levels,size,
                 ref,ext,conf_lag_ms,late,outcome,detail,mode,match_clock_snapshot,
-                forward_path_started_ts,config_id)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                forward_path_started_ts,config_id,context)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
              (s["ts_ms"], s["local_ts"], s["market"], s["event"], s["series"], s["dir"],
               s["dl"], s["levels"], s["size"], s["ref"], s["ext"], s.get("conf_lag_ms"),
               1 if s.get("late") else 0, s["outcome"], json.dumps(s.get("detail") or {}), _mode,
               _stamp_text(s.get("match_clock_snapshot")),
-              s.get("forward_path_started_ts"), _config_id))
+              s.get("forward_path_started_ts"), _config_id,
+              _stamp_text(s.get("context"))))
     return cur.lastrowid
 
 

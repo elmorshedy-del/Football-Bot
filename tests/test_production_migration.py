@@ -123,6 +123,8 @@ TABLES = (
     "signals", "trades", "paper_fills", "latency", "bid_path_samples",
     "match_clock_observations", "provider_match_events",
     "goal_latency_observations",
+    # Created by the migration itself on a database that predates it.
+    "feed_events",
 )
 
 
@@ -196,6 +198,9 @@ class ProductionSchemaMigrationTests(unittest.TestCase):
 
         expected = {
             "latency": {"mode"},
+            # Per-signal capture conditions (feed lag, processing lag, backlog).
+            "signals": {"context"},
+            "feed_events": {"ts", "mono", "kind", "detail"},
             "match_clock_observations": {
                 "source", "confirmed_ts", "confirmation_previous_poll_ts"},
             "provider_match_events": {
@@ -238,6 +243,26 @@ class ProductionSchemaMigrationTests(unittest.TestCase):
             "a legacy clock row was relabeled with the current provider source",
         )
         self.assertEqual(store.present_mode(None), "legacy_unknown")
+
+    def test_the_new_ledger_and_column_appear_and_stay_empty_of_history(self):
+        """Additive: the migration creates them, twice, without touching a row."""
+        self.migrate()
+        self.migrate()
+
+        self.assertEqual(
+            store.q("SELECT COUNT(*) AS n FROM feed_events")[0]["n"], 0,
+            "the migration invented feed-health history",
+        )
+        contexts = [row["context"] for row in
+                    store.q("SELECT context FROM signals ORDER BY id")]
+        self.assertEqual(contexts, [None, None, None],
+                         "a legacy signal was given a capture context it never had")
+
+        store.insert_feed_event("connected", {"connection": 1})
+        before = store.q("SELECT id, kind, detail, mode FROM feed_events")
+        self.migrate()
+        self.assertEqual(store.q("SELECT id, kind, detail, mode FROM feed_events"),
+                         before, "remigration rewrote the ledger")
 
     def test_legacy_rows_survive_a_live_boot(self):
         self.migrate()

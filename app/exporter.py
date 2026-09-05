@@ -25,6 +25,9 @@ TABLES = (
     "match_clock_observations",
     "provider_match_events",
     "bid_path_samples",
+    # Feed-health ledger: connection, gap, snapshot and rotation events, so a
+    # discontinuity in the exported observations has a recorded explanation.
+    "feed_events",
     "eventlog",
     # Resolves every config_id on a signal or trade to its parameters and code
     # fingerprint.  It carries no `mode`, so mode scoping keeps it whole: an

@@ -644,6 +644,31 @@ async def match_clocks(limit: int = 100, mode: str | None = None):
     return {"coverage": coverage, "observations": rows}
 
 
+@app.get("/api/feed-events")
+async def feed_events(limit: int = 200, mode: str | None = None):
+    """Feed-health ledger: connection, subscription, gap, snapshot, rotation.
+
+    Newest first and bounded, like the other mode-scoped observation reads.
+    """
+    limit = max(1, min(limit, 1000))
+    selector = _mode_selector(mode)
+
+    def _load():
+        scope, scope_args = store.mode_clause(selector=selector)
+        rows = _label_modes(store.q(
+            f"SELECT * FROM feed_events WHERE 1=1{scope}"
+            " ORDER BY id DESC LIMIT ?", (*scope_args, limit),
+        ))
+        for row in rows:
+            try:
+                row["detail"] = json.loads(row["detail"])
+            except (TypeError, json.JSONDecodeError):
+                pass
+        return rows
+
+    return {"events": await store.read(_load)}
+
+
 @app.get("/api/trades/{trade_id}/path")
 async def trade_bid_path(trade_id: int, limit: int = 2000,
                          mode: str | None = None):

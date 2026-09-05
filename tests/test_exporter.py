@@ -113,6 +113,7 @@ class StudyExportTests(unittest.TestCase):
             "normalized_event": {"canonical_type": "penalty.scored"},
             "raw_payload": {"event_type": "score_change"},
         })
+        store.insert_feed_event("connected", {"connection": 1}, 1_777_777_777.0, 5.0)
         store.log_event("test", "export fixture")
         raw_dir = Path(directory) / "raw"
         raw_dir.mkdir()

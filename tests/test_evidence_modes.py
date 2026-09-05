@@ -9,7 +9,7 @@ from app import store
 STUDY_TABLES = (
     "signals", "trades", "paper_fills", "latency", "bid_path_samples",
     "match_clock_observations", "provider_match_events",
-    "goal_latency_observations",
+    "goal_latency_observations", "feed_events",
 )
 
 
@@ -79,6 +79,7 @@ class ModeFixtureMixin:
             "provider_clock": "90+5′", "normalized_event": {"canonical_type": "goal.scored"},
             "raw_payload": {"occurence_ts": 1000.0},
         })
+        store.insert_feed_event("connected", {"connection": 1, "event": event})
         store.insert_goal_latency({
             "observed_ts": 1000.0, "event": event, "milestone_id": "m1",
             "change_kind": "goal", "live_type": "soccer",
