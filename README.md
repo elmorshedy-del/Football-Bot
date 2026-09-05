@@ -242,11 +242,77 @@ as the selected raw gzip segments and return:
 - CSV and JSONL versions of markets, signals, trades, fills, latency, canonical match-event
   observations, the feed-health ledger, and event/error logs;
 - immutable raw WebSocket gzip files;
+- the raw-segment archive ledger and an `archive` continuity block, so a bundle
+  describes the whole raw timeline including the segments that live in R2 and
+  were not copied into it;
 - an allowlisted non-secret configuration, table counts, byte sizes, and SHA-256 hashes; and
 - the external [backtest architecture and validation contract](docs/PRICE_ONLY_BACKTEST_HANDOFF.md).
 
 Match-event observations remain post-trade diagnostics. They are explicitly prohibited as
 entry/exit inputs in the handoff contract.
+
+### Raw feed archive on Cloudflare R2 (opt-in)
+
+The Railway volume is finite. On 2026-09-05 it was 4.00 GB used of a 4.08 GB
+maximum, 2.94 GB of that being 176 hourly raw segments, and an audit export
+already failed with `study_export: database or disk is full`. At ~300 MB of new
+segments a day the next failure would be silent write loss in SQLite.
+
+`RAW_ARCHIVE_ENABLED=true` plus R2 credentials extends the volume onto object
+storage as **one logical archive with one timeline**, never two stores that can
+disagree:
+
+| Var | Default | Meaning |
+|---|---|---|
+| `RAW_ARCHIVE_ENABLED` | false | master switch; off means completely inert |
+| `R2_ACCOUNT_ID` | empty | Cloudflare account id; the endpoint is `https://<id>.r2.cloudflarestorage.com` |
+| `R2_ACCESS_KEY_ID` / `R2_SECRET_ACCESS_KEY` | empty | R2 API token. **Never logged, never exported, never returned by an API** |
+| `R2_BUCKET` | `football-bot-raw-feed` | destination bucket; segments are stored under `raw/` |
+| `R2_ENDPOINT` | empty | optional endpoint override (tests point it at a local stub) |
+| `RAW_LOCAL_RETENTION_HOURS` | 48 | how long a verified segment stays on the volume |
+| `RAW_ARCHIVE_MIN_FREE_MB` | 512 | free-space floor below which verified segments are pruned early, oldest first |
+| `RAW_ARCHIVE_MAX_ATTEMPTS` | 5 | upload attempts before a segment is left alone (it is kept, never deleted) |
+| `RAW_ARCHIVE_INTERVAL_S` | 60 | archive pass interval |
+
+The contract, enforced in `app/archive.py` and the `raw_segments` table:
+
+- **Every segment is in exactly one known state**, recorded in SQLite and never
+  inferred from a directory listing: `local` (on the volume, not yet uploaded),
+  `uploaded` (verified in R2, still on the volume), `pruned` (verified in R2,
+  removed from the volume). Startup reconciles the directory into the table.
+- **Only sealed segments are uploaded.** The hour being appended to is never
+  uploaded and never pruned — neither the current wall-clock hour nor the hour
+  the recorder still holds open after a quiet boundary.
+- **Verify before prune.** A single PUT (R2 allows 5 GB; the largest segment
+  here is 118 MB) is checked twice: the returned `ETag` must equal the md5
+  computed while reading the file, then a `HEAD` must report the same content
+  length as the local file. Only then is `verified_ts` set. Any mismatch leaves
+  the row `local`, records `last_error`, and retries with backoff.
+- **Pruning is bounded**: retention or the free-space floor, oldest first, and a
+  live `HEAD` re-check immediately before the one place a local file is deleted.
+- **Reads are transparent.** `/api/export/raw` lists local and remote segments
+  as one inventory with a `location` of `local`, `both` or `r2`, and
+  `/api/export/raw/{name}` serves either, passing HTTP `Range` straight through
+  to R2 and relaying the `206`.
+- **Continuity is verifiable.** `/api/archive`, `/api/status` under `archive`,
+  and every study manifest carry the same block: counts by state, local and
+  remote bytes, the first and last hour, and the list of **missing hours** — an
+  hour with no segment at all, which is legitimate when the bot was down but
+  must be visible rather than interpolated.
+
+Uploads, hashing, verification and deletion all run off the event loop in a
+single background task; a failure records `last_error`, a `archive_error` feed
+event and a system error, and never touches the recorder, the WebSocket path or
+the paper desk. Without credentials, or with the switch off, nothing is
+registered, uploaded or deleted and the bot behaves exactly as before.
+
+After setting the variables, confirm connectivity once with
+`scripts/r2_probe.py` (reads the same env vars, writes and deletes one small
+object under `probe/`, and never touches `raw/`).
+
+These are storage knobs. They are deliberately excluded from
+`config.STRATEGY_PARAM_NAMES`: capturing or moving a recorded file cannot change
+a trading decision.
 
 ### Goal latency observer
 

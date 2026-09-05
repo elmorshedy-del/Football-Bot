@@ -12,12 +12,18 @@ entries; correct them with a dated follow-up entry instead.
 
 **Branch:** `claude/football-bot-analysis-rxz1vz`
 **Base commit:** `c398635` (merge of PR #18)
-**Commits:** `6cffcf8`, `c59010b`, `cddbaee`, plus the documentation commit that adds
-this section.
-**Diff totals:** 22 files, +1,952 / -119 (this change-log section itself
-excluded): `app/` +886 / -111 across 10 files, `tests/` +1,022 / -7 across
-9 files, `.env.example` +8, `README.md` +36 / -1.
-**Suite:** 394 tests OK before (32.0 s), 425 tests OK after (40.1 s), under
+**Commits:** platform pass `6cffcf8`, `c59010b`, `cddbaee`, plus the
+documentation commit that adds this section; R2 archive pass `aac510f`,
+`88dcf17`, plus the documentation commit that adds CHG-2026-09-05-007/008.
+**Diff totals:** platform pass 22 files, +1,952 / -119 (this change-log section
+itself excluded): `app/` +886 / -111 across 10 files, `tests/` +1,022 / -7
+across 9 files, `.env.example` +8, `README.md` +36 / -1. R2 archive pass
+13 files, +2,362 / -20: `app/` +1,245 / -19 across 7 files (of which
+`app/archive.py` is 837 new lines), `tests/` +916 / -1 across 3 files (of which
+`tests/test_raw_archive.py` is 852 new lines), `scripts/r2_probe.py` +104,
+`.env.example` +31, `README.md` +66.
+**Suite:** 394 tests OK before the platform pass (32.0 s), 425 after (40.1 s),
+459 after the R2 archive pass (52.1 s), under
 `python -X dev -W error::RuntimeWarning -m unittest discover -s tests`.
 **Deployment status:** NOT DEPLOYED. Nothing here has run in production; every
 number quoted as production evidence was measured on the deployed 2026-09-04/05
@@ -59,6 +65,319 @@ written inline here because the harness is synchronous and has no event loop
 for `asyncio.to_thread` to dispatch to. In production those rows go to a worker
 thread and the loop does not pay for them, so the measured in-process gain is a
 conservative lower bound on the relief the event loop actually gets.
+
+### CHG-2026-09-05-008 — Serve and report the raw archive as one timeline
+
+**Commit:** `88dcf17` (with CHG-2026-09-05-007; the two are one deployment)
+**Components:** `app/exporter.py`, `app/main.py`, `tests/test_raw_archive.py`,
+`tests/test_exporter.py`
+
+**Observed / original behaviour.** `exporter.raw_inventory()` listed
+`DATA_DIR/raw` and nothing else, and `GET /api/export/raw/{name}` resolved a
+name to a file on that volume or returned 404. Once a segment is pruned to R2
+(CHG-2026-09-05-007) both would report it as if it had never existed: an audit
+bundle would silently describe 48 hours of feed where the archive holds
+11 days, and a caller asking for `feed-20260825-18.jsonl.gz` would get a 404
+for a segment that is intact in object storage.
+
+**Root cause.** Design gap. Storage was about to become two places while every
+reader still assumed one.
+
+**Why necessary.** The operator's requirement was "make sure it's a continuity
+to the Railway volume so it's not inconsistent". Without this half, extending
+storage would create exactly the inconsistency it was meant to avoid: an export
+whose manifest contradicts the archive, and a download path whose 404 means
+either "never recorded" or "moved", with no way to tell which. That ambiguity
+is unrecoverable after the fact, because the raw feed is the only record of
+what the exchange sent.
+
+**Exact change.** `raw_inventory()` with no argument now returns the union of
+the volume and the `raw_segments` ledger as one ordered inventory, each item
+carrying `name`, `bytes`, `sha256` and a `location` of `local` (on the volume
+only), `both` (verified in R2 and still local) or `r2` (pruned). Passing
+explicit paths keeps the old scoped behaviour, enriched from the ledger. The
+ledger read is guarded: a missing or uninitialised database degrades to "the
+volume is all we know about" rather than breaking a listing that used to work.
+
+`GET /api/export/raw/{name}` is unchanged for a local segment (native file
+response, HTTP Range as before). When the name is not on the volume it looks up
+the ledger and, for a row with an `r2_key` and a `verified_ts`, streams the
+object back under the same admin/cookie authorisation, passing `Range` straight
+through to R2 and relaying the `206` with its `Content-Range`. A transport
+fault is a 502 with `engine._record_error`, never a crash.
+
+`archive.archive_continuity()` reports total segments, counts by state, local
+and remote bytes, the first and last hour, and the list of missing hours
+between them. It is built from the union deliberately: a segment sealed seconds
+ago that the background task has not registered yet is still part of the
+timeline. It is surfaced in `Engine.status()` under `archive` (from a snapshot
+the background task refreshes off the loop, with a 30 s TTL when nothing else
+does), in a new mode-scoped `GET /api/archive` alongside the ledger rows, and
+in every study manifest under `archive`. `raw_segments` is in
+`exporter.TABLES`, and a full bundle also appends the segments it could not
+copy because they live in R2.
+
+The report separates three facts that a half-configured deployment would
+otherwise conflate: `enabled` (the switch), `credentialled` (R2 reachable), and
+`active` (both, so the archive is actually running).
+
+**Before / after.** Same input, an archive holding 11 days of segments with the
+oldest 9 days pruned to R2. Before: `raw_inventory()` returns 48 entries; an
+audit manifest describes 48 hours; `GET /api/export/raw/feed-20260825-18.jsonl.gz`
+returns 404. After: the inventory returns all 176 entries, 128 with
+`location="r2"`; the manifest additionally carries
+`archive.missing_hours` naming the hours the bot was actually down; the same
+GET returns the segment, and `Range: bytes=0-9` returns 206 with ten bytes.
+
+**Reasoning and trade-offs.** The alternative was a separate "remote archive"
+endpoint and a second inventory, leaving callers to merge two lists. Rejected:
+that is precisely the two-stores-that-disagree failure the operator asked to
+avoid, and every consumer (dashboard, audit bundle, future replay tooling)
+would have to re-implement the merge correctly. Serving remote bytes through
+the existing endpoint costs a proxied stream through this process rather than a
+presigned redirect; a redirect was rejected because it would hand a URL bearing
+archive credentials' authority to the browser, and the authorisation model here
+is a single admin token.
+
+`missing_hours` is capped at 720 entries with an explicit
+`missing_hours_truncated` flag, so one stray old file cannot turn the status
+payload into a million rows.
+
+**Validation.** `tests/test_raw_archive.py` (32 tests, all against a local stub
+S3 endpoint; no network) covers: a pruned segment is listed with
+`location="r2"`, its recorded sha256, and is served whole and by range through
+`/api/export/raw/{name}` with the gzip member intact end to end (40 lines
+decompressed after the round trip); a local segment is still served from the
+volume and no GET reaches R2; an unknown name is still 404; `/api/archive`
+reports continuity and the ledger and contains neither credential; missing
+hours between the first and last are reported exactly
+(`20260901-12`, `20260901-13` for segments at 10, 11 and 14); local and remote
+bytes are counted separately after a prune; an unregistered file is still part
+of the timeline; and the manifest block equals the `Engine.status()` block key
+for key. `tests/test_exporter.py` asserts an audit bundle still does not hash
+bodies it did not copy (`sha256` is null, `location` stated) and that every
+table in `TABLES`, now including `raw_segments`, is exported. Suite: 459 tests
+OK in 52.1 s.
+
+**Risks / limitations.** The continuity block in a bundle is computed from the
+live ledger while the exported `raw_segments` table comes from the SQLite
+snapshot, so an upload completing between the two edges can make them differ by
+one row; the capture-boundary note already covers that class of drift, but it
+is not zero. Serving a pruned segment streams it through this process, so a
+large ranged read competes for the same uplink as the live WebSocket; it is
+bounded by being admin-only and by Range support. `/api/archive` is readable
+without the admin token, like the other observation endpoints: it exposes
+segment names, sizes and states, and no credential, but it does reveal when the
+bot was down.
+
+**Follow-up.** The dashboard has no archive panel; continuity is available at
+`/api/archive` and inside `/api/status` but is not rendered. `static/` is
+untouched by this pass.
+
+### CHG-2026-09-05-007 — Archive the raw feed to Cloudflare R2 under a verified continuity contract
+
+**Commit:** `aac510f`, `88dcf17`
+**Components:** `app/archive.py` (new), `app/config.py`, `app/store.py`,
+`app/recorder.py`, `app/engine.py`, `scripts/r2_probe.py` (new),
+`tests/test_raw_archive.py` (new), `tests/test_production_migration.py`
+
+**Observed / original behaviour.** Measured in production on 2026-09-05: the
+Railway persistent volume at `/srv/data` holds 4.00 GB of a 4.08 GB maximum
+(peak over 48 h). Raw hourly segments are 2.94 GB of that — 176 files,
+`feed-YYYYMMDD-HH.jsonl.gz`, from Aug 25 18:00 to Sep 5 — and the SQLite study
+database is roughly the remaining 1 GB. An audit export already fails with
+`study_export: database or disk is full` because the snapshot copy no longer
+fits. New segments accumulate at ~300 MB/day. Nothing deleted anything, and
+nothing could: the recorder only ever appends.
+
+**Root cause.** Design gap, not a defect. The recorder was built on the
+assumption that the volume is large enough, and there was no second tier of
+storage and no record of what the archive contains. The next failure mode after
+the export failure is worse than a failed export: SQLite on a full volume loses
+writes silently, so the study database — the thing every measurement in this
+log is computed from — degrades without an error anyone sees.
+
+**Why necessary.** Without it the volume fills within days and live collection
+starts losing observations with no signal. Deleting old segments to make room
+is not an option: the raw feed is the only record of what the exchange actually
+sent, and it is what will replace the print-constrained fill model. The
+operator's requirement was explicit — extend storage to Cloudflare, "but make
+sure it's a continuity to the Railway volume so it's not inconsistent" — which
+rules out any design where the volume and the remote store can disagree about
+what exists.
+
+**Exact change.** A new `raw_segments` table (additive, idempotent migration in
+`store.init()`) is the source of truth for what the archive contains. Every
+segment is in exactly one state, recorded durably and never inferred from a
+directory listing: `local`, `uploaded` (verified in R2, still on the volume),
+`pruned` (verified in R2, removed from the volume). There is no state in which
+a segment is neither on the volume nor verified remotely.
+
+`app/archive.py` holds `SigV4Signer`, `R2Client` and `RawArchive`.
+`RawRecorder` gained one hook: `_rotate` and `checkpoint_for_export` call
+`on_sealed(path)` for a segment that will never be appended to again. The hook
+does one set insertion and never touches SQLite, because `_rotate` runs on the
+WebSocket path; the archive's own pass reconciles the directory anyway, so a
+dropped hook costs promptness, never correctness. Startup reconcile registers
+any `feed-*.jsonl.gz` that is not the active hour and not in the table as
+`local`.
+
+Uploads are one PUT (R2 allows 5 GB; the largest segment here is 118 MB), the
+body streamed from the file handle so 118 MB is never held in memory, with
+`x-amz-content-sha256` computed in a separate streaming pass. Verification is
+two independent checks: the returned `ETag` must equal the md5 computed while
+reading the file, then a `HEAD` must report the same content length as the
+local file. Only then does the row become `uploaded` with `verified_ts`. A
+mismatch leaves it `local`, records `last_error`, counts an attempt and retries
+with exponential backoff up to `RAW_ARCHIVE_MAX_ATTEMPTS`; a segment that
+exhausts its attempts is kept on the volume, never deleted.
+
+Pruning is bounded and deliberate: a verified segment older than
+`RAW_LOCAL_RETENTION_HOURS` (48), or, when free space on `DATA_DIR` is below
+`RAW_ARCHIVE_MIN_FREE_MB` (512, via `shutil.disk_usage`), oldest first until the
+floor is cleared. `RawArchive._prune_one` is the only place in the codebase
+that deletes a recorded segment (`app/archive.py:750`), and every guard is
+re-checked there — against SQLite and against R2 — at the moment of deletion
+rather than when the candidate list was built: the row still exists and is
+`uploaded`; it carries `verified_ts` and an `r2_key`; it is not the hour the
+recorder is appending to; the file on disk is still exactly the size that was
+verified; a live `HEAD` confirms the remote object is still there at that size;
+and the ledger flip `uploaded -> pruned` succeeded, itself a conditional UPDATE
+requiring `verified_ts IS NOT NULL`. Every prune, upload, verification and
+failure is written to the feed-health ledger as `archive_uploaded`,
+`archive_verified`, `archive_pruned` or `archive_error`.
+
+"Sealed" is deliberately stricter than "not the current hour": after a quiet
+hour boundary the recorder's gzip handle is still open on the PREVIOUS hour's
+file, so the active set is the current wall-clock hour AND the recorder's open
+hour. Uploading the latter would archive a truncated gzip member.
+
+SigV4 is implemented with stdlib `hmac`/`hashlib` over the existing `httpx` —
+no boto3, no aiobotocore — against `https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+path-style, region `auto`, service `s3`. Everything runs off the event loop:
+one background task awaits `tick()` inside `asyncio.to_thread`, with backoff,
+and a failure records `last_error`, a feed event and `engine._record_error`
+without ever reaching the recorder, the WebSocket path or the paper desk. The
+first pass registers the existing backlog and drains it oldest-first, one
+upload at a time with a pause between, so 2.94 GB moves without saturating the
+uplink the live socket shares.
+
+`scripts/r2_probe.py` is an operator tool, not part of the suite: it performs
+PUT/HEAD/GET/Range/DELETE against the real bucket with one small object under
+`probe/` and deletes it again, so connectivity can be confirmed after deploy
+without touching `raw/`.
+
+**Before / after.** Same input, the production volume as measured. Before:
+2.94 GB of segments on a 4.08 GB volume, growing 300 MB/day, audit export
+failing with `database or disk is full`, and no record of what the archive
+contains. After, with `RAW_ARCHIVE_ENABLED=true` and credentials: the 176-file
+backlog uploads oldest-first and is verified; everything older than 48 h is
+removed from the volume only after that verification, leaving roughly 600 MB of
+recent segments locally; the ledger names every segment and its state; and both
+the deleted and the retained segments remain downloadable. With the switch off
+or credentials absent the process behaves exactly as before: no task is
+created, no row is written, no byte is deleted.
+
+**Reasoning and trade-offs.** Options rejected:
+
+- *Delete old segments outright.* Fastest fix, permanent data loss. The raw
+  feed is the study's irreplaceable input.
+- *A bigger volume.* Buys weeks at 300 MB/day and moves the same failure later,
+  without making the archive describable.
+- *boto3/aiobotocore.* Would have made the S3 half trivial, but
+  `requirements.txt`/`.lock` are pinned and minimal and this runs beside a live
+  trading loop; ~50 lines of verified SigV4 is a smaller risk surface than a
+  large transitive dependency tree. The signer is therefore validated against
+  the published AWS test vectors rather than trusted.
+- *Multipart upload.* Unnecessary below 5 GB, and it would have cost the
+  strongest verification available: for a single PUT the ETag IS the md5 of the
+  body, which a multipart ETag is not.
+- *Prune on the strength of the upload response alone.* Rejected. The prune
+  path re-HEADs the object immediately before deleting, costing one request per
+  prune. If R2 is unreachable the prune is refused and the volume stays fuller
+  for another minute — the correct direction to fail.
+- *Presigned redirects for reads.* Rejected; see CHG-2026-09-05-008.
+
+**Validation.** `tests/test_raw_archive.py`, 32 tests, entirely against a local
+stub S3 endpoint started in a thread — no network. The stub recomputes the
+SigV4 signature of every request it receives and refuses a mismatch, so each
+upload test is also an end-to-end test of the signer.
+
+The signer is validated offline against the published AWS Signature Version 4
+test vectors: `get-vanilla` (full Authorization header compared byte for byte,
+signature `5fa00fa3...fbf31`), `post-vanilla-query`
+(`28038455...f7f11`), and the two S3 worked examples — GET Object with a signed
+`Range` (`f0e8bdb8...bdb41`) and PUT Object with a non-empty payload
+(`98ad7217...108bd`, body hash `44ce7dd6...8b072`). All four match exactly.
+
+Behaviour covered: a sealed segment uploads, verifies and flips state with its
+sha256, md5, ETag and byte count recorded, the stub's bytes equal the file's,
+and the local copy is kept; an ETag mismatch leaves the row `local` with
+`attempts=1`, does NOT prune even with retention forced to zero, and succeeds
+on retry; a HEAD length mismatch does the same; exhausted attempts keep the
+segment; the active hour is never registered, uploaded or pruned, and neither
+is the recorder's open hour; retention prunes oldest-first and keeps a segment
+inside the window; the low-disk floor prunes exactly as many as the floor
+requires, oldest first; a segment appended to after verification is refused; a
+segment missing from R2 is refused; a five-file backlog drains oldest-first two
+per pass; the recorder's rotation hook seals only the previous hour; a failing
+tick never crashes the task; and `tick` runs on a worker thread, not the main
+thread. With the feature disabled: nothing registered, no request made, no file
+touched, no event, no error, and `R2Client.from_config()` is None.
+
+Secret hygiene: a test asserts none of `R2_ACCESS_KEY_ID`,
+`R2_SECRET_ACCESS_KEY` or `R2_ACCOUNT_ID` appears anywhere in a full study
+bundle or in `exporter.non_secret_config()`, and that none of the storage knobs
+is in `config.STRATEGY_PARAM_NAMES` — changing retention, the free-space floor
+or the switch leaves `config_id()` unchanged.
+
+`tests/test_production_migration.py` migrates a production-shaped database
+twice and asserts the ledger appears empty, keeps a verified segment's stamps
+across remigration, and refuses to mark an unverified segment pruned.
+
+Trading behaviour: `strategy_params()` is byte-identical before and after
+(diffed as sorted JSON). No detection, confirmation, sizing, entry, exit, fee,
+lockout or settlement code was touched; the `engine.py` diff is construction,
+the status block and task startup only. The price-only sleeve's AST allowlist
+test stays green. Because `config.py` and `engine.py` are strategy sources,
+`CODE_FINGERPRINT` moves (`f74a5bed98d2` -> `444a612f5f8e` in this
+environment) and with it `config_id` (`01ed0f686eabf351` ->
+`788061d1dfc317bc`); that is the provenance stamp working as designed, not a
+decision change.
+
+Demo-mode smoke run (`MODE=demo DATA_DIR=/tmp/fbarch uvicorn app.main:app
+--port 8098`): `/api/status` reports `archive.enabled=false`,
+`active=false`, `failures=0`, `last_tick_ts=null`, `health.ok=true`;
+`/api/archive` returns an empty timeline; `raw_segments` has 0 rows and the
+feed-health ledger has 0 `archive_*` events; no traceback in the server log. A
+second run with `RAW_ARCHIVE_ENABLED=true` and no credentials is equally inert
+(`enabled=true`, `credentialled=false`, `active=false`, `last_tick_ts=null`,
+0 rows, 0 tracebacks) — the fail-closed path.
+
+Full gate: 459 tests OK (52.1 s) under
+`python -X dev -W error::RuntimeWarning`, `compileall` clean,
+`ruff check --select E9,F63,F7,F82 app tests scripts` clean, `node --check
+static/app.js` clean, `git diff --check` clean.
+
+**Risks / limitations.** Not exercised against the real R2 endpoint from this
+branch: every archive test uses a local stub. `scripts/r2_probe.py` exists
+precisely because that gap can only be closed with credentials on the
+deployment. The retry backoff between attempts is in memory, so a restart
+retries immediately; the durable cap is `attempts` in SQLite, which is what
+bounds it. Deleting an object in R2 by hand while its row says `pruned` would
+leave a segment recorded as archived that no longer exists — the prune-time
+HEAD prevents this process from creating that state, but nothing outside this
+process is guarded. R2 egress and storage cost is not modelled anywhere. The
+archive does not verify a previously pruned segment periodically; verification
+happens at upload and again immediately before the delete, and not after.
+Nothing here reduces the ~1 GB the SQLite database itself occupies, so the
+volume pressure returns eventually from that side.
+
+**Follow-up.** Deploy needs `RAW_ARCHIVE_ENABLED=true`, `R2_ACCOUNT_ID`,
+`R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` and `R2_BUCKET` set on the Railway
+service, then `scripts/r2_probe.py` run once to confirm connectivity, then the
+first backlog drain watched through `/api/archive` (`by_state`) and the
+feed-health ledger. A study-database retention pass is a separate change.
 
 ### CHG-2026-09-05-006 — Bound the detector's per-trade scan to its own windows
 
