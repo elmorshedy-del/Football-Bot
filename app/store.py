@@ -277,6 +277,19 @@ def init():
             _conn.execute(f"ALTER TABLE markets ADD COLUMN {column} TEXT")
         except sqlite3.OperationalError:
             pass
+    # Settlement outcome, so a study can ask what actually happened to a market
+    # the bot watched -- including the ones it declined.  Nothing persisted the
+    # result anywhere queryable before; see CHG-2026-09-05-010.
+    for column, definition in (
+        ("result", "TEXT"),
+        ("settled_ts", "REAL"),
+        ("last_yes_bid", "REAL"),
+        ("last_yes_ask", "REAL"),
+    ):
+        try:
+            _conn.execute(f"ALTER TABLE markets ADD COLUMN {column} {definition}")
+        except sqlite3.OperationalError:
+            pass
     # Every new clock row records the exact source behind its stamp.  Legacy
     # rows keep a null source and are presented as legacy_unknown; they are
     # never relabeled as the current provider.
@@ -1419,6 +1432,40 @@ def upsert_market(ticker, event, series, title, close_time, status,
           display_leg=COALESCE(excluded.display_leg,markets.display_leg)""",
        (ticker, event, series, title, close_time, status, time.time(),
         display_game, display_leg))
+
+
+def record_market_result(ticker, result, settled_ts=None, last_yes_bid=None,
+                         last_yes_ask=None):
+    """Persist a market's settlement outcome and its last observed quote.
+
+    First observation wins for `settled_ts` and a known quote is never
+    overwritten with a null, so a lifecycle frame and a later REST poll can
+    both report the same settlement without either degrading the row.  A
+    result for a ticker that was never registered writes nothing and returns 0,
+    rather than inventing a market row.
+    """
+    if result not in ("yes", "no"):
+        return 0
+    cur = ex(
+        """UPDATE markets
+              SET result=?,
+                  settled_ts=COALESCE(settled_ts, ?),
+                  last_yes_bid=COALESCE(?, last_yes_bid),
+                  last_yes_ask=COALESCE(?, last_yes_ask)
+            WHERE ticker=?""",
+        (result, time.time() if settled_ts is None else settled_ts,
+         last_yes_bid, last_yes_ask, ticker),
+    )
+    return cur.rowcount
+
+
+def market_result(ticker):
+    rows = q(
+        "SELECT ticker,result,settled_ts,last_yes_bid,last_yes_ask"
+        " FROM markets WHERE ticker=?",
+        (ticker,),
+    )
+    return rows[0] if rows else None
 
 
 def _stamp_text(value):

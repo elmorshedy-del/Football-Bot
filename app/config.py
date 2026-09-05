@@ -165,6 +165,23 @@ EVENT_MATCH_WINDOW_S = _f("EVENT_MATCH_WINDOW_S", 20.0)
 # nothing in the trading path reads it.
 SIGNAL_PATH_WINDOW_S = _f("SIGNAL_PATH_WINDOW_S", 300.0)
 SIGNAL_PATH_MAX_TRACKED = _i("SIGNAL_PATH_MAX_TRACKED", 400)
+# Path sampling policy.  A flat 4,000-row cap is a budget spent in arrival
+# order, so the busiest markets exhausted it first: samples=3999 on every La
+# Liga trade and signal in the first live study, which collapsed the intended
+# 300 s forward window to 60-130 s exactly where activity was highest and the
+# answer mattered most.
+#
+# Time-based thinning instead: every change for the first PATH_THIN_AFTER_S
+# after the anchor, where the reaction being studied happens, then at most one
+# row per PATH_THIN_INTERVAL_MS.  A new peak or trough is ALWAYS recorded
+# regardless of thinning, so the extremes the exit study reads are never the
+# rows that get dropped.  `store.BID_PATH_MAX_SAMPLES` remains the hard
+# backstop.
+#
+# Collection only: nothing in the trading path reads a persisted path, so these
+# are deliberately not strategy parameters.
+PATH_THIN_AFTER_S = _f("PATH_THIN_AFTER_S", 10.0)
+PATH_THIN_INTERVAL_MS = _f("PATH_THIN_INTERVAL_MS", 250.0)
 # Maximum age of a persisted match-clock confirmation used by the 88+ gate.
 #
 # Was 2500 ms, derived as ten 250 ms poll intervals. Live capture measured

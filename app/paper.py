@@ -13,6 +13,33 @@ from . import config, store
 
 # Samples buffered before an incremental write; bounds crash loss.
 BID_PATH_FLUSH_EVERY = 250
+
+
+def path_thins(dt_s, bid, peak, trough, now, last_written):
+    """True when this observation may be dropped by time-based thinning.
+
+    Four exemptions, in order:
+
+    * an unpriced observation is an availability change, not a sample, and is
+      always recorded -- an outage the path never traded through is evidence;
+    * a new peak or trough is always recorded, so the extremes every exit study
+      reads survive thinning by construction;
+    * nothing inside the first `PATH_THIN_AFTER_S` after the anchor is thinned,
+      because that is the window the reaction itself happens in;
+    * after that, one row per `PATH_THIN_INTERVAL_MS`.
+
+    Replaces spending a flat 4,000-row budget in arrival order, which exhausted
+    the cap in the busiest markets first (samples=3999 on every La Liga trade
+    and signal in the first live study) and collapsed a 300 s window to
+    60-130 s exactly where activity was highest.
+    """
+    if bid is None:
+        return False
+    if peak is None or trough is None or bid > peak or bid < trough:
+        return False
+    if dt_s <= config.PATH_THIN_AFTER_S:
+        return False
+    return (now - last_written) * 1000.0 < config.PATH_THIN_INTERVAL_MS
 # Slowest acceptable staleness for a trade high that no path flush or close has
 # written yet.  The high itself is authoritative in memory; this only bounds how
 # long the API/UI can read a stale column for an open position.
@@ -94,6 +121,12 @@ class Position:
         # incremental flush, so a length check silently resets the cap.
         self.exec_path_total = 0
         self.exec_path_flush_failed = False
+        # Time-based thinning state.  Separate from `peak_bid`, which the sleeve
+        # exit rules own (SPEC_CORRECTIONS H1) and which only advances upward.
+        self.path_peak = None
+        self.path_trough = None
+        self.path_last_written = 0.0
+        self.exec_path_thinned = 0
         self.high_dirty = False
         self.high_persisted_ts = 0.0
         self.max_executable_bid = None
@@ -631,12 +664,24 @@ class PaperDesk:
         signature = (bid, bid_size, exec_px, qty)
         if signature == pos.exec_path_last:
             return
+        if path_thins(now - pos.entry_ts, bid, pos.path_peak, pos.path_trough,
+                      now, pos.path_last_written):
+            # Deliberately does NOT advance `exec_path_last`: that signature is
+            # what is durable, so the next row written carries the then-current
+            # quote rather than being deduplicated against one never persisted.
+            pos.exec_path_thinned += 1
+            return
         pos.exec_path_last = signature
         # One slot is reserved so the terminal row always fits inside the cap.
         if pos.exec_path_total >= store.BID_PATH_MAX_SAMPLES - 1:
             pos.exec_path_dropped += 1
             return
         pos.exec_path_total += 1
+        pos.path_last_written = now
+        if bid is not None:
+            pos.path_peak = bid if pos.path_peak is None else max(pos.path_peak, bid)
+            pos.path_trough = (bid if pos.path_trough is None
+                               else min(pos.path_trough, bid))
         pos.exec_path.append({
             "kind": "position", "trade_id": pos.tid, "signal_id": pos.signal_id,
             "event": pos.event, "market": pos.market, "side": pos.side,
@@ -667,6 +712,9 @@ class PaperDesk:
             pos.exec_path_dropped += 1
             return
         pos.exec_path_total += 1
+        # An outage ends the thinning interval, so the quote that resumes
+        # availability is always recorded rather than possibly thinned away.
+        pos.path_last_written = 0.0
         pos.exec_path.append({
             "kind": "position", "trade_id": pos.tid, "signal_id": pos.signal_id,
             "event": pos.event, "market": pos.market, "side": pos.side,

@@ -31,6 +31,9 @@ def _position(tid=1, signal_id=2, side="yes", remaining=10.0, entry_px=50.0):
     pos.exec_path_total, pos.exec_path_flush_failed = 0, False
     pos.max_executable_bid = pos.max_executable_bid_ts = pos.mfe_c = None
     pos.high_dirty = False
+    # Time-based thinning state.
+    pos.path_peak = pos.path_trough = None
+    pos.path_last_written, pos.exec_path_thinned = 0.0, 0
     return pos
 
 

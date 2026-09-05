@@ -13,7 +13,7 @@ from .goal_latency import GoalLatencyObserver
 from .kalshi import KalshiClient, KalshiWS
 from .late_score_sleeve import PriceOnlyLateScoreSleeve
 from .match_clock import MatchClockGate, MatchClockTracker, unusable_stamp
-from .paper import BID_PATH_FLUSH_EVERY, PaperDesk
+from .paper import BID_PATH_FLUSH_EVERY, PaperDesk, path_thins
 from .recorder import RawRecorder
 
 
@@ -167,6 +167,9 @@ class Engine:
         self._feed_event_tasks = set()
         self._path_write_tasks = set()
         self._watched_markets = set()
+        # Markets whose settlement has already been persisted, so the widened
+        # settlement poll does not re-request a resolved market every 30 s.
+        self._settled_markets = set()
         self.market_observations = {}  # event -> recent locally timestamped price changes
         self._last_market_state = {}   # (kind, ticker) -> tuple, suppress unchanged frames
         self.goal_latency = None
@@ -443,7 +446,48 @@ class Engine:
         elif t == "market_lifecycle_v2":
             res = body.get("settled_result") or body.get("result")
             if res in ("yes", "no"):
+                self._record_market_result(ticker, res, proc_wall)
                 self.desk.settle_market(ticker, res)
+
+    def _last_yes_quote(self, ticker):
+        book = self.books.get(ticker)
+        if book is None or not book.ok:
+            return None, None
+        return self._cents(book.best_yes_bid()), self._cents(book.best_yes_ask())
+
+    def _record_market_result(self, ticker, result, settled_ts):
+        """Persist a settlement from the socket without an fsync on the loop.
+
+        Settlement is rare, but `handle_ws` runs on the event loop and the
+        platform pass removed the writes that were there.  This reuses the same
+        dispatch: to a worker thread when a loop is running, inline only when
+        there is none (the synchronous replay harness and the tests).
+        """
+        if result not in ("yes", "no") or not ticker:
+            return
+        self._settled_markets.add(ticker)
+        bid, ask = self._last_yes_quote(ticker)
+        args = (ticker, result, settled_ts, bid, ask)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is None:
+            try:
+                store.record_market_result(*args)
+            except Exception as exc:  # noqa: BLE001 - reported, never raised
+                self._record_error("market_result", exc)
+            return
+
+        async def _write():
+            try:
+                await asyncio.to_thread(store.record_market_result, *args)
+            except Exception as exc:  # noqa: BLE001 - reported, never raised
+                self._record_error("market_result", exc)
+
+        task = loop.create_task(_write())
+        self._path_write_tasks.add(task)
+        task.add_done_callback(self._path_write_tasks.discard)
 
     def _watch_signal_forward(self, sid, cand, outcome):
         """Track the held-side price for a bounded window after any signal.
@@ -463,6 +507,9 @@ class Engine:
             "side": side, "strategy": cand.get("strategy") or "detector",
             "anchor_ts": now, "expires_at": now + config.SIGNAL_PATH_WINDOW_S,
             "outcome": outcome, "last": None, "rows": [], "dropped": 0, "total": 0,
+            # Time-based thinning state (see `path_thins`): the extremes seen so
+            # far and when a row was last written.
+            "peak": None, "trough": None, "last_written": 0.0, "thinned": 0,
         })
         self._evict_signal_paths()
 
@@ -492,12 +539,26 @@ class Engine:
             if availability == "gap" and watch["last"] is None:
                 # Never open a path with a gap: there is no availability to end.
                 continue
+            if path_thins(now - watch["anchor_ts"], bid, watch.get("peak"),
+                          watch.get("trough"), now, watch.get("last_written", 0.0)):
+                # `last` is deliberately not advanced: it tracks what is
+                # durable, so the next written row carries the current quote.
+                watch["thinned"] = watch.get("thinned", 0) + 1
+                continue
             watch["last"] = signature
             # One slot is reserved so a terminal/final row always fits.
             if watch.get("total", 0) >= store.BID_PATH_MAX_SAMPLES - 1:
                 watch["dropped"] += 1
                 continue
             watch["total"] = watch.get("total", 0) + 1
+            if bid is None:
+                # An outage ends the interval, so the resuming quote is kept.
+                watch["last_written"] = 0.0
+            else:
+                watch["last_written"] = now
+                peak, trough = watch.get("peak"), watch.get("trough")
+                watch["peak"] = bid if peak is None else max(peak, bid)
+                watch["trough"] = bid if trough is None else min(trough, bid)
             watch["rows"].append({
                 "kind": "decline", "trade_id": None, "signal_id": watch["signal_id"],
                 "event": watch["event"], "market": ticker, "side": watch["side"],
@@ -1314,18 +1375,51 @@ class Engine:
                 self.broadcast({"type": "log", "text": f"discovery error: {e!r}"})
             await asyncio.sleep(config.DISCOVERY_INTERVAL_S)
 
+    # Per-cycle request bound for the widened settlement poll.  Open positions
+    # are always polled; expired declined markets fill whatever budget is left,
+    # so widening the poll cannot turn into a rate-limit incident.
+    SETTLE_POLL_MAX = 50
+
+    def _settlement_poll_targets(self, now):
+        """Open-position markets, plus every watched market past expiration.
+
+        A settlement result must exist for episodes the bot DECLINED, not only
+        the ones it traded: without it the declined population -- which is most
+        of the funnel -- has no outcome label at all, and the whole
+        precision/recall question stays unanswerable.  Markets leave
+        `_watched_markets` `DROP_AFTER_CLOSE_MIN` past expiration, which bounds
+        the set on its own; `_settled_markets` stops re-polling a resolved one.
+        """
+        held = sorted({p.market for p in self.desk.positions.values()})
+        expired = []
+        for tk in sorted(self._watched_markets):
+            if tk in held or tk in self._settled_markets:
+                continue
+            expiration = parse_iso(self.meta.get(tk, {}).get("close_time") or "")
+            if expiration is not None and expiration <= now:
+                expired.append(tk)
+        # Bound memory: forget settlements for markets no longer watched.
+        self._settled_markets &= self._watched_markets | set(held)
+        return (held + expired)[:self.SETTLE_POLL_MAX]
+
     async def settle_poll_task(self):
-        """Fallback settlement detection for open paper positions."""
+        """Fallback settlement detection, and the durable market result."""
         while True:
             await asyncio.sleep(30)
             if self.mode != "live":
                 continue
-            tickers = {p.market for p in self.desk.positions.values()}
-            for tk in tickers:
+            now = time.time()
+            for tk in self._settlement_poll_targets(now):
                 try:
                     r = await self.client.get(f"/markets/{tk}")
                     mkt = r.get("market") or {}
                     if mkt.get("result") in ("yes", "no"):
+                        bid, ask = self._last_yes_quote(tk)
+                        await asyncio.to_thread(
+                            store.record_market_result, tk, mkt["result"],
+                            time.time(), bid, ask,
+                        )
+                        self._settled_markets.add(tk)
                         self.desk.settle_market(tk, mkt["result"])
                 except Exception as exc:
                     self._record_error(f"settlement:{tk}", exc)
