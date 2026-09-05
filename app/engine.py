@@ -762,6 +762,143 @@ class Engine:
             context["proc_lag_ms"] = round((proc - arrival) * 1000.0, 3)
         return context
 
+    @staticmethod
+    def _attach_confirmation(cand, evidence):
+        """Carry the confirmation scan's evidence on the candidate.
+
+        Attached to the candidate rather than passed alongside it because the
+        same candidate is copied into both sleeves by `_strategy_candidate`, so
+        one attachment reaches every row of the episode.  `attempts` counts how
+        many times the scan actually ran, which is what separates "no sibling
+        ever printed" from "the wait window expired before its frame arrived".
+        """
+        if not isinstance(evidence, dict):
+            return
+        previous = cand.get("confirmation") or {}
+        evidence = dict(evidence)
+        evidence["attempts"] = int(previous.get("attempts") or 0) + 1
+        cand["confirmation"] = evidence
+
+    @staticmethod
+    def episode_id(cand):
+        """Stable identity for one detected episode.
+
+        In `parallel` mode a confirmed episode writes two signal rows with
+        different ids, identical trigger fields and two forward watches, and
+        nothing keyed them together: joining them meant matching on
+        (market, ts_ms, dl, levels) and hoping.  The candidate's exchange
+        timestamp and market are the episode, so they are the key.
+        """
+        ticker, ts_ms = cand.get("ticker"), cand.get("ts_ms")
+        if not ticker or not isinstance(ts_ms, (int, float)):
+            return None
+        return f"{ticker}:{int(ts_ms)}"
+
+    @staticmethod
+    def _cents(value):
+        """Round a recorded price to whole-cent precision plus a margin.
+
+        `best_yes_ask` is `100 - max(no_bids)` in floating point, so an exact
+        55c NO bid reads back as 44.99999999999999.  Rounding the *recorded*
+        value keeps the row readable and comparable; no decision reads this
+        field, so nothing about admission or fills is affected.
+        """
+        return None if value is None else round(value, 3)
+
+    def _leg_quote(self, ticker, depth=True):
+        """Top of book for one leg in YES space, or None when unavailable."""
+        book = self.books.get(ticker)
+        if book is None or not book.ok:
+            return None
+        bid, ask = book.best_yes_bid(), book.best_yes_ask()
+        quote = {"bid": self._cents(bid), "ask": self._cents(ask)}
+        if depth:
+            quote["bid_size"] = book.yes_bids.get(bid) if bid is not None else None
+            quote["ask_size"] = (
+                book.no_bids.get(100 - ask) if ask is not None else None
+            )
+            quote["last"] = self.prices.get(ticker, {}).get("last")
+        if bid is not None and ask is not None:
+            quote["mid"] = round((bid + ask) / 2.0, 3)
+            quote["spread_c"] = round(ask - bid, 3)
+        return quote
+
+    def _event_quotes(self, ticker, depth=True):
+        """Every leg of the candidate's event, keyed by ticker."""
+        event = self.meta.get(ticker, {}).get("event")
+        legs = self.event_markets.get(event) or [ticker]
+        return {leg: self._leg_quote(leg, depth=depth) for leg in legs}
+
+    def _fillable(self, ticker, side):
+        """What a Gate-A entry would have taken, WITHOUT consuming anything.
+
+        Deliberately the same walk as `PaperDesk.try_enter`: ascending asks for
+        `side`, stop at `PRICE_CAP`, fill `NOTIONAL_USD`.  Recorded on declined
+        and unconfirmed rows too, so a refusal carries the fill it refused
+        rather than only the fact of the refusal.
+        """
+        book = self.books.get(ticker)
+        if book is None or not book.ok:
+            return None
+        try:
+            ladder = book.ask_ladder(side)
+        except Exception:
+            return None
+        want = config.NOTIONAL_USD
+        qty = cost = weighted = 0.0
+        levels = 0
+        for px, avail in ladder:
+            if px > config.PRICE_CAP or px <= 0:
+                break
+            take = min(avail, (want - cost) / (px / 100.0))
+            if take <= 0:
+                break
+            qty += take
+            cost += take * px / 100.0
+            weighted += take * px
+            levels += 1
+            if cost >= want - 0.01:
+                break
+        return {
+            "vwap": round(weighted / qty, 2) if qty > 0 else None,
+            "qty": round(qty, 1),
+            "levels": levels,
+            "notional_usd": want,
+            "price_cap": config.PRICE_CAP,
+        }
+
+    def _capture_context(self, cand, base):
+        """Extend the frame context with book, fillability and load state.
+
+        Pure in-memory work folded into the signal INSERT that already happens,
+        so no statement and no commit is added to the hot path (H2).
+
+        Capture is additive to collection and must never cost a row: a failure
+        here keeps the frame context and records the reason in the row itself,
+        which is visible in the data rather than swallowed.
+        """
+        context = dict(base or {})
+        ticker = cand.get("ticker")
+        try:
+            quotes = self._event_quotes(ticker)
+            context["books"] = quotes
+            own = quotes.get(ticker) or {}
+            context["spread_c"] = own.get("spread_c")
+            context["fillable"] = self._fillable(
+                ticker, "yes" if cand.get("dir", 1) >= 0 else "no",
+            )
+            context["load"] = {
+                "open_watches": len(self._signal_paths),
+                "open_positions": len(self.desk.positions),
+                "pending_candidates": len(self.pending),
+            }
+        except Exception as exc:  # noqa: BLE001 - recorded, never raised
+            context["capture_error"] = f"{type(exc).__name__}: {exc}"
+        confirmation = cand.get("confirmation")
+        if confirmation:
+            context["confirmation"] = confirmation
+        return context
+
     def process_trade(self, ticker, ts_ms, px, sz, taker, wall,
                       proc_wall=None, backlog=0):
         """Feed one trade into the detector.
@@ -787,7 +924,9 @@ class Engine:
             still = []
             for p in self.pending:
                 if ticker in p["siblings"]:
-                    ok, lag = self.detector.confirm(p["cand"], p["siblings"])
+                    ok, lag, evidence = self.detector.confirm(
+                        p["cand"], p["siblings"])
+                    self._attach_confirmation(p["cand"], evidence)
                     if ok:
                         if time.time() - p["queued_at"] <= config.CONF_TRADE_MAX_AGE_S:
                             self.act_on_signal(p["cand"], lag)
@@ -805,7 +944,8 @@ class Engine:
             self.pending = still
         if cand:
             sibs = self.siblings(ticker)
-            ok, lag = self.detector.confirm(cand, sibs)
+            ok, lag, evidence = self.detector.confirm(cand, sibs)
+            self._attach_confirmation(cand, evidence)
             if ok:
                 self.act_on_signal(cand, lag)
             elif sibs:
@@ -853,14 +993,33 @@ class Engine:
                     },
                 },
                 "match_clock_snapshot": stamp,
-                "context": self._signal_context(
-                    observation.get("context"), observation.get("ts_ms")),
+                # Deliberately a cheap subset of `record_signal`'s context: the
+                # legs' top of book and the spread, with no depth, no ladder
+                # walk and no load state.  These rows are numerous by design
+                # (287 in a two-hour replay against 78 candidates), so the
+                # per-row cost has to stay near zero.
+                "context": self._subthreshold_context(observation),
                 # No forward path: these are numerous by design, and each watch
                 # costs a tracking slot and up to BID_PATH_MAX_SAMPLES rows.
                 "forward_path_started_ts": None,
             })
         except Exception as exc:
             self._record_error("subthreshold", exc)
+
+    def _subthreshold_context(self, observation):
+        context = dict(
+            self._signal_context(
+                observation.get("context"), observation.get("ts_ms"))
+            or {}
+        )
+        ticker = observation.get("ticker")
+        try:
+            quotes = self._event_quotes(ticker, depth=False)
+            context["books"] = quotes
+            context["spread_c"] = (quotes.get(ticker) or {}).get("spread_c")
+        except Exception as exc:  # noqa: BLE001 - recorded, never raised
+            context["capture_error"] = f"{type(exc).__name__}: {exc}"
+        return context or None
 
     def record_signal(self, cand, lag, outcome, announce=True):
         m = self.meta.get(cand["ticker"], {})
@@ -893,7 +1052,10 @@ class Engine:
             "conf_lag_ms": lag, "late": self.is_late(cand["ticker"]), "outcome": outcome,
             "detail": cand.get("detail") or {},
             "match_clock_snapshot": stamp,
-            "context": self._signal_context(cand.get("context"), cand.get("ts_ms")),
+            "context": self._capture_context(
+                cand, self._signal_context(cand.get("context"), cand.get("ts_ms")),
+            ),
+            "episode_id": self.episode_id(cand),
             "forward_path_started_ts": (
                 cand.get("local_ts") or time.time()
                 if config.SIGNAL_PATH_WINDOW_S else None

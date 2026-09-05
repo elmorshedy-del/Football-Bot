@@ -313,11 +313,23 @@ def init():
                    # Per-signal capture conditions (feed lag, processing lag,
                    # queue backlog).  Additive JSON so the row explains the
                    # timing it was produced under; see CHG-2026-09-05-001.
-                   "context"):
+                   "context",
+                   # `<market>:<candidate ts_ms>`.  Written on every row of one
+                   # detected episode so the two rows `parallel` mode produces
+                   # join without heuristics; see CHG-2026-09-05-007.
+                   "episode_id"):
         try:
             _conn.execute(f"ALTER TABLE signals ADD COLUMN {column} TEXT")
         except sqlite3.OperationalError:
             pass
+    # Episodes are looked up by identity when a study joins the two sleeves'
+    # rows; without this that join is a full scan of the signals table.
+    try:
+        _conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_signals_episode ON signals(episode_id)"
+        )
+    except sqlite3.OperationalError:
+        pass
     # Configuration provenance.  Rows written before this existed keep a NULL
     # config_id: their configuration is unknown, not assumed to be the current
     # one, so they are never pooled into a current-configuration aggregate.
@@ -1413,14 +1425,14 @@ def _stamp_text(value):
 def insert_signal(s):
     cur = ex("""INSERT INTO signals(ts_ms,local_ts,market,event,series,dir,dl,levels,size,
                 ref,ext,conf_lag_ms,late,outcome,detail,mode,match_clock_snapshot,
-                forward_path_started_ts,config_id,context)
-                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                forward_path_started_ts,config_id,context,episode_id)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
              (s["ts_ms"], s["local_ts"], s["market"], s["event"], s["series"], s["dir"],
               s["dl"], s["levels"], s["size"], s["ref"], s["ext"], s.get("conf_lag_ms"),
               1 if s.get("late") else 0, s["outcome"], json.dumps(s.get("detail") or {}), _mode,
               _stamp_text(s.get("match_clock_snapshot")),
               s.get("forward_path_started_ts"), _config_id,
-              _stamp_text(s.get("context"))))
+              _stamp_text(s.get("context")), s.get("episode_id")))
     return cur.lastrowid
 
 

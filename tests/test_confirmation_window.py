@@ -70,7 +70,7 @@ class ConfirmationWaitTests(unittest.TestCase):
     def test_a_fresh_confirmation_still_trades(self):
         engine = self.make_engine()
         engine.detector.on_trade.return_value = None
-        engine.detector.confirm.return_value = (True, 3.0)
+        engine.detector.confirm.return_value = (True, 3.0, {"bursts": []})
         engine.pending = [{"cand": self.candidate(), "siblings": ["D"],
                            "queued_at": __import__("time").time(),
                            "deadline": __import__("time").time() + 2.0}]
@@ -82,7 +82,7 @@ class ConfirmationWaitTests(unittest.TestCase):
         """Coherent on the exchange clock, learned too late to act on."""
         engine = self.make_engine()
         engine.detector.on_trade.return_value = None
-        engine.detector.confirm.return_value = (True, 3.0)
+        engine.detector.confirm.return_value = (True, 3.0, {"bursts": []})
         stale = __import__("time").time() - 1.0
         engine.pending = [{"cand": self.candidate(), "siblings": ["D"],
                            "queued_at": stale,
@@ -102,7 +102,7 @@ class ConfirmationWaitTests(unittest.TestCase):
     def test_a_candidate_that_never_confirms_still_expires(self):
         engine = self.make_engine()
         engine.detector.on_trade.return_value = None
-        engine.detector.confirm.return_value = (False, None)
+        engine.detector.confirm.return_value = (False, None, {"bursts": []})
         past = __import__("time").time() - 10.0
         engine.pending = [{"cand": self.candidate(), "siblings": ["D"],
                            "queued_at": past, "deadline": past + 2.0}]

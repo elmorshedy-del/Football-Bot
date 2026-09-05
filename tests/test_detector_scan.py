@@ -121,6 +121,18 @@ def comparable(row):
     ))
 
 
+def burst_trace(state):
+    """The registration fields the confirmation rule actually reads.
+
+    `big_bursts` also carries the burst's level count so `Detector.confirm` can
+    describe the sibling burst it weighed.  That is capture metadata appended
+    after the reference was frozen, and it is not part of the windowing
+    equivalence this module exists to pin, so it is excluded here rather than
+    back-dated into the verbatim reference implementation.
+    """
+    return tuple((row[0], row[1]) for row in state.big_bursts)
+
+
 def replay(detector_class, tape):
     """Return the full observable trace of one implementation over the tape."""
     near_misses = []
@@ -132,7 +144,7 @@ def replay(detector_class, tape):
         if out is not None:
             candidates.append(comparable(out))
         state = detector.markets[ticker]
-        bursts.append((ticker, tuple(state.big_bursts)))
+        bursts.append((ticker, burst_trace(state)))
     detector.flush_subthreshold(tape[-1][0] + 10_000)
     return candidates, bursts, [comparable(row) for row in near_misses]
 
