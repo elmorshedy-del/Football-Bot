@@ -21,6 +21,7 @@ from .match_events import (
     iter_provider_event_rows,
     normalize_match_event,
     period_status_event,
+    score_values,
 )
 
 _SCORE_KEY = re.compile(r"score", re.IGNORECASE)
@@ -68,12 +69,42 @@ def score_signature(details):
 
 
 def classify_score_change(before, after):
-    """Classify a score transition without interpreting natural language."""
-    keys = set(before) | set(after)
-    deltas = [after.get(key, 0.0) - before.get(key, 0.0) for key in keys]
-    if any(delta < 0 for delta in deltas):
+    """Classify a score transition without interpreting natural language.
+
+    Only score-VALUED keys are diffed (see `match_events.score_values`).  The
+    previous form diffed the whole numeric signature with `before.get(key, 0.0)`
+    as the default, so any newly appearing numeric key read as a positive delta:
+    a second-half kickoff appends `period_scores[1]`, whose `number` is 2, and
+    the row was labelled a goal.  199 of 476 `goal` rows in the first live study
+    had `side=unknown` and an unchanged score for exactly this reason.
+
+    Three rules, and the original correction-beats-goal precedence:
+
+    * a key present on both sides is a goal when it rises and a correction when
+      it falls;
+    * a key that appears is a goal only when it appears ABOVE zero, so a new
+      period starting 0-0 is a schema change;
+    * a key that disappears is a schema change -- the provider stopped
+      reporting a field, it did not un-score a goal.
+    """
+    before_scores = score_values(before)
+    after_scores = score_values(after)
+    corrected = scored = False
+    for key in set(before_scores) | set(after_scores):
+        if key not in after_scores:
+            continue
+        if key not in before_scores:
+            if after_scores[key] > 0:
+                scored = True
+            continue
+        delta = after_scores[key] - before_scores[key]
+        if delta < 0:
+            corrected = True
+        elif delta > 0:
+            scored = True
+    if corrected:
         return "score_correction"
-    if any(delta > 0 for delta in deltas):
+    if scored:
         return "goal"
     return "score_schema_change"
 
@@ -198,6 +229,7 @@ class GoalLatencyObserver:
             "previous_poll_ts": self.last_poll_ts.get(milestone_id),
             "poll_started_ts": timing["started_wall"],
             "response_ms": timing["response_ms"],
+            "poll_seq": timing.get("poll_seq"),
             "last_book_change_ts": book.get("wall") if book else None,
             "last_book_lead_ms": -book["delta_ms"] if book else None,
             "last_trade_ts": trade.get("wall") if trade else None,
@@ -375,13 +407,18 @@ class GoalLatencyObserver:
         )
         received_mono = time.monotonic()
         received_wall = time.time()
+        self.polls += 1
         timing = {
             "started_wall": started_wall,
             "received_wall": received_wall,
             "received_mono": received_mono,
             "response_ms": round((received_mono - started_mono) * 1000.0, 3),
+            # Monotonic within one observer run, so poll cadence -- and which
+            # observations came from the same request -- is reconstructible
+            # from the rows alone.  It restarts at 1 on a new process; that is
+            # what "per observer run" means and it is not backfilled.
+            "poll_seq": self.polls,
         }
-        self.polls += 1
         self.last_poll_wall = received_wall
         self.last_response_ms = timing["response_ms"]
         store.add_latency("match_response_ms", timing["response_ms"])

@@ -297,6 +297,7 @@ def init():
         ("source", "TEXT"),
         ("confirmed_ts", "REAL"),
         ("confirmation_previous_poll_ts", "REAL"),
+        ("poll_seq", "INTEGER"),
     ):
         try:
             _conn.execute(
@@ -308,6 +309,10 @@ def init():
         ("canonical_type", "TEXT"),
         ("canonical_side", "TEXT"),
         ("normalized_event", "TEXT"),
+        # Observer-run poll counter, so poll cadence is reconstructible from
+        # the rows.  Historical rows keep NULL: the counter did not exist when
+        # they were written and is never backfilled.
+        ("poll_seq", "INTEGER"),
     ):
         try:
             _conn.execute(
@@ -1243,8 +1248,8 @@ def insert_goal_latency(row):
                observed_ts,event,milestone_id,change_kind,live_type,
                score_before,score_after,previous_poll_ts,poll_started_ts,response_ms,
                last_book_change_ts,last_book_lead_ms,last_trade_ts,last_trade_lead_ms,
-               canonical_type,canonical_side,normalized_event,detail,mode)
-             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               canonical_type,canonical_side,normalized_event,detail,mode,poll_seq)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             row["observed_ts"], row["event"], row["milestone_id"],
             row["change_kind"], row.get("live_type"),
@@ -1257,6 +1262,7 @@ def insert_goal_latency(row):
             json.dumps(normalized, separators=(",", ":")),
             json.dumps(row.get("detail") or {}, separators=(",", ":")),
             _mode,
+            row.get("poll_seq"),
         ),
     )
     return cur.lastrowid
@@ -1268,8 +1274,8 @@ def insert_match_clock(row):
                observed_ts,poll_started_ts,previous_poll_ts,response_ms,event,milestone_id,
                provider_period,provider_minute,provider_stoppage,provider_clock,
                provider_status,precision,raw_context,mode,source,confirmed_ts,
-               confirmation_previous_poll_ts)
-             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               confirmation_previous_poll_ts,poll_seq)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             row["observed_ts"], row["poll_started_ts"], row.get("previous_poll_ts"),
             row["response_ms"], row["event"], row["milestone_id"],
@@ -1281,6 +1287,7 @@ def insert_match_clock(row):
             row.get("source") or match_clock.CLOCK_SOURCE,
             row.get("confirmed_ts"),
             row.get("confirmation_previous_poll_ts"),
+            row.get("poll_seq"),
         ),
     )
     return cur.lastrowid

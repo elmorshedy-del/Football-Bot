@@ -48,6 +48,40 @@ def score_pair(signature):
     }
 
 
+# The keys inside a score signature that actually carry a score.
+#
+# `goal_latency.score_signature` collects every numeric field at or below a key
+# containing "score", which is deliberately schema-flexible.  That flexibility
+# is exactly what broke goal classification: `period_scores` contains "score",
+# so a second-half kickoff appending
+# `period_scores[1] = {away_score: 0, home_score: 0, number: 2, type: "..."}`
+# introduced `period_scores.1.number = 2` -- a positive delta on a key that is
+# a period ORDINAL, not a score.  In the first live study 199 of 476 rows
+# labelled `goal` carried `side=unknown` and an unchanged score, inflating any
+# goal-rate statistic by roughly 2x.
+#
+# Tails are compared with underscores and dots stripped, so snake_case and
+# camelCase resolve identically, and the set matches the same three families
+# `_primary_score` above already ranks.
+_SCORE_VALUE_TAILS = frozenset({
+    "homesamegamescore", "awaysamegamescore",
+    "homeaggregatescore", "awayaggregatescore",
+    "homescore", "awayscore",
+    "scorehome", "scoreaway",
+})
+
+
+def is_score_value_key(key):
+    """True when this signature key holds a score rather than structure."""
+    return str(key).rsplit(".", 1)[-1].lower().replace("_", "") in _SCORE_VALUE_TAILS
+
+
+def score_values(signature):
+    """The score-valued subset of a signature; structural keys are dropped."""
+    return {key: value for key, value in (signature or {}).items()
+            if is_score_value_key(key)}
+
+
 def _first_field(value, names):
     wanted = {name.lower().replace("_", "") for name in names}
     if isinstance(value, dict):

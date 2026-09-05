@@ -158,7 +158,28 @@ GOAL_LATENCY_OBSERVER = _b("GOAL_LATENCY_OBSERVER", True)
 GOAL_LATENCY_POLL_MS = _f("GOAL_LATENCY_POLL_MS", 250.0)
 GOAL_LATENCY_LOOKBACK_S = _f("GOAL_LATENCY_LOOKBACK_S", 10.0)
 GOAL_LATENCY_AFTER_S = _f("GOAL_LATENCY_AFTER_S", 2.0)
-EVENT_MATCH_WINDOW_S = _f("EVENT_MATCH_WINDOW_S", 20.0)
+# Diagnostic +-seconds for associating a signal with the nearest same-match
+# provider event.  An audit-window default, never an entry or exit input, and
+# deliberately excluded from `STRATEGY_PARAM_NAMES` (it is listed under
+# `exporter._OBSERVABILITY_NAMES` instead), so changing it does not move
+# `config_id` and cannot re-partition the study.
+#
+# Was 20, guessed rather than measured, against a documented 18.635 s
+# observation lag on the Al-Shabab case -- about 1.4 s of margin (see
+# SPEC_CORRECTIONS C6, which asks for it to be set from data). Measured since:
+# provider `occurence_ts` to first observation is p50 15 s, and goal
+# observation minus bot entry is typically +12..+50 s, because the Kalshi score
+# feed lands 10-40 s after the market moves. At 20 s most genuinely goal-driven
+# trades therefore recorded `no_nearby_same_match_event`, which reads as "no
+# goal" and is wrong.
+#
+# 90 covers the measured upper tail with margin. The cost is a looser label:
+# association was already only a ground-truth label and never an explanation of
+# any individual trade (C6), and a wider window admits more coincidental
+# matches. That is the correct direction for a recall-limited measurement --
+# the association is reported alongside `state_consistent` / `state_mismatch`,
+# which is what separates a real match from a coincidence.
+EVENT_MATCH_WINDOW_S = _f("EVENT_MATCH_WINDOW_S", 90.0)
 
 # Forward price window recorded after every signal, accepted or declined, so a
 # decline is a labelled observation rather than a dead record.  Collection only:
