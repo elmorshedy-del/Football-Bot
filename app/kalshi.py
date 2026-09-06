@@ -235,6 +235,13 @@ class KalshiWS:
         self.max_backlog = 0
         self.feed_event_failures = 0
         # --- bounded-queue accounting ---
+        # Time the consumer coroutine actually spends working, and how many
+        # slices it got.  `consume_share` off these two says whether the feed
+        # falls behind because the work is expensive or because the coroutine
+        # rarely gets the loop -- the question every latency diagnosis in this
+        # codebase so far has answered by argument rather than measurement.
+        self.consume_ns = 0
+        self.consume_slices = 0
         self.queue_dropped_total = 0
         self.queue_overflow_events = 0
         self.queue_forced_reconnects = 0
@@ -784,6 +791,12 @@ class KalshiWS:
         slice_s = max(0.0, config.WS_CONSUMER_SLICE_MS) / 1000.0
         while True:
             raw, wall, mono = await queue.get()
+            # Wall-clock time this coroutine actually spends working, against
+            # the time it exists for.  It is the one number that separates "the
+            # consumer is slow" from "the consumer is starved", and the whole
+            # question of why the feed falls behind turns on which of those is
+            # true.  Two counter reads per slice, not per frame.
+            slice_started = time.perf_counter_ns()
             deadline = time.monotonic() + slice_s
             while True:
                 backlog = queue.qsize()
@@ -799,6 +812,8 @@ class KalshiWS:
                     raw, wall, mono = queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
+            self.consume_ns += time.perf_counter_ns() - slice_started
+            self.consume_slices += 1
             await asyncio.sleep(0)
 
     def _discard_backlog(self):
@@ -880,6 +895,8 @@ class KalshiWS:
             "queue_depth": self.queue_depth,
             "queue_max": config.WS_QUEUE_MAX,
             "queue_drop_policy": config.ws_queue_drop_policy(),
+            "consume_ms": round(self.consume_ns / 1e6, 3),
+            "consume_slices": self.consume_slices,
             "queue_dropped_total": self.queue_dropped_total,
             "queue_overflow_events": self.queue_overflow_events,
             "queue_forced_reconnects": self.queue_forced_reconnects,

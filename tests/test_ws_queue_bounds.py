@@ -346,7 +346,8 @@ class BoundedQueueTests(unittest.IsolatedAsyncioTestCase):
         # Patch the NAME `app.kalshi` binds, never `time.monotonic` itself: the
         # event loop reads the real one, and a frozen clock underneath it would
         # be measuring the harness rather than the code.
-        clock = SimpleNamespace(monotonic=lambda: now[0], time=lambda: 1_000.0)
+        clock = SimpleNamespace(monotonic=lambda: now[0], time=lambda: 1_000.0,
+                                perf_counter_ns=lambda: int(now[0] * 1e9))
         with patch("app.kalshi.time", clock):
             tasks = [asyncio.ensure_future(count_turns()),
                      asyncio.ensure_future(ws._consume(queue))]
@@ -887,3 +888,75 @@ class ReadinessOffTheLoopTests(unittest.TestCase):
         periodic = " ".join(
             inspect.getsource(engine_module.Engine.periodic_task).split())
         self.assertIn("store.read( store.latency_readiness)", periodic)
+
+
+class ConsumerShareTests(unittest.IsolatedAsyncioTestCase):
+    """Working time over uptime: starved, or saturated?
+
+    Every latency diagnosis in this codebase so far answered that by argument.
+    A4 attributed the backlog to SQLite commits on the loop and was wrong -- the
+    frame path issues 0.0008 statements per frame. The per-stage timers then
+    showed the whole frame path costing 2.6% of wall clock while the queue built
+    to 17,000, which says the consumer is not doing the expensive thing; it does
+    not by itself prove what is. This counter is the direct measurement: the
+    coroutine's own working time, against the time it existed for.
+    """
+
+    def setUp(self):
+        self.events = []
+
+    def make_ws(self, **overrides):
+        with patch("app.kalshi._load_private_key", return_value=None):
+            ws = KalshiWS(lambda msg, wall, mono, backlog=0: None)
+        for name, value in {"WS_QUEUE_MAX": 0, "WS_CONSUMER_SLICE_MS": 5.0,
+                            **overrides}.items():
+            patcher = patch.object(config, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        return ws
+
+    async def drain(self, ws, frames, cost_ms):
+        queue = asyncio.Queue()
+        for index in range(frames):
+            queue.put_nowait((trade_frame("A", index), 1.0, 1.0))
+        now = [0.0]
+
+        async def handle(raw, wall, mono, backlog):
+            now[0] += cost_ms / 1000.0
+
+        ws._handle_raw = handle
+        clock = SimpleNamespace(monotonic=lambda: now[0], time=lambda: 1_000.0,
+                                perf_counter_ns=lambda: int(now[0] * 1e9))
+        with patch("app.kalshi.time", clock):
+            task = asyncio.ensure_future(ws._consume(queue))
+            for _ in range(frames * 4):
+                if queue.empty():
+                    break
+                await asyncio.sleep(0)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def test_the_counter_measures_the_work_the_consumer_actually_did(self):
+        ws = self.make_ws()
+        await self.drain(ws, frames=200, cost_ms=1.0)
+
+        # 200 frames at 1 ms each, whatever the loop did around them.
+        self.assertAlmostEqual(ws.consume_ns / 1e6, 200.0, delta=5.0)
+        self.assertGreater(ws.consume_slices, 0)
+        self.assertEqual(ws.status()["consume_ms"], round(ws.consume_ns / 1e6, 3))
+
+    async def test_slices_are_counted_so_the_share_can_be_read_per_slice(self):
+        ws = self.make_ws(WS_CONSUMER_SLICE_MS=5.0)
+        await self.drain(ws, frames=200, cost_ms=1.0)
+
+        # ~6 frames per 5 ms slice, so ~33 slices for 200 frames.
+        self.assertGreaterEqual(ws.consume_slices, 25)
+        self.assertLessEqual(ws.consume_slices, 40)
+
+    async def test_an_idle_consumer_reports_no_working_time(self):
+        ws = self.make_ws()
+        self.assertEqual(ws.consume_ns, 0)
+        self.assertEqual(ws.status()["consume_ms"], 0.0)

@@ -16,6 +16,43 @@ work into `main`).
 **Deployment status:** the 2026-09-05 work IS now deployed; this section's
 entries are not, unless an entry says otherwise.
 
+### CHG-2026-09-06-006 — Measure the consumer's own share of the wall clock
+
+**Commit:** this change
+**Components:** `app/kalshi.py` (`_consume`, `status()`), `app/engine.py`
+(`status()`), `tests/test_ws_queue_bounds.py`
+
+**Observed / original behaviour.** The stage timers established what the frame
+path costs (2.6-4.2% of wall clock) but not why the queue still builds under
+burst load. Those are different claims: "the consumer is not doing the expensive
+thing" does not establish "the consumer rarely gets to run".
+
+The first readings after CHG-2026-09-06-005 confirm the fix and rule out the two
+remaining loop residents as the cause. `status()` fell from **104 ms to
+0.54-1.33 ms** per call — the snapshot works — and `periodic` totals 941 ms over
+358 s, 0.26% of wall clock, though its **230 ms max** is a real single-turn stall
+worth chasing separately. With everything measured summing to 3.75% and the
+queue still reaching 7,932 with 1,621 frames dropped, the missing quantity is
+the consumer's own share of the wall clock, and nothing reported it.
+
+**Root cause.** Every latency diagnosis in this codebase so far — A4 included,
+which attributed the backlog to SQLite commits and was wrong — reasoned about
+this quantity instead of measuring it.
+
+**Change.** `_consume` accumulates the wall-clock time it spends inside its
+drain loop (`consume_ns`) and how many slices it got (`consume_slices`), and
+`status()` reports both plus `consume_share` = working time over uptime. Two
+counter reads per slice, not per frame. A share near the frame path's own cost
+means the coroutine is starved; a share near 1 means it is saturated and the
+work itself is the problem. The two readings are not otherwise distinguishable
+from outside.
+
+**Verification.** 3 tests: the counter measures the work actually done (200
+frames at 1 ms each read back as 200 ms whatever the loop did around them),
+slices are counted so the share can be read per slice, and an idle consumer
+reports zero. Full gate: 629 tests OK, `compileall`, `ruff`, `node --check`,
+`git diff --check`.
+
 ### CHG-2026-09-06-005 — The frame path is not the bottleneck: take `status()`'s 18 queries off the loop
 
 **Commit:** this change
