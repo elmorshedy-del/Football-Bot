@@ -54,6 +54,13 @@ class ExportCancelled(Exception):
 _OBSERVABILITY_NAMES = (
     "GOAL_LATENCY_OBSERVER", "GOAL_LATENCY_POLL_MS", "GOAL_LATENCY_LOOKBACK_S",
     "GOAL_LATENCY_AFTER_S", "EVENT_MATCH_WINDOW_S",
+    # Transport bounds.  They decide which frames the study got to see -- a
+    # bundle captured under a bounded queue may contain deliberate holes -- so
+    # a replay must be able to read them off the manifest.  They cannot change
+    # a decision made about a frame that WAS seen, so they stay out of the
+    # strategy identity.
+    "WS_QUEUE_MAX", "WS_QUEUE_DROP_POLICY", "WS_QUEUE_OVERFLOW_REPORT_S",
+    "WS_QUEUE_STALL_S", "WS_QUEUE_STALL_DEPTH", "WS_RECONNECT_MIN_INTERVAL_S",
 )
 
 

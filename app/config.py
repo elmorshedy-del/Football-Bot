@@ -299,6 +299,69 @@ def raw_archive_ready():
     )
 
 
+# --- WebSocket arrival queue bounds -----------------------------------------
+# TRANSPORT knobs.  They are deliberately absent from `STRATEGY_PARAM_NAMES`:
+# they decide which frames this process gets to see, not what it does with the
+# ones it sees.  Gate A detection, confirmation, sizing, entry, exit, fee,
+# lockout and settlement read none of them.
+#
+# The queue between the socket reader and the frame consumer was unbounded on
+# purpose, so its depth would measure the processing backlog.  In production on
+# 2026-09-05 that made a consumer stall silent and unbounded instead: the reader
+# kept up (feed lag p50 63-148 ms) while the backlog reached 896,017 frames and
+# settled near 556,000, `order_arrival_ms` reached p95 2,280,666 ms (38 minutes)
+# and max 2,895,826 ms, and the process held 3.77 GB of an 8 GB limit at 0.12 of
+# 8 vCPU.  The bot went on "entering" against 77-minute-old book state for
+# matches that had already finished and booking the settlement that was queued
+# behind it, which fabricated about +$281 of paper profit across trades 110-114.
+#
+# A bound cannot make a slow consumer fast.  What it can do is convert an
+# invisible, unbounded loss of currency into an explicit, counted, ledgered loss
+# of frames -- which is the honest failure, and the one the old single-coroutine
+# design used to produce naturally when Kalshi dropped a backed-up socket.
+WS_QUEUE_MAX = _i("WS_QUEUE_MAX", 20000)
+# `oldest` drops from the head of the queue.  For trading, the newest market
+# state is the only state worth having: a frame that has already waited behind
+# 20,000 others cannot inform a decision, and processing it produces a fill
+# price the exchange stopped offering minutes ago.  Anything else is normalised
+# to `oldest` (see `ws_queue_drop_policy`) rather than silently disabling the
+# bound.
+WS_QUEUE_DROP_POLICY = os.environ.get("WS_QUEUE_DROP_POLICY", "oldest")
+WS_QUEUE_DROP_POLICIES = ("oldest",)
+# One overflow summary per this many seconds, so an overflow storm cannot itself
+# become the bottleneck.  A newly affected market is disclosed immediately
+# regardless: its book must be invalidated before the consumer can fill from it.
+WS_QUEUE_OVERFLOW_REPORT_S = _f("WS_QUEUE_OVERFLOW_REPORT_S", 1.0)
+# Stall guard.  A queue held above the high-water mark for this long is a
+# consumer that is not going to recover on its own; a reconnect drains it and
+# re-subscribes, which yields fresh snapshots.  Fresh snapshots are strictly
+# better than a deep queue of stale deltas.
+WS_QUEUE_STALL_S = _f("WS_QUEUE_STALL_S", 60.0)
+# Depth the stall guard watches.  0 derives it as half of `WS_QUEUE_MAX`, and
+# leaves the guard off when the queue is unbounded.
+WS_QUEUE_STALL_DEPTH = _i("WS_QUEUE_STALL_DEPTH", 0)
+WS_QUEUE_STALL_POLL_S = _f("WS_QUEUE_STALL_POLL_S", 1.0)
+# Floor on the interval between two FORCED reconnects, so the guard cannot
+# thrash a feed that reconnects into the same backlog.
+WS_RECONNECT_MIN_INTERVAL_S = _f("WS_RECONNECT_MIN_INTERVAL_S", 120.0)
+
+
+def ws_queue_drop_policy():
+    """The active drop policy, normalised.  Unknown values mean `oldest`.
+
+    Failing closed here would mean an unbounded queue, which is the defect.
+    """
+    policy = (WS_QUEUE_DROP_POLICY or "").strip().lower()
+    return policy if policy in WS_QUEUE_DROP_POLICIES else "oldest"
+
+
+def ws_queue_stall_depth():
+    """Effective stall high-water mark; 0 disables the guard."""
+    if WS_QUEUE_STALL_DEPTH > 0:
+        return WS_QUEUE_STALL_DEPTH
+    return WS_QUEUE_MAX // 2 if WS_QUEUE_MAX > 0 else 0
+
+
 # --- Market discovery ---
 DISCOVERY_INTERVAL_S = _i("DISCOVERY_INTERVAL_S", 180)
 SUBSCRIBE_BEFORE_CLOSE_MIN = _i("SUBSCRIBE_BEFORE_CLOSE_MIN", 150)  # watch markets closing within this
