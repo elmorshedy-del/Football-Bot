@@ -762,3 +762,77 @@ class OverflowInvalidatesBooksInTheEngineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StageCostTests(unittest.TestCase):
+    """Where the per-frame cost goes -- measured, not attributed by argument.
+
+    The consumer's cost per frame is what decides how far behind the exchange
+    this process runs.  The in-process benchmark says ~65 us of work per frame;
+    production on 2026-09-06 sustained 320-470 frames/s, which is 2-3 ms.
+    Nothing measured the difference, so every explanation for it was a guess --
+    and Part E of the investigation records what guessing cost the last time:
+    every instrumentation layer added since 2026-08-30 ran on the trading loop
+    and became the latency it had been added to explain.
+
+    So the two properties that matter for this particular instrument are that it
+    reports the stages truthfully, and that it is far too cheap to be the thing
+    it is measuring.
+    """
+
+    def engine(self):
+        eng = engine_module.Engine.__new__(engine_module.Engine)
+        eng._stages = None
+        return eng
+
+    def test_each_stage_is_reported_with_its_own_count_and_cost(self):
+        eng = self.engine()
+        for _ in range(3):
+            with eng.stage("book_apply"):
+                pass
+        with eng.stage("on_book"):
+            pass
+
+        costs = eng.stage_costs()
+        self.assertEqual(sorted(costs), ["book_apply", "on_book"])
+        self.assertEqual(costs["book_apply"]["n"], 3)
+        self.assertEqual(costs["on_book"]["n"], 1)
+        for row in costs.values():
+            self.assertGreaterEqual(row["total_ms"], 0.0)
+            self.assertGreaterEqual(row["max_ms"], 0.0)
+            self.assertIsNotNone(row["mean_us"])
+
+    def test_a_raising_stage_is_still_counted_and_still_raises(self):
+        """A stage that fails is exactly the one worth having measured."""
+        eng = self.engine()
+        with self.assertRaises(ValueError):
+            with eng.stage("book_apply"):
+                raise ValueError("frame rejected")
+
+        self.assertEqual(eng.stage_costs()["book_apply"]["n"], 1)
+
+    def test_two_engines_never_share_timings(self):
+        first, second = self.engine(), self.engine()
+        with first.stage("record"):
+            pass
+
+        self.assertEqual(second.stage_costs(), {})
+
+    def test_an_engine_with_no_frames_yet_reports_nothing_not_an_error(self):
+        self.assertEqual(self.engine().stage_costs(), {})
+
+    def test_the_measurement_costs_far_less_than_what_it_measures(self):
+        """It is on the trading loop, so its own cost is a correctness
+        property, not a nicety.  The budget is the 2-3 ms per frame being
+        explained; anything near that would be self-defeating."""
+        eng = self.engine()
+        rounds = 20_000
+        start = time.perf_counter()
+        for _ in range(rounds):
+            with eng.stage("record"):
+                pass
+        per_call_us = (time.perf_counter() - start) / rounds * 1e6
+
+        self.assertLess(per_call_us, 50.0,
+                        f"stage timing costs {per_call_us:.2f} us per frame")
+        self.assertEqual(eng.stage_costs()["record"]["n"], rounds)

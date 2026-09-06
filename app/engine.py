@@ -4,6 +4,7 @@ import json
 import re
 import time
 from collections import deque
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from . import config, store
@@ -112,6 +113,10 @@ def _clock_coverage_check(coverage):
 
 
 class Engine:
+    # Replaced by a per-instance dict on first use.  A class-level default
+    # rather than a class-level dict, so no two engines can ever share timings.
+    _stages = None
+
     def __init__(self, queue):
         self.q = queue
         self._signal_paths = deque()
@@ -175,6 +180,9 @@ class Engine:
         self._feed_lag_tick = deque(maxlen=20_000)
         self._backlog_tick = 0
         self.feed_backlog = 0
+        # stage name -> [count, total_ns, max_ns].  A list, not a tuple or a
+        # dataclass: it is updated in place on the hot path.
+        self._stages = {}
         self._feed_event_failures = 0
         self._feed_event_tasks = set()
         self._path_write_tasks = set()
@@ -354,6 +362,61 @@ class Engine:
                                    "spark": deque(maxlen=180), "dirty": False}
         return self.prices[ticker]
 
+    @contextmanager
+    def stage(self, name):
+        """Time one stage of the frame path.  Measurement only, never a write.
+
+        The consumer's cost per frame is the binding constraint on how far
+        behind the exchange this process runs, and until now nothing measured
+        where it went: the in-process benchmark says ~65 us of work per frame
+        while production sustains 320-470 frames/s, which is 2-3 ms.  Attributing
+        that gap was guesswork, and Part E of the investigation records what
+        guesswork cost last time -- every instrumentation layer added since
+        2026-08-30 ran on the trading loop and became the latency it was added
+        to explain.
+
+        So this is two `perf_counter_ns` calls and three integer updates into a
+        plain dict, on the loop, with no I/O per frame.  Measured at **1.14 us
+        per stage** including the context-manager machinery, so about 5.7 us for
+        the five stages on a book frame, against the 2-3 ms being explained:
+        0.2-0.3% of it.  Exposed through `status()` and differenced by the
+        reader; nothing here is persisted.
+        """
+        start = time.perf_counter_ns()
+        try:
+            yield
+        finally:
+            elapsed = time.perf_counter_ns() - start
+            stages = self._stages
+            if stages is None:
+                # Tests build an Engine without running `__init__`; timing must
+                # never be the reason a frame fails to route.
+                stages = self._stages = {}
+            row = stages.get(name)
+            if row is None:
+                stages[name] = [1, elapsed, elapsed]
+            else:
+                row[0] += 1
+                row[1] += elapsed
+                if elapsed > row[2]:
+                    row[2] = elapsed
+
+    def stage_costs(self):
+        """Per-stage cumulative cost, in the units an operator reads.
+
+        Cumulative on purpose: a caller that wants a rate differences two reads,
+        and nothing has to decide for them how long a window is.
+        """
+        return {
+            name: {
+                "n": count,
+                "total_ms": round(total / 1e6, 3),
+                "mean_us": round(total / count / 1e3, 2) if count else None,
+                "max_ms": round(worst / 1e6, 3),
+            }
+            for name, (count, total, worst) in sorted((self._stages or {}).items())
+        }
+
     def _record_market_observation(self, ticker, kind, wall, mono):
         """Keep an in-memory arrival timeline; never calls strategy code or SQLite."""
         meta = self.meta.get(ticker)
@@ -434,26 +497,36 @@ class Engine:
             self.n_foreign += 1
             return
         if t in ("orderbook_snapshot", "orderbook_delta", "trade", "market_lifecycle_v2"):
-            self.recorder.write(msg, proc_wall, proc_mono,
-                                arrival_wall=wall, arrival_mono=mono, backlog=backlog)
+            with self.stage("record"):
+                self.recorder.write(msg, proc_wall, proc_mono,
+                                    arrival_wall=wall, arrival_mono=mono,
+                                    backlog=backlog)
         if t == "orderbook_snapshot":
             b = self.books.setdefault(ticker, Book())
-            b.apply_snapshot(body, msg.get("seq"), arrival_wall=wall)
-            self.desk.apply_book_snapshot(ticker, b)
-            self.on_book(ticker)
-            self._record_market_observation(ticker, "book", wall, mono)
+            with self.stage("book_apply"):
+                b.apply_snapshot(body, msg.get("seq"), arrival_wall=wall)
+                self.desk.apply_book_snapshot(ticker, b)
+            with self.stage("on_book"):
+                self.on_book(ticker)
+            with self.stage("observe"):
+                self._record_market_observation(ticker, "book", wall, mono)
         elif t == "orderbook_delta":
             b = self.books.setdefault(ticker, Book())
-            if not b.apply_delta(body, msg.get("seq"), sequence_validated=True,
-                                 arrival_wall=wall):
+            with self.stage("book_apply"):
+                applied = b.apply_delta(body, msg.get("seq"),
+                                        sequence_validated=True, arrival_wall=wall)
+                if applied:
+                    self.desk.apply_book_delta(ticker, body, msg.get("seq"),
+                                               arrival_wall=wall)
+            if not applied:
                 self.desk.invalidate_books([ticker])
                 if self.ws:
                     asyncio.get_event_loop().create_task(self.ws.request_snapshot(ticker))
             else:
-                self.desk.apply_book_delta(ticker, body, msg.get("seq"),
-                                           arrival_wall=wall)
-                self.on_book(ticker)
-                self._record_market_observation(ticker, "book", wall, mono)
+                with self.stage("on_book"):
+                    self.on_book(ticker)
+                with self.stage("observe"):
+                    self._record_market_observation(ticker, "book", wall, mono)
         elif t == "trade":
             ts_ms = body.get("ts_ms") or (body.get("ts", 0) * 1000)
             px = float(body.get("yes_price_dollars", 0)) * 100
@@ -463,9 +536,11 @@ class Engine:
             lag = wall * 1000 - ts_ms
             self.feed_lag.append(lag)
             self._feed_lag_tick.append(lag)
-            self.process_trade(ticker, int(ts_ms), px, sz, body.get("taker_side"), wall,
-                               proc_wall=proc_wall, backlog=backlog)
-            self._record_market_observation(ticker, "trade", wall, mono)
+            with self.stage("process_trade"):
+                self.process_trade(ticker, int(ts_ms), px, sz, body.get("taker_side"),
+                                   wall, proc_wall=proc_wall, backlog=backlog)
+            with self.stage("observe"):
+                self._record_market_observation(ticker, "trade", wall, mono)
         elif t == "market_lifecycle_v2":
             res = body.get("settled_result") or body.get("result")
             if res in ("yes", "no"):
@@ -1665,6 +1740,9 @@ class Engine:
                 # background task refreshes off the loop.
                 "archive": archive_status,
                 "feed_event_failures": getattr(self, "_feed_event_failures", 0),
+                # Where the per-frame cost actually goes.  Cumulative since
+                # start; difference two reads for a rate.
+                "consumer_stages": self.stage_costs(),
                 # Every measured number beside the bound it is supposed to
                 # respect, so an operator can see at a glance which ones are
                 # doing what they were meant to.  Observation only: it reuses
