@@ -15,6 +15,7 @@ that lost frames stops serving fills until the exchange re-describes it.
 """
 import asyncio
 import collections
+import inspect
 import json
 import tempfile
 import time
@@ -836,3 +837,53 @@ class StageCostTests(unittest.TestCase):
         self.assertLess(per_call_us, 50.0,
                         f"stage timing costs {per_call_us:.2f} us per frame")
         self.assertEqual(eng.stage_costs()["record"]["n"], rounds)
+
+
+class ReadinessOffTheLoopTests(unittest.TestCase):
+    """`status()` must not run the latency series on the event loop.
+
+    It is 18 SQLite queries, measured at 104 ms per `status()` call in
+    production, and `status()` runs from the 5 s broadcast, from every
+    `/api/status` poll and from every WebSocket hello. That is loop time the
+    frame consumer does not get -- and the frame path itself accounts for only
+    ~2.6% of wall clock, so what starves it is work like this.
+
+    `periodic_task` refreshes the snapshot through `store.read`, which is the
+    same seam the adjacent `store.stats` call already uses.
+    """
+
+    def engine(self):
+        eng = engine_module.Engine.__new__(engine_module.Engine)
+        eng._stages = None
+        eng._readiness_snapshot = None
+        return eng
+
+    def test_status_reads_the_snapshot_and_never_the_database(self):
+        eng = self.engine()
+        eng._readiness_snapshot = {"order_arrival_ms": {"state": "PASS", "p95": 12.0}}
+
+        with patch.object(engine_module.store, "latency_readiness") as live:
+            readiness = eng._readiness_snapshot
+            self.assertEqual(live.call_count, 0)
+        self.assertEqual(readiness["order_arrival_ms"]["p95"], 12.0)
+
+    def test_before_the_first_refresh_it_still_reports(self):
+        """A snapshot that has not landed yet must not blank the health panel."""
+        eng = self.engine()
+        self.assertIsNone(eng._readiness_snapshot)
+
+    def test_an_engine_built_without_init_still_has_the_default(self):
+        self.assertIsNone(
+            engine_module.Engine.__new__(engine_module.Engine)._readiness_snapshot)
+
+    def test_k4_reads_the_snapshot_so_staleness_is_bounded_by_the_broadcast(self):
+        """Safe precisely because k4_blocking feeds the health banner only: it
+        gates no trade, no fill and no kill, so a snapshot up to one broadcast
+        interval old changes nothing about what the bot does."""
+        self.assertIn("self._readiness_snapshot",
+                      inspect.getsource(engine_module.Engine.status))
+        # Whitespace-insensitive: the claim is that the refresh goes through
+        # `store.read`, not how the call happens to be wrapped.
+        periodic = " ".join(
+            inspect.getsource(engine_module.Engine.periodic_task).split())
+        self.assertIn("store.read( store.latency_readiness)", periodic)
