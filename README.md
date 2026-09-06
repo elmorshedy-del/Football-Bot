@@ -363,6 +363,14 @@ risk, and follow-ups. Read it before changing strategy behaviour: several
 entries exist because a plausible-looking change was measured and rejected.
 Appending to it is mandatory, in the format `AGENTS.md` prescribes.
 
+[`docs/INVESTIGATION_2026_09.md`](docs/INVESTIGATION_2026_09.md) is the standing
+account of what the bot is actually doing and what the evidence does and does not
+support: the funnel, where the edge appears to be and how small that sample is,
+which numbers in the ledger cannot be trusted and why, and the experiments worth
+running next. Read it before believing a P&L figure — one of its own sections
+retracts the profitability numbers in another, and a later one retracts an
+earlier diagnosis of the latency.
+
 ## Architecture
 
 ```mermaid

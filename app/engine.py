@@ -1770,6 +1770,16 @@ class Engine:
                                           if ws is not None else 0),
                 "queue_forced_reconnects": (ws.queue_forced_reconnects
                                             if ws is not None else 0),
+                # The consumer's own share of wall clock: working time over
+                # uptime.  A share near the frame path's own cost means the
+                # coroutine is starved; a share near 1 means it is saturated.
+                "consume_ms": (round(ws.consume_ns / 1e6, 3)
+                               if ws is not None else 0.0),
+                "consume_slices": (ws.consume_slices if ws is not None else 0),
+                "consume_share": (
+                    round(ws.consume_ns / 1e9 / uptime, 5)
+                    if ws is not None and (uptime := time.time() - self.started) > 0
+                    else None),
                 # Continuity of the raw archive: the same block the study
                 # manifest and `GET /api/archive` carry, plus how the archive
                 # task itself is behaving.  Read from a cached snapshot the
