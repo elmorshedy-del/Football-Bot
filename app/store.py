@@ -2043,6 +2043,63 @@ def _latency_evidence(mode=None):
     }
 
 
+# Below this the disclosure is off; the desk's own guard supersedes it when set.
+STALE_FILL_DISCLOSURE_MS = 5000.0
+
+
+def _stale_fill_threshold_ms():
+    """The book age above which a fill is disclosed as taken from a stale book.
+
+    `PAPER_MAX_BOOK_AGE_MS` is the line the desk now refuses at, so it is the
+    honest line to report against; when the guard is off the fixed disclosure
+    bound still applies, because the trades that need disclosing are precisely
+    the ones taken before any guard existed.
+    """
+    configured = config.PAPER_MAX_BOOK_AGE_MS
+    return configured if configured and configured > 0 else STALE_FILL_DISCLOSURE_MS
+
+
+def _stale_fills(closed, threshold_ms=None):
+    """Closed trades whose ENTRY was filled against an already-old book.
+
+    Not a hardcoded list of trade ids: the condition is measured, from the
+    `book_age_ms` every fill records (CHG-2026-09-05-012), so it keeps holding
+    for any future stall and needs no maintenance.
+
+    Why it is disclosed rather than removed: those fills are a true record of
+    what the bot did, and deleting them from the aggregate would hide a defect
+    instead of showing it.  The headline stays the whole ledger; this says how
+    much of it was priced against market state that had already moved on.
+
+    Trades from before the capture pass have no `book_age_ms` at all.  They are
+    counted as `unknown` — never as clean — because "not measured" and "measured
+    and fine" are different claims.
+    """
+    threshold = _stale_fill_threshold_ms() if threshold_ms is None else threshold_ms
+    stale, unknown, worst = [], 0, None
+    for trade in closed:
+        try:
+            context = json.loads(trade.get("entry_context") or "{}")
+        except (TypeError, ValueError):
+            context = {}
+        age = context.get("book_age_ms")
+        if not isinstance(age, (int, float)) or isinstance(age, bool):
+            unknown += 1
+            continue
+        worst = age if worst is None else max(worst, age)
+        if age > threshold:
+            stale.append(trade)
+    return {
+        "n": len(stale),
+        "net": round(sum(t.get("net") or 0 for t in stale), 4),
+        "gross": round(sum(t.get("gross") or 0 for t in stale), 4),
+        "trade_ids": sorted(t["id"] for t in stale if t.get("id") is not None),
+        "unmeasured": unknown,
+        "max_book_age_ms": worst,
+        "threshold_ms": threshold,
+    }
+
+
 def _strategy_summary(closed, open_t, signals, latency_evidence):
     n = len(closed)
     gross = sum(t.get("gross") or 0 for t in closed)
@@ -2111,6 +2168,9 @@ def _strategy_summary(closed, open_t, signals, latency_evidence):
         "open_partial_realized_gross": round(open_realized_gross, 2),
         "open_accrued_fees": round(open_accrued_fees, 2),
         "open_partial_realized_net": round(open_realized_gross - open_accrued_fees, 2),
+        # How much of the headline was priced against a book that had already
+        # gone stale.  Disclosed beside the total, never subtracted from it.
+        "stale_fills": _stale_fills(closed),
         "evidence": evidence,
     }
 

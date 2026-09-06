@@ -265,6 +265,98 @@ class EntryContextTests(unittest.TestCase):
             self.assertNotEqual(config.config_id(), before)
 
 
+class StaleFillDisclosureTests(unittest.TestCase):
+    """How much of the headline was priced against a book that had moved on.
+
+    Production, 2026-09-05: with the arrival queue unbounded, trades 110-114
+    "entered" against book state 41-79 minutes old for matches that had already
+    finished, and booked the settlement queued behind them — about +$281 of
+    fabricated paper profit sitting inside the reported net.
+    `PAPER_MAX_BOOK_AGE_MS` now refuses those fills, but the trades that were
+    taken before it existed are still in the ledger and still in the total.
+
+    They are disclosed, never subtracted: they are a true record of what the bot
+    did, and removing them from the aggregate would hide the defect rather than
+    show it. The condition is measured from each fill's own `book_age_ms`, not a
+    hardcoded list of ids, so it keeps holding for any future stall.
+    """
+
+    def setUp(self):
+        self._dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._dir.cleanup)
+        patcher = patch.object(config, "DATA_DIR", self._dir.name)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        if store._conn is not None:
+            store._conn.close()
+        store._conn = None
+        store.init()
+        store.set_mode("live")
+        self.addCleanup(self.close_store)
+
+    def close_store(self):
+        if store._conn is not None:
+            store._conn.close()
+        store._conn = None
+
+    def trade(self, net, book_age_ms, trade_id):
+        """A closed trade row, written directly: this is a test of how the
+        aggregate reads entry_context, not of how a fill gets written."""
+        context = (None if book_age_ms is None
+                   else json.dumps({"book_age_ms": book_age_ms}))
+        store.ex(
+            """INSERT INTO trades(id,signal_id,market,event,series,dir,side,
+                 entry_ts,entry_px,size,status,exit_ts,exit_px,exit_reason,
+                 gross,fees,net,mode,strategy,entry_context)
+               VALUES(?,?,'T','E','S',1,'yes',1.0,50.0,100,'closed',2.0,60.0,
+                 'timeout',?,1.0,?,'live','gate_a',?)""",
+            (trade_id, trade_id, net + 1.0, net, context))
+
+    def disclosure(self):
+        store._stats_cache.clear()
+        return store.stats()["sleeves"]["gate_a"]["stale_fills"]
+
+    def test_a_fill_taken_from_an_old_book_is_named_with_what_it_contributed(self):
+        self.trade(net=107.87, book_age_ms=4_572_000.0, trade_id=112)
+        self.trade(net=5.0, book_age_ms=300.0, trade_id=115)
+
+        disclosed = self.disclosure()
+        self.assertEqual(disclosed["n"], 1)
+        self.assertEqual(disclosed["trade_ids"], [112])
+        self.assertEqual(disclosed["net"], 107.87)
+        self.assertEqual(disclosed["threshold_ms"], store.STALE_FILL_DISCLOSURE_MS)
+        self.assertEqual(disclosed["max_book_age_ms"], 4_572_000.0)
+
+    def test_the_headline_still_carries_every_trade(self):
+        """Disclosed beside the total, never quietly removed from it."""
+        self.trade(net=107.87, book_age_ms=4_572_000.0, trade_id=112)
+        self.trade(net=5.0, book_age_ms=300.0, trade_id=115)
+
+        summary = store.stats()["sleeves"]["gate_a"]
+        self.assertEqual(summary["closed"], 2)
+        self.assertEqual(summary["net"], 112.87)
+
+    def test_a_fill_with_no_recorded_age_is_unmeasured_never_clean(self):
+        """Trades from before the capture pass have no book_age_ms at all.
+        "Not measured" and "measured and fine" are different claims."""
+        self.trade(net=-3.0, book_age_ms=None, trade_id=42)
+
+        disclosed = self.disclosure()
+        self.assertEqual(disclosed["n"], 0)
+        self.assertEqual(disclosed["unmeasured"], 1)
+        self.assertIsNone(disclosed["max_book_age_ms"])
+
+    def test_the_line_follows_the_guard_the_desk_actually_refuses_at(self):
+        self.trade(net=1.0, book_age_ms=3_000.0, trade_id=1)
+
+        with patch.object(config, "PAPER_MAX_BOOK_AGE_MS", 5_000.0):
+            self.assertEqual(self.disclosure()["n"], 0)
+        with patch.object(config, "PAPER_MAX_BOOK_AGE_MS", 1_000.0):
+            disclosed = self.disclosure()
+        self.assertEqual(disclosed["n"], 1)
+        self.assertEqual(disclosed["threshold_ms"], 1_000.0)
+
+
 class ExitContextTests(unittest.TestCase):
     def setUp(self):
         self._dir = tempfile.TemporaryDirectory()
