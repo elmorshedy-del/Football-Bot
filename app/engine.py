@@ -1536,31 +1536,40 @@ class Engine:
             # one of the few things that can starve the frame consumer.  Timed
             # for the same reason the frame path is: so the next question about
             # where the loop goes is answered from data.
+            # Sub-staged, because the tick as a whole was measured at a 528 ms
+            # max on the live loop: half a second in which the frame consumer
+            # gets nothing.  Which of these five phases owns that is exactly the
+            # kind of question this codebase has previously answered by argument.
             with self.stage("periodic"):
-                self.desk.check_timeouts()
+                with self.stage("periodic.timeouts"):
+                    self.desk.check_timeouts()
                 # expire stale pendings
                 now = time.time()
                 # A near miss on a market that then goes quiet would otherwise
                 # sit held until its next trade, which may never come before the
                 # match ends.  Flushing on the same clock bounds that wait.
-                self.detector.flush_subthreshold(now * 1000.0)
+                with self.stage("periodic.subthreshold"):
+                    self.detector.flush_subthreshold(now * 1000.0)
                 # Also retries startup watches when no new book frame arrives.
-                self._expire_signal_paths(now)
-                for p in [p for p in self.pending if now >= p["deadline"]]:
-                    self.record_signal(p["cand"], None, "unconfirmed")
-                self.pending = [p for p in self.pending if now < p["deadline"]]
+                with self.stage("periodic.paths"):
+                    self._expire_signal_paths(now)
+                with self.stage("periodic.pending"):
+                    for p in [p for p in self.pending if now >= p["deadline"]]:
+                        self.record_signal(p["cand"], None, "unconfirmed")
+                    self.pending = [p for p in self.pending if now < p["deadline"]]
                 # coalesced price updates
-                dirty = []
-                for tk, ps in self.prices.items():
-                    if ps["dirty"]:
-                        ps["dirty"] = False
-                        m = self.meta.get(tk, {})
-                        dirty.append({"ticker": tk, "event": m.get("event"),
-                                      "series": m.get("series"), "last": ps["last"],
-                                      "bid": ps["bid"], "ask": ps["ask"],
-                                      "late": self.is_late(tk)})
-                if dirty:
-                    self.broadcast({"type": "prices", "prices": dirty})
+                with self.stage("periodic.prices"):
+                    dirty = []
+                    for tk, ps in self.prices.items():
+                        if ps["dirty"]:
+                            ps["dirty"] = False
+                            m = self.meta.get(tk, {})
+                            dirty.append({"ticker": tk, "event": m.get("event"),
+                                          "series": m.get("series"),
+                                          "last": ps["last"], "bid": ps["bid"],
+                                          "ask": ps["ask"], "late": self.is_late(tk)})
+                    if dirty:
+                        self.broadcast({"type": "prices", "prices": dirty})
             if now - last_stats > 5:
                 last_stats = now
                 self._flush_feed_latency()
