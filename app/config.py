@@ -344,6 +344,20 @@ WS_QUEUE_STALL_POLL_S = _f("WS_QUEUE_STALL_POLL_S", 1.0)
 # Floor on the interval between two FORCED reconnects, so the guard cannot
 # thrash a feed that reconnects into the same backlog.
 WS_RECONNECT_MIN_INTERVAL_S = _f("WS_RECONNECT_MIN_INTERVAL_S", 120.0)
+# How long the frame consumer may hold the event loop before yielding.  It
+# replaces a fixed 16-frames-per-turn yield, which capped throughput at 16
+# frames per event-loop turn regardless of how cheap a frame was or how much
+# CPU was idle: at the measured scheduler lag (p50 19 ms, p95 165 ms) that is
+# 97-800 frames/s, against ~19,000 frames/s of actual capacity.  5 ms is small
+# beside that lag, so nothing else on the loop waits materially longer, and it
+# is roughly 75 frames at the measured per-frame cost.  0 restores the old
+# yield-after-every-frame behaviour.
+WS_CONSUMER_SLICE_MS = _f("WS_CONSUMER_SLICE_MS", 5.0)
+# Minimum interval before recovery re-asks for a market's snapshot.  Recovery
+# used to send one `get_snapshot` per rejected delta and re-request every market
+# on every gap; under load that made recovery the largest single load on the
+# process it was recovering.
+WS_SNAPSHOT_RETRY_S = _f("WS_SNAPSHOT_RETRY_S", 5.0)
 
 
 def ws_queue_drop_policy():
