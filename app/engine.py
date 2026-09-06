@@ -410,11 +410,22 @@ class Engine:
                 book = self.books.get(tk)
                 if book is not None:
                     book.ok = False
-            store.log_event(
-                "book",
-                f"sequence gap sid={body.get('sid')} expected={body.get('expected')} "
-                f"received={body.get('received')}; awaiting fresh snapshots",
-            )
+            # `book.ok` is the gate every fill path checks, and only a fresh
+            # snapshot sets it back: a book that lost frames cannot serve a fill
+            # again until the exchange has re-described it.
+            if body.get("reason") == "queue_overflow":
+                store.log_event(
+                    "book",
+                    f"arrival queue overflow sid={body.get('sid')} dropped="
+                    f"{body.get('dropped')}; invalidated {len(tickers)} book(s); "
+                    "awaiting fresh snapshots",
+                )
+            else:
+                store.log_event(
+                    "book",
+                    f"sequence gap sid={body.get('sid')} expected={body.get('expected')} "
+                    f"received={body.get('received')}; awaiting fresh snapshots",
+                )
             return
         ticker = body.get("market_ticker")
         # defense-in-depth: ignore anything we didn't explicitly subscribe to
@@ -1633,6 +1644,19 @@ class Engine:
                                  else getattr(self, "feed_backlog", 0)),
                 "feed_backlog_max": (ws.max_backlog if ws is not None
                                      else getattr(self, "_backlog_tick", 0)),
+                # The arrival queue is bounded, so its depth is no longer the
+                # whole story: what it had to throw away to stay bounded is
+                # reported beside it.  Zero drops is the healthy reading.
+                "queue_depth": (ws.queue_depth if ws is not None
+                                else getattr(self, "feed_backlog", 0)),
+                "queue_max": config.WS_QUEUE_MAX,
+                "queue_drop_policy": config.ws_queue_drop_policy(),
+                "queue_dropped_total": (ws.queue_dropped_total
+                                        if ws is not None else 0),
+                "queue_overflow_events": (ws.queue_overflow_events
+                                          if ws is not None else 0),
+                "queue_forced_reconnects": (ws.queue_forced_reconnects
+                                            if ws is not None else 0),
                 # Continuity of the raw archive: the same block the study
                 # manifest and `GET /api/archive` carry, plus how the archive
                 # task itself is behaving.  Read from a cached snapshot the

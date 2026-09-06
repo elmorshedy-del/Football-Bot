@@ -122,6 +122,32 @@ LOSS_TRADE = dict(
     display_contract="Chelsea wins", event="KXGAME2",
 )
 
+# The real 2026-09-05 shape. The match was a DRAW, so "Inter Miami wins"
+# resolved NO and the NO holder was paid 100 -- which the old card rendered as
+# "Inter Miami wins" beside "100" and the bot's own author read as Miami having
+# won. Trade 112 held YES on the Draw leg of the same match and also paid 100.
+SETTLED_NO_TRADE = dict(
+    TRADE, id=113, side="no", exit_reason="settle", exit_px=100.0,
+    net=72.42, gross=74.0, market="KXMIA-MIA", event="KXMIA",
+    display_game="Inter Miami vs Seattle", display_leg="Inter Miami",
+    display_contract="Inter Miami wins",
+    market_result="no", market_settled_ts=1772325700.0, market_status="settled",
+)
+SETTLED_YES_TRADE = dict(
+    TRADE, id=112, side="yes", exit_reason="settle", exit_px=100.0,
+    net=107.87, gross=110.0, market="KXMIA-TIE", event="KXMIA",
+    display_game="Inter Miami vs Seattle", display_leg="Draw",
+    display_contract="Draw",
+    market_result="yes", market_settled_ts=1772325700.0, market_status="settled",
+)
+UNKNOWN_RESULT_TRADE = dict(
+    TRADE, id=99, side="no", exit_reason="settle", exit_px=100.0,
+    net=5.0, gross=5.5, market="KXOLD-OLD", event="KXOLD",
+    display_game="Legacy Home vs Legacy Away", display_leg="Legacy Home",
+    display_contract="Legacy Home wins",
+    market_result=None, market_settled_ts=None, market_status=None,
+)
+
 API_FIXTURES = {
     "/api/status": {
         "mode": "live", "health": {"ok": True, "runtime_ok": True,
@@ -194,8 +220,12 @@ class DashboardBrowserTests(unittest.TestCase):
         cls.server.shutdown()
         cls.server.server_close()
 
-    def open_dashboard(self, viewport=None, path_response="ok"):
-        """Load the shipped dashboard with the API layer intercepted."""
+    def open_dashboard(self, viewport=None, path_response="ok", trades=None):
+        """Load the shipped dashboard with the API layer intercepted.
+
+        `trades` replaces the `/api/trades` payload for one test, so a scenario
+        can add rows without changing the fixture every other test counts.
+        """
         page = self.browser.new_page(viewport=viewport or {"width": 1280, "height": 900})
 
         def _teardown():
@@ -226,6 +256,10 @@ class DashboardBrowserTests(unittest.TestCase):
                     "samples": GAPPED_SAMPLES, "summary": PATH_SUMMARY,
                     "truncated": False,
                 }))
+                return
+            if endpoint == "/api/trades" and trades is not None:
+                route.fulfill(status=200, content_type="application/json",
+                              body=json.dumps(trades))
                 return
             payload = API_FIXTURES.get(endpoint)
             if payload is None:
@@ -363,6 +397,83 @@ class DashboardBrowserTests(unittest.TestCase):
                             && el.scrollWidth > el.clientWidth + 1).length"""
         )
         self.assertEqual(truncated, 0, "a leaf field is clipped at 360px")
+
+    # ------------------------------------------------------- settlement words
+
+    def settled_cards(self, page):
+        """Map trade id -> rendered card, once the settled fixture is drawn."""
+        page.wait_for_selector("#trade-list .settlement-note", timeout=10000)
+        return {card.get_attribute("data-trade-id"): card
+                for card in page.query_selector_all("#trade-list .trade-story")}
+
+    def open_settled(self, viewport=None):
+        return self.open_dashboard(viewport=viewport, trades={
+            "open": [],
+            "closed": [SETTLED_NO_TRADE, SETTLED_YES_TRADE, UNKNOWN_RESULT_TRADE],
+        })
+
+    def test_a_no_settled_trade_can_never_be_read_as_the_team_having_won(self):
+        """The exact defect: 'Inter Miami wins' beside a payout of 100."""
+        page = self.open_settled()
+        self.show_trades_tab(page)
+        card = self.settled_cards(page)["113"]
+
+        self.assertIn("Betting AGAINST: Inter Miami wins",
+                      card.query_selector(".position-sentence").text_content())
+        self.assertIn(
+            "Market resolved NO — Inter Miami did not win — NO pays 100",
+            card.query_selector(".settlement-sentence").text_content(),
+        )
+        self.assertIn("This position held NO, so it was paid 100 per contract.",
+                      card.query_selector(".settlement-note").text_content())
+        # Nowhere on the card may the market read as Miami having won.
+        self.assertNotIn("Inter Miami won", card.text_content())
+        self.assertEqual(self.console_errors, [])
+
+    def test_a_yes_settled_draw_trade_reads_as_betting_on_the_draw(self):
+        page = self.open_settled()
+        self.show_trades_tab(page)
+        card = self.settled_cards(page)["112"]
+
+        self.assertIn("Betting ON: Draw",
+                      card.query_selector(".position-sentence").text_content())
+        self.assertIn(
+            "Market resolved YES — the match was a draw — YES pays 100",
+            card.query_selector(".settlement-sentence").text_content(),
+        )
+        self.assertIn("This position held YES, so it was paid 100 per contract.",
+                      card.query_selector(".settlement-note").text_content())
+
+    def test_an_unrecorded_resolution_says_so_instead_of_inferring_one(self):
+        """A legacy row has no stored result; the payout is not back-inferred."""
+        page = self.open_settled()
+        self.show_trades_tab(page)
+        card = self.settled_cards(page)["99"]
+
+        note = card.query_selector(".settlement-note")
+        self.assertIn("unknown", note.get_attribute("class"))
+        self.assertIn("Market resolution not recorded", note.text_content())
+        self.assertNotIn("pays 100", note.text_content())
+        # The side held is still stated, because that IS recorded.
+        self.assertIn("Betting AGAINST: Legacy Home wins",
+                      card.query_selector(".position-sentence").text_content())
+
+    def test_settlement_wording_survives_the_360px_viewport(self):
+        page = self.open_settled(viewport={"width": 360, "height": 780})
+        self.show_trades_tab(page)
+        self.settled_cards(page)
+
+        overflow = page.evaluate(
+            "() => document.documentElement.scrollWidth"
+            " - document.documentElement.clientWidth")
+        self.assertLessEqual(overflow, 1,
+                             f"settled trade cards overflow 360px by {overflow}px")
+        clipped = page.evaluate(
+            """() => [...document.querySelectorAll('#trade-list .position-callout *,'
+                 + ' #trade-list .settlement-note *')]
+                 .filter(el => el.children.length === 0
+                            && el.scrollWidth > el.clientWidth + 1).length""")
+        self.assertEqual(clipped, 0, "settlement wording is clipped at 360px")
 
     # ------------------------------------------------------------------ flows
 

@@ -169,16 +169,46 @@ def _backlog_call_style(callback):
 CONSUMER_YIELD_EVERY = 16
 RECONNECT_DELAY_S = 3.0
 
+# Frame types that carry order-book state.  Dropping one of these leaves the
+# book that was being rebuilt from it holed, exactly as a sequence gap does.
+_BOOK_FRAME_TYPES = ("orderbook_delta", "orderbook_snapshot")
+
+
+def _exchange_ts_ms(message):
+    """Exchange stamp of one parsed frame in milliseconds, or None.
+
+    Never invents one: a frame without a provider timestamp contributes nothing
+    to the discarded span rather than contributing the local clock.
+    """
+    body = message.get("msg")
+    if not isinstance(body, dict):
+        return None
+    ts_ms = body.get("ts_ms")
+    if isinstance(ts_ms, (int, float)) and not isinstance(ts_ms, bool):
+        return float(ts_ms)
+    ts = body.get("ts")
+    if isinstance(ts, (int, float)) and not isinstance(ts, bool):
+        return float(ts) * 1000.0
+    return None
+
 
 class KalshiWS:
     """Authenticated WebSocket with subscribe/update helpers and reconnect.
 
     Receipt and processing are split into two coroutines.  The reader only
     does ``recv`` and stamps each raw frame with its arrival time before
-    queueing it; the consumer parses and routes.  The queue is unbounded on
-    purpose: its depth is the measured processing backlog, reported as
-    ``backlog`` and exported per frame, so that falling behind the exchange
-    is visible instead of being folded into every downstream timestamp.
+    queueing it; the consumer parses and routes.  The queue's depth is the
+    measured processing backlog, reported as ``backlog`` and exported per
+    frame, so that falling behind the exchange is visible instead of being
+    folded into every downstream timestamp.
+
+    The queue is BOUNDED at ``config.WS_QUEUE_MAX`` (0 = unbounded).  An
+    unbounded queue turned a slow consumer into a silent one: see the incident
+    recorded above `WS_QUEUE_MAX` in `config.py`.  On overflow the oldest frames
+    are discarded, counted, written to the ledger and to the raw stream, and any
+    market whose order-book frames were among them is invalidated and
+    re-snapshotted through the same path a sequence gap uses -- a book that lost
+    deltas must never go on serving fills.
     """
 
     def __init__(self, on_message, on_state=None, on_feed_event=None):
@@ -205,11 +235,34 @@ class KalshiWS:
         self.disconnects = 0
         self.max_backlog = 0
         self.feed_event_failures = 0
+        # --- bounded-queue accounting ---
+        self.queue_dropped_total = 0
+        self.queue_overflow_events = 0
+        self.queue_forced_reconnects = 0
+        self.queue_forced_reconnects_suppressed = 0
+        # Markets already invalidated by the CURRENT overflow episode; they are
+        # cleared when their fresh snapshot lands, so a market that loses deltas
+        # again after recovering is invalidated again.
+        self._overflow_markets = set()
+        self._overflow = self._blank_overflow()
+        self._last_overflow_emit = None
+        self._stall_since = None
+        self._last_forced_reconnect = None
+
+    @staticmethod
+    def _blank_overflow():
+        return {"dropped": 0, "book_frames": 0, "ts_min": None, "ts_max": None,
+                "unparseable": 0, "unknown_market": 0, "markets": set()}
 
     @property
     def backlog(self):
         """Frames received but not yet processed (current queue depth)."""
         return self._queue.qsize() if self._queue is not None else 0
+
+    @property
+    def queue_depth(self):
+        """Alias of `backlog`, named for the thing that is now bounded."""
+        return self.backlog
 
     def _dispatch(self, message, wall, mono, backlog):
         if self._call_style == "keyword":
@@ -343,14 +396,229 @@ class KalshiWS:
                 "msg": {"sid": active_sid, "expected": expected, "received": received,
                         "market_tickers": tickers},
             }, time.time(), time.monotonic(), self.backlog)
-            if tickers:
-                await self._send("update_subscription", {
-                    "sid": active_sid,
-                    "action": "get_snapshot",
-                    "market_tickers": tickers,
-                })
-                self._emit("snapshot_requested",
-                           {"sid": active_sid, "markets": len(tickers), "reason": "gap"})
+            await self._request_snapshots(active_sid, tickers, "gap")
+
+    async def _request_snapshots(self, sid, tickers, reason):
+        """Ask the exchange for fresh snapshots.  The caller holds `_lock`."""
+        if sid is None or not tickers:
+            return
+        await self._send("update_subscription", {
+            "sid": sid,
+            "action": "get_snapshot",
+            "market_tickers": list(tickers),
+        })
+        self._emit("snapshot_requested",
+                   {"sid": sid, "markets": len(tickers), "reason": reason})
+
+    # ---------- bounded queue: overflow accounting and disclosure ----------
+    def _note_dropped(self, raw):
+        """Account one discarded frame.  Returns True when disclosure is due.
+
+        Parsing happens only for frames that are being thrown away, so this
+        costs nothing while the consumer is keeping up.  A frame that cannot be
+        parsed is still counted -- an unreadable discard is a discard.
+
+        Disclosure is due immediately for every newly affected market -- its
+        book has to be invalidated before the consumer can fill from it -- and
+        otherwise at most once per `WS_QUEUE_OVERFLOW_REPORT_S`, so an overflow
+        storm cannot become the bottleneck it is a symptom of.
+        """
+        self.queue_dropped_total += 1
+        pending = self._overflow
+        pending["dropped"] += 1
+        try:
+            message = json.loads(raw)
+        except (TypeError, ValueError):
+            pending["unparseable"] += 1
+            message = None
+        new_market = False
+        if isinstance(message, dict):
+            ts_ms = _exchange_ts_ms(message)
+            if ts_ms is not None:
+                pending["ts_min"] = (ts_ms if pending["ts_min"] is None
+                                     else min(pending["ts_min"], ts_ms))
+                pending["ts_max"] = (ts_ms if pending["ts_max"] is None
+                                     else max(pending["ts_max"], ts_ms))
+            if message.get("type") in _BOOK_FRAME_TYPES:
+                pending["book_frames"] += 1
+                body = message.get("msg")
+                ticker = body.get("market_ticker") if isinstance(body, dict) else None
+                if ticker is None:
+                    # An order-book frame whose market cannot be read must be
+                    # treated as though it could have been any of them -- but
+                    # only while there is still a book left to invalidate.
+                    # Otherwise a run of unreadable frames would re-disclose
+                    # the same full invalidation once per frame, which is a
+                    # write per frame at exactly the moment the process is
+                    # already too slow to keep up.
+                    pending["unknown_market"] += 1
+                    new_market = not self._subscribed <= self._overflow_markets
+                elif ticker not in self._overflow_markets:
+                    pending["markets"].add(ticker)
+                    new_market = True
+        if self._last_overflow_emit is None:
+            # First discard of an episode: open the reporting window.  The
+            # summary itself waits, so a storm produces one row per interval.
+            self._last_overflow_emit = time.monotonic()
+            return new_market
+        if new_market:
+            return True
+        return (time.monotonic() - self._last_overflow_emit
+                >= config.WS_QUEUE_OVERFLOW_REPORT_S)
+
+    def _report_overflow(self, depth):
+        """Emit one discard summary.  Returns what it covered, or None.
+
+        Synchronous on purpose: the reader must be able to disclose whatever it
+        has accumulated while it is being torn down, where awaiting anything is
+        not safe.
+        """
+        pending, self._overflow = self._overflow, self._blank_overflow()
+        if not pending["dropped"]:
+            return None
+        self.queue_overflow_events += 1
+        self._last_overflow_emit = time.monotonic()
+        span = (None if pending["ts_min"] is None or pending["ts_max"] is None
+                else round(pending["ts_max"] - pending["ts_min"], 3))
+        markets = sorted(pending["markets"])
+        detail = {
+            "policy": config.ws_queue_drop_policy(),
+            "dropped": pending["dropped"],
+            "dropped_total": self.queue_dropped_total,
+            "queue_depth": depth,
+            "queue_max": config.WS_QUEUE_MAX,
+            "book_frames_dropped": pending["book_frames"],
+            "unparseable": pending["unparseable"],
+            "exchange_ts_min_ms": pending["ts_min"],
+            "exchange_ts_max_ms": pending["ts_max"],
+            "exchange_ts_span_ms": span,
+            "invalidated_markets": markets,
+            "unknown_market_frames": pending["unknown_market"],
+        }
+        # Ledger row AND raw-stream marker, so a replay of the segment sees the
+        # hole rather than bridging silently across it.
+        self._emit("queue_overflow", detail)
+        return pending
+
+    async def _flush_overflow(self, depth):
+        """Disclose the accumulated discards and recover the books they holed."""
+        pending = self._report_overflow(depth)
+        if pending is None:
+            return
+        if pending["markets"] or pending["unknown_market"]:
+            await self._recover_dropped_books(sorted(pending["markets"]),
+                                              bool(pending["unknown_market"]),
+                                              pending["dropped"])
+
+    async def _recover_dropped_books(self, markets, unknown, dropped):
+        """Invalidate the books that lost frames and ask for fresh snapshots.
+
+        Deliberately the SAME mechanism a sequence gap uses: an `orderbook_gap`
+        frame dispatched straight to the engine, which clears `book.ok` and
+        invalidates the paper desk's shadow books, plus a `get_snapshot` request
+        and a recovery gate that refuses every further delta for those markets
+        until their snapshot lands.  Dropping deltas corrupts book state exactly
+        as a sequence gap does, and must fail exactly as loudly.
+
+        It is dispatched from the reader rather than queued, because a frame
+        queued behind the backlog would arrive long after the consumer had
+        already filled from the holed book.
+        """
+        async with self._lock:
+            sid = self._orderbook_sid
+            if unknown or not markets:
+                targets = sorted(self._subscribed)
+            elif self._subscribed:
+                targets = sorted(m for m in markets if m in self._subscribed)
+            else:
+                targets = sorted(markets)
+            # Remember every market this episode was OBSERVED to hole, not just
+            # the ones there was anything to do about.  A dropped book frame for
+            # a market this process never subscribed to has no book to
+            # invalidate, but it is still "already seen": without this, each
+            # repeat of it would read as newly affected and force another
+            # immediate disclosure.
+            self._overflow_markets.update(markets)
+            self._overflow_markets.update(targets)
+            if sid is not None:
+                self._recovering_orderbooks.setdefault(sid, set()).update(targets)
+            self._dispatch({
+                "type": "orderbook_gap",
+                "msg": {"sid": sid, "reason": "queue_overflow",
+                        "dropped": dropped, "market_tickers": targets},
+            }, time.time(), time.monotonic(), self.backlog)
+            await self._request_snapshots(sid, targets, "queue_overflow")
+
+    # ---------- bounded queue: stall guard ----------
+    def _stall_reconnect_due(self, depth, now):
+        """Decide whether a stalled queue must force a reconnect.
+
+        Returns the detail to report, or None.  Separated from the watchdog
+        coroutine so the decision -- including the minimum interval that stops
+        it thrashing -- is testable without waiting on wall-clock time.
+        """
+        high = config.ws_queue_stall_depth()
+        if high <= 0 or depth < high:
+            self._stall_since = None
+            return None
+        if self._stall_since is None:
+            self._stall_since = now
+            return None
+        held = now - self._stall_since
+        if held < config.WS_QUEUE_STALL_S:
+            return None
+        if (self._last_forced_reconnect is not None
+                and now - self._last_forced_reconnect
+                < config.WS_RECONNECT_MIN_INTERVAL_S):
+            # Reconnecting straight back into the same backlog helps nobody;
+            # the stall stays visible through `queue_depth` and the ledger.
+            self.queue_forced_reconnects_suppressed += 1
+            return None
+        self._stall_since = None
+        self._last_forced_reconnect = now
+        self.queue_forced_reconnects += 1
+        return {"queue_depth": depth, "high_water": high,
+                "held_s": round(held, 3),
+                "stall_s": config.WS_QUEUE_STALL_S,
+                "forced_reconnects": self.queue_forced_reconnects}
+
+    def _drain_queue(self, queue):
+        """Discard everything still queued and count it.  Never blocks."""
+        dropped = 0
+        while True:
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            dropped += 1
+        self.frames_discarded += dropped
+        return dropped
+
+    async def _watch_queue(self, ws, queue):
+        """Force a reconnect when the consumer stops draining the queue.
+
+        A reconnect is the honest failure: it is what used to happen by itself
+        when a slow consumer backed the socket up and Kalshi hung up.  Returning
+        from here completes one of the tasks `run()` is waiting on, so the loop
+        tears the connection down and rebuilds it, which re-subscribes and
+        yields fresh snapshots -- strictly better than a deep queue of stale
+        deltas.
+        """
+        while True:
+            await asyncio.sleep(max(0.05, config.WS_QUEUE_STALL_POLL_S))
+            detail = self._stall_reconnect_due(queue.qsize(), time.monotonic())
+            if detail is None:
+                continue
+            detail["drained"] = self._drain_queue(queue)
+            self.on_state("stalled: forcing reconnect")
+            self._emit("queue_stall_reconnect", detail)
+            try:
+                await ws.close()
+            except Exception:
+                # The socket is being abandoned either way; a close that fails
+                # must not leave the watchdog running against a dead task set.
+                pass
+            return
 
     async def _accept_orderbook_frame(self, message):
         """Validate and recovery-gate one order-book frame."""
@@ -377,6 +645,9 @@ class KalshiWS:
         ticker = body.get("market_ticker")
         if message.get("type") == "orderbook_snapshot" and ticker in pending:
             pending.remove(ticker)
+            # Recovered: a later overflow that hits this market again must
+            # invalidate it again rather than assume it is still invalid.
+            self._overflow_markets.discard(ticker)
             if not pending:
                 self._recovering_orderbooks.pop(sid, None)
                 self._emit("snapshot_complete", {"sid": sid, "reason": "snapshots_received"})
@@ -402,10 +673,36 @@ class KalshiWS:
         self._dispatch(m, wall, mono, backlog)
 
     async def _read(self, ws, queue):
-        """Receive frames and stamp their arrival; nothing else runs here."""
-        async for raw in ws:
-            queue.put_nowait((raw, time.time(), time.monotonic()))
-            self.frames_received += 1
+        """Receive frames and stamp their arrival.
+
+        The only work beyond `recv` and the arrival stamp is enforcing the queue
+        bound, and that only ever runs once the queue is already full: while the
+        consumer keeps up this is exactly the loop it always was.
+        """
+        limit = config.WS_QUEUE_MAX
+        try:
+            async for raw in ws:
+                if limit > 0 and queue.qsize() >= limit:
+                    # Drop from the HEAD.  The newest market state is the only
+                    # state worth having; a frame behind `limit` others
+                    # describes a book the exchange has already moved on from.
+                    flush = False
+                    while queue.qsize() >= limit:
+                        try:
+                            stale, _wall, _mono = queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        flush = self._note_dropped(stale) or flush
+                    if flush:
+                        await self._flush_overflow(queue.qsize())
+                queue.put_nowait((raw, time.time(), time.monotonic()))
+                self.frames_received += 1
+        finally:
+            # Whatever the rate limiter was still holding is disclosed before
+            # the reader goes away, so the last window of an episode is never
+            # the one nobody hears about.  Synchronous: this also runs while
+            # the task is being cancelled, where awaiting is not safe.
+            self._report_overflow(queue.qsize())
 
     async def _consume(self, queue):
         """Drain the arrival queue; yields periodically so the reader keeps up."""
@@ -446,6 +743,10 @@ class KalshiWS:
                     subs = self._subscribed
                     self._subscribed = set()
                     self._queue = asyncio.Queue()
+                    self._overflow = self._blank_overflow()
+                    self._overflow_markets.clear()
+                    self._last_overflow_emit = None
+                    self._stall_since = None
                     self.on_state("connected")
                     self._emit("connected", {"connection": self.connections,
                                              "resubscribe": len(subs)})
@@ -453,7 +754,8 @@ class KalshiWS:
                         await self.set_markets(subs)
                         self._emit("resubscribed", {"markets": len(subs)})
                     tasks = (asyncio.ensure_future(self._read(ws, self._queue)),
-                             asyncio.ensure_future(self._consume(self._queue)))
+                             asyncio.ensure_future(self._consume(self._queue)),
+                             asyncio.ensure_future(self._watch_queue(ws, self._queue)))
                     try:
                         done, _pending = await asyncio.wait(
                             tasks, return_when=asyncio.FIRST_COMPLETED,
@@ -491,4 +793,10 @@ class KalshiWS:
             "connections": self.connections,
             "disconnects": self.disconnects,
             "feed_event_failures": self.feed_event_failures,
+            "queue_depth": self.queue_depth,
+            "queue_max": config.WS_QUEUE_MAX,
+            "queue_drop_policy": config.ws_queue_drop_policy(),
+            "queue_dropped_total": self.queue_dropped_total,
+            "queue_overflow_events": self.queue_overflow_events,
+            "queue_forced_reconnects": self.queue_forced_reconnects,
         }

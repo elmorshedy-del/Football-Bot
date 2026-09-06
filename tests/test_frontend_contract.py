@@ -150,6 +150,38 @@ class FrontendContractTests(unittest.TestCase):
         # Per-kind latency query renders every canonical kind, not just non-zero.
         self.assertIn("CANONICAL_LATENCY_KINDS", self.js)
 
+    def test_a_position_is_stated_in_words_that_cannot_be_read_backwards(self):
+        """A bare `yes`/`no` beside a market name is how the bot's own author
+        read trades 113/114 as "Miami won" a match that finished a draw."""
+        for token in ("positionWording", "positionCallout", "resolutionMeaning",
+                      "contractName", "Betting ON: ", "Betting AGAINST: ",
+                      "Side not recorded"):
+            self.assertIn(token, self.js)
+        # The sentence must be a real element, not styling on a bare token: the
+        # chip is uppercase-transformed and cannot be the only statement.
+        self.assertIn('class="position-sentence"', self.js)
+        self.assertIn(".position-sentence", self.css)
+        self.assertIn(".position-callout", self.css)
+        # Cards are addressable so an audit can point at one.
+        self.assertIn("data-trade-id", self.js)
+
+    def test_a_settled_trade_explains_its_payout_from_the_market_resolution(self):
+        for token in ("settlementBlock", "trade.market_result",
+                      "Market resolved ${upper}", "${upper} pays 100",
+                      "Market resolution not recorded"):
+            self.assertIn(token, self.js)
+        for rule in (".settlement-note", ".settlement-note.unknown",
+                     ".settlement-sentence"):
+            self.assertIn(rule, self.css)
+        # Reuses the existing chip palette rather than inventing a second one.
+        self.assertIn(".tag.bad", self.css)
+        self.assertIn(".tag.good", self.css)
+
+    def test_the_settlement_wording_wraps_instead_of_overflowing_360px(self):
+        """`.tag` is nowrap; a wrapped sentence chip must opt out explicitly."""
+        self.assertIn("white-space: normal", self.css)
+        self.assertIn("@media (max-width: 360px)", self.css)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -479,6 +479,9 @@ function gateOutcome(row) {
 }
 function passesFilters(row, isTrade = false) {
   const searchable = [row.display_game, row.display_contract, row.display_leg, row.market, row.event, row.series, row.outcome, row.exit_reason,
+    // "against" and "resolved no" are the words an operator reaches for when
+    // checking which way round a trade was; make them findable.
+    isTrade ? positionWording(row).sentence : null, isTrade && row.market_result ? `resolved ${row.market_result}` : null,
     row.matched_event?.canonical_event?.human_label, row.matched_event?.canonical_event?.provider_description].join(" ").toLowerCase();
   if (filters.query && !searchable.includes(filters.query.toLowerCase())) return false;
   if (filters.strategy !== "all" && row.strategy !== filters.strategy) return false;
@@ -547,6 +550,58 @@ function triggerSummary(trigger) {
   if (finite(observed.contracts)) pieces.push(`${integer(observed.contracts)} contracts`);
   return pieces.length ? pieces.join(" · ") : "The provider did not supply the complete trigger measurements.";
 }
+// --- Which way round the bet was ------------------------------------------
+// A bare `yes`/`no` beside a market name reads backwards. "Miami wins" next to
+// a payout of 100 was read as "Miami won" for trades 113 and 114, which held
+// NO on that market in a match that finished a draw — a draw resolves
+// "Miami wins" as NO, so NO is what pays 100. The bot's own author misread his
+// own ledger from this card, which for an audit dashboard is a defect. Nothing
+// below changes settlement; it only says out loud what the stored row means.
+function contractName(row) {
+  return row.display_contract || row.display_leg || row.market || "Unnamed contract";
+}
+function isDrawContract(row) {
+  return row.display_leg === "Draw" || contractName(row) === "Draw";
+}
+// What a resolution MEANS about the match, in words, never as a bare token.
+function resolutionMeaning(row, result) {
+  const team = row.display_leg && row.display_leg !== "Draw" ? row.display_leg : contractName(row);
+  if (isDrawContract(row)) return result === "yes" ? "the match was a draw" : "the match was not a draw";
+  return result === "yes" ? `${team} won` : `${team} did not win`;
+}
+function positionWording(row) {
+  const side = String(row.side || "").toLowerCase(), name = contractName(row);
+  if (side === "yes") return {side, sentence: `Betting ON: ${name}`, chip: "YES position", tag: "good"};
+  if (side === "no") return {side, sentence: `Betting AGAINST: ${name}`, chip: "NO position", tag: "bad"};
+  return {side: "", sentence: `Side not recorded for: ${name}`, chip: "Side not recorded", tag: "warn"};
+}
+function positionCallout(row) {
+  const position = positionWording(row);
+  // The chip carries the side token and the sentence carries the meaning, so
+  // the uppercase chip styling can never be the only thing saying which way
+  // round the bet was.
+  const condition = position.side
+    ? `Pays 100 only if ${resolutionMeaning(row, position.side)}.`
+    : "The stored row does not record which side was held.";
+  return `<div class="position-callout ${position.side || "unknown"}"><span class="tag ${position.tag}">${escapeHtml(position.chip)}</span><p class="position-sentence">${escapeHtml(position.sentence)}</p><small>${escapeHtml(condition)}</small></div>`;
+}
+// Why a settled trade was paid what it was paid. Never inferred from the
+// payout: an unrecorded resolution is reported as unrecorded.
+function settlementBlock(trade) {
+  if (trade.exit_reason !== "settle") return "";
+  const result = String(trade.market_result || "").toLowerCase();
+  const side = String(trade.side || "").toLowerCase();
+  const name = contractName(trade);
+  if (result !== "yes" && result !== "no") {
+    return `<div class="settlement-note unknown"><span class="tag warn">Market resolution not recorded</span><p>This trade closed at settlement, but no stored result exists for “${escapeHtml(name)}”. The payout is not explained here rather than inferred from the side that was held.</p></div>`;
+  }
+  const upper = result.toUpperCase();
+  const paid = side === result;
+  const heldLine = side
+    ? `This position held ${side.toUpperCase()}, so it was paid ${paid ? "100" : "0"} per contract.`
+    : "The stored row does not record which side was held, so the payout is not explained here.";
+  return `<div class="settlement-note ${paid ? "paid" : "void"}"><span class="tag ${paid ? "good" : "bad"}">Market resolved ${upper}</span><p class="settlement-sentence">Market resolved ${upper} — ${escapeHtml(resolutionMeaning(trade, result))} — ${upper} pays 100.</p><p>${escapeHtml(heldLine)}</p></div>`;
+}
 function eventAssociationBlock(matched) {
   const event = matched?.canonical_event;
   if (!event) return `<div class="event-association unmatched"><div class="event-summary-line"><h4>No nearby same-match event</h4><span class="tag">Unmatched</span></div><p class="event-caveat">The diagnostic feed did not record a score change inside the fixed ±${integer(matched?.window_s || state.config.event_match_window_s || 20)} second audit window. This does not prove that no football event occurred.</p></div>`;
@@ -574,7 +629,9 @@ function tradeCard(trade) {
   const highBlock = tradeHighBlock(trade);
   const loss = lossPath(trade);
   const spark = pathSparkline(trade);
-  return `<article class="trade-story ${strategyClass(trade.strategy)}"><div class="trade-core"><div class="trade-title-row"><div><h3>${escapeHtml(trade.display_game || "Unnamed match")}</h3><p class="contract-line">${escapeHtml(trade.display_contract || trade.display_leg || "Unnamed contract")} · ${escapeHtml(leagueName(trade.series))} · ${escapeHtml(matchTime)}</p></div><span class="tag ${strategyClass(trade.strategy) === "price" ? "info" : "warn"}">${escapeHtml(strategyLabel(trade.strategy))}</span></div><div class="sleeve-net ${(trade.net || 0) >= 0 ? "positive" : "negative"}">${money(trade.net || 0)}</div><p class="muted">Net after ${money(-(trade.fees || 0))} fees</p><div class="trade-economics"><div><span>Entry → exit</span><strong>${cents(trade.entry_px)} → ${cents(trade.exit_px)}</strong></div><div><span>Contracts</span><strong>${integer(trade.size)}</strong></div><div><span>Gross</span><strong>${money(trade.gross || 0)}</strong></div></div>${loss}${spark}${clock}${highBlock}<div class="trade-reason"><strong>${escapeHtml(humanExit(trade.exit_reason))}</strong><br>${escapeHtml(triggerSummary(trade.trigger))}</div></div><div class="trade-audit">${eventAssociationBlock(matched)}${tradeTimeline(trade)}<div class="audit-footer">${rawDetails("Raw identifiers and audit record", {trade_id: trade.id, signal_id: trade.signal_id, market: trade.market, event: trade.event, series: trade.series, trigger: trade.trigger, schedule_window: trade.schedule_window, matched_event: matched, match_clock: trade.match_clock, max_executable_bid: trade.max_executable_bid, max_executable_bid_ts: trade.max_executable_bid_ts, mfe_c: trade.mfe_c, high_after_entry_s: trade.high_after_entry_s})}</div></div></article>`;
+  const position = positionCallout(trade);
+  const settlement = settlementBlock(trade);
+  return `<article class="trade-story ${strategyClass(trade.strategy)}" data-trade-id="${escapeHtml(String(trade.id ?? ""))}"><div class="trade-core"><div class="trade-title-row"><div><h3>${escapeHtml(trade.display_game || "Unnamed match")}</h3><p class="contract-line">${escapeHtml(trade.display_contract || trade.display_leg || "Unnamed contract")} · ${escapeHtml(leagueName(trade.series))} · ${escapeHtml(matchTime)}</p></div><span class="tag ${strategyClass(trade.strategy) === "price" ? "info" : "warn"}">${escapeHtml(strategyLabel(trade.strategy))}</span></div>${position}<div class="sleeve-net ${(trade.net || 0) >= 0 ? "positive" : "negative"}">${money(trade.net || 0)}</div><p class="muted">Net after ${money(-(trade.fees || 0))} fees</p>${settlement}<div class="trade-economics"><div><span>Entry → exit</span><strong>${cents(trade.entry_px)} → ${cents(trade.exit_px)}</strong></div><div><span>Contracts</span><strong>${integer(trade.size)}</strong></div><div><span>Gross</span><strong>${money(trade.gross || 0)}</strong></div></div>${loss}${spark}${clock}${highBlock}<div class="trade-reason"><strong>${escapeHtml(humanExit(trade.exit_reason))}</strong><br>${escapeHtml(triggerSummary(trade.trigger))}</div></div><div class="trade-audit">${eventAssociationBlock(matched)}${tradeTimeline(trade)}<div class="audit-footer">${rawDetails("Raw identifiers and audit record", {trade_id: trade.id, signal_id: trade.signal_id, market: trade.market, event: trade.event, series: trade.series, side: trade.side, market_result: trade.market_result, market_settled_ts: trade.market_settled_ts, trigger: trade.trigger, schedule_window: trade.schedule_window, matched_event: matched, match_clock: trade.match_clock, max_executable_bid: trade.max_executable_bid, max_executable_bid_ts: trade.max_executable_bid_ts, mfe_c: trade.mfe_c, high_after_entry_s: trade.high_after_entry_s})}</div></div></article>`;
 }
 function renderTrades() {
   const rows = (state.trades.closed || []).filter(row => passesFilters(row, true));
@@ -584,7 +641,8 @@ function renderFeaturedTrades() {
   const linked = [...(state.trades.closed || [])].sort((a, b) => Number(Boolean(b.matched_event?.canonical_event)) - Number(Boolean(a.matched_event?.canonical_event)) || (b.exit_ts || 0) - (a.exit_ts || 0)).slice(0, 4);
   byId("featured-trade-list").innerHTML = linked.length ? linked.map(trade => {
     const event = trade.matched_event?.canonical_event;
-    return `<div class="compact-story"><div><strong>${escapeHtml(trade.display_game || "Unnamed match")} · ${escapeHtml(trade.display_contract || trade.display_leg)}</strong><p>${escapeHtml(strategyLabel(trade.strategy))} · ${escapeHtml(humanExit(trade.exit_reason))}</p><p class="event-note">${escapeHtml(event?.human_label || "No nearby same-match event")}${event?.event_method === "penalty" ? " · Penalty" : ""}</p></div><strong class="${(trade.net || 0) >= 0 ? "positive" : "negative"}">${money(trade.net || 0)}</strong></div>`;
+    const position = positionWording(trade);
+    return `<div class="compact-story"><div><strong>${escapeHtml(trade.display_game || "Unnamed match")}</strong><p class="position-sentence">${escapeHtml(position.sentence)}</p><p>${escapeHtml(strategyLabel(trade.strategy))} · ${escapeHtml(humanExit(trade.exit_reason))}</p><p class="event-note">${escapeHtml(event?.human_label || "No nearby same-match event")}${event?.event_method === "penalty" ? " · Penalty" : ""}</p></div><strong class="${(trade.net || 0) >= 0 ? "positive" : "negative"}">${money(trade.net || 0)}</strong></div>`;
   }).join("") : '<div class="empty-state">Explained trades appear after a paper position closes.</div>';
 }
 
@@ -767,7 +825,7 @@ function renderMatches() {
 }
 function renderPositions() {
   const rows = state.trades.open || [];
-  byId("position-list").innerHTML = rows.length ? rows.map(position => `<div class="position-row"><div class="metric-inline"><strong>${escapeHtml(position.display_game || "Unnamed match")}</strong><span class="tag ${strategyClass(position.strategy) === "price" ? "info" : "warn"}">${escapeHtml(strategyLabel(position.strategy))}</span></div><p>${escapeHtml(position.display_contract || position.display_leg || "Unnamed contract")} · ${integer(position.remaining ?? position.size)} contracts remaining · entry ${cents(position.entry_px)} · best bid ${cents(position.best_bid)}</p><strong class="${(position.upnl || 0) >= 0 ? "positive" : "negative"}">${money(position.upnl || 0)} open mark</strong>${rawDetails("Raw identifiers", {trade_id: position.id, signal_id: position.signal_id, market: position.market, event: position.event, series: position.series})}</div>`).join("") : '<div class="empty-state">No open paper positions.</div>';
+  byId("position-list").innerHTML = rows.length ? rows.map(position => `<div class="position-row"><div class="metric-inline"><strong>${escapeHtml(position.display_game || "Unnamed match")}</strong><span class="tag ${strategyClass(position.strategy) === "price" ? "info" : "warn"}">${escapeHtml(strategyLabel(position.strategy))}</span></div>${positionCallout(position)}<p>${integer(position.remaining ?? position.size)} contracts remaining · entry ${cents(position.entry_px)} · best bid ${cents(position.best_bid)}</p><strong class="${(position.upnl || 0) >= 0 ? "positive" : "negative"}">${money(position.upnl || 0)} open mark</strong>${rawDetails("Raw identifiers", {trade_id: position.id, signal_id: position.signal_id, market: position.market, event: position.event, series: position.series, side: position.side})}</div>`).join("") : '<div class="empty-state">No open paper positions.</div>';
 }
 const LATENCY_STATE_TAG = {PASS: "good", BREACH: "bad", COLLECTING: "warn", STALE: "warn", INVALID: "bad"};
 // Canonical kinds are named in tests/test_health.py / app/store.py; render every

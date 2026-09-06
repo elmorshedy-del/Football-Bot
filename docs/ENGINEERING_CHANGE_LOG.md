@@ -39,6 +39,26 @@ concurrently and merged here:
 - **capture pass** (plan B3-B7, B9), entries `-009` to `-020`, commits
   `b59cece`, `b5e0470`, `d743a17`, `a900e6d`, `e6f4c93`.
 
+**Added after the merge: the incident pass**, entries `-021` and `-022`,
+commits `0ef21dd` and `45d1b08`, on the same branch with base commit `17ed463`
+(the merge of the three passes above). It is not part of the data-capture plan:
+it fixes two defects the deployed 2026-09-05 build demonstrated in production
+on the day. Diff totals 13 files, +1,431 / -27 excluding this section:
+`app/` +466 / -22 across 5 files, `static/` +84 / -5 across 2 files,
+`tests/` +875 across 5 files (of which `tests/test_ws_queue_bounds.py` is 556
+new lines), `.env.example` +33. Suite 538 tests OK before this pass, 562 after
+`0ef21dd`, 580 after `45d1b08`, under the same command as above. Still NOT
+DEPLOYED.
+
+**Configuration identity, incident pass.** `strategy_params()` is byte-identical
+before and after: the JSON of the whole parameter set compares equal, and the
+new `WS_QUEUE_*` settings are deliberately not in `STRATEGY_PARAM_NAMES`. But
+`config.py` and `engine.py` are strategy sources, so `CODE_FINGERPRINT` moves
+(`5bfd89de8bf6` -> `e2d93ec7f4df` in this environment) and with it `config_id`
+(`04284893a0ab0dcf` -> `af5bdf160217cea5`). Rows written after this deploys will
+not pool with earlier rows in a current-configuration aggregate. That is the
+provenance stamp working as designed, not a decision change.
+
 **Numbering correction, recorded rather than hidden.** The archive and capture
 passes were written in parallel against the same base and both claimed
 `-007`/`-008`. The archive pass had already been pushed and its entry numbers
@@ -78,6 +98,395 @@ written inline here because the harness is synchronous and has no event loop
 for `asyncio.to_thread` to dispatch to. In production those rows go to a worker
 thread and the loop does not pay for them, so the measured in-process gain is a
 conservative lower bound on the relief the event loop actually gets.
+
+### CHG-2026-09-05-023 — Disclose an overflowing market once, not once per frame
+
+**Commit:** this change
+**Components:** `app/kalshi.py` (`_note_dropped`, `_recover_dropped_books`),
+`tests/test_ws_queue_bounds.py`
+
+**Observed / original behaviour.** Found in review of CHG-2026-09-05-021 before
+that change was deployed; never ran in production.
+
+The bounded queue rate-limits its overflow summary to one per
+`WS_QUEUE_OVERFLOW_REPORT_S`, with one deliberate exception: a market seen for
+the first time in an overflow episode is disclosed **immediately**, because its
+book has to be invalidated before the consumer can fill from it. "Seen for the
+first time" was implemented as "not in `_overflow_markets`", and
+`_overflow_markets` was only updated with the markets that were actually acted
+on — the intersection of the dropped frames' markets with `_subscribed`.
+
+Two kinds of frame are therefore never remembered, because there is nothing to
+do about either:
+
+1. an order-book frame for a market this process is not subscribed to (the feed
+   delivers these in volume — 69,122 in 6.5 h on 2026-08-30/31);
+2. an order-book frame whose `market_ticker` cannot be read, which is treated as
+   though it could have been any market and blanket-invalidates all of them.
+
+Every repeat of either read as newly affected, so each one forced its own
+immediate disclosure: a `queue_overflow` ledger row, a raw-stream marker and a
+dispatched `orderbook_gap` (which writes an event-log row) — **per dropped
+frame**, synchronously, while the consumer is by definition already too slow.
+Measured on the regression test: 39 emissions for 39 dropped frames where 2 are
+correct. The bound would have converted a silent stall into a write storm timed
+to arrive at the exact moment the process could least afford it.
+
+**Root cause.** Conflating "newly affected" with "newly acted on". The set is a
+seen-set, so it has to record what was seen.
+
+**Change.** `_recover_dropped_books` records every market the episode was
+observed to hole, not only the subscribed subset it could re-snapshot; and an
+unreadable book frame counts as newly affecting only while some subscribed
+market is still outside `_overflow_markets` — once everything is invalidated
+there is nothing left for the next such frame to disclose.
+
+**Invariants preserved.** A market with a book to invalidate is still disclosed
+immediately and still re-snapshotted through the sequence-gap path; recovery
+still clears a market from `_overflow_markets` when its fresh snapshot lands, so
+a market holed again after recovering is invalidated again; the reader's
+teardown flush still discloses the final window; no strategy parameter and no
+Gate A behaviour is touched.
+
+**Verification.** Three tests added to `tests/test_ws_queue_bounds.py`:
+40 dropped frames for an unsubscribed market produce one immediate disclosure
+plus the teardown summary (was 39 emissions, asserted against the pre-fix code);
+40 unreadable book frames blanket-invalidate once, not 39 times; and a market
+holed, re-snapshotted, then holed again is invalidated both times. Full gate:
+583 tests OK, `compileall`, `ruff check --select E9,F63,F7,F82`,
+`node --check static/app.js`, `git diff --check` all clean.
+
+### CHG-2026-09-05-022 — Say which way round every trade was, and why a settlement paid
+
+**Commit:** `45d1b08`
+**Components:** `static/app.js`, `static/style.css`, `app/main.py`
+(`/api/trades`, new `_market_settlements`), `tests/test_settlement_display.py`,
+`tests/test_dashboard_browser.py`, `tests/test_frontend_contract.py`,
+`tests/test_pr13_browser_followup.py`
+
+**Observed / original behaviour.** Production trades 112, 113 and 114 of
+2026-09-05 are all **correct**, and nothing in this entry changes settlement.
+The match finished a draw. Trade 112 held YES on the Draw leg; trades 113 and
+114 held NO on "Miami wins"; a draw resolves "Miami wins" as NO. All three were
+therefore paid 100, for +$107.87, +$72.42 and +$96.14 net.
+
+The card rendered the market name "Miami wins" beside an exit price of 100,
+with the side held present only as a bare `yes`/`no` token in the raw-JSON
+`<details>`. Read left to right it says "Miami wins ... 100". The operator who
+designed this bot read his own ledger that way and concluded Miami had won a
+match that was a draw. For an audit dashboard, a card that the author himself
+misreads is a defect in the card.
+
+**Root cause.** Two gaps, one presentational and one in the API.
+Presentationally, `tradeCard` never stated the position in words: it printed
+`display_contract` (which is always phrased as the YES claim, "X wins" or
+"Draw") and left the reader to combine it mentally with a token they could not
+see. In the API, `/api/trades` selected only from `trades`; `markets.result`
+and `markets.settled_ts` exist (CHG-2026-09-05-016) but were never joined, so
+the dashboard had nothing to explain a payout with even if it had wanted to.
+This is a design gap, not a regression: the card never showed this.
+
+**Why necessary.** The dashboard is the audit surface. A settlement row whose
+plain reading inverts the fact it records is worse than no row, because it is
+read confidently. It already produced one wrong conclusion by the person best
+placed to catch it, on trades that were themselves correct.
+
+**Exact change.** `/api/trades` now runs one extra query per page,
+`_market_settlements`, and stamps `market_result`, `market_settled_ts` and
+`market_status` from the parent `markets` row onto every trade. It is
+deliberately not mode-scoped, because `markets` carries no capture mode: a
+market is one exchange object observed in whatever mode was running. A ticker
+with no row, or no stored result, yields nulls.
+
+In `app.js`, `positionWording`/`positionCallout` render on every trade card and
+open position: a short `.tag` chip carrying the side token, a
+`.position-sentence` element carrying "Betting AGAINST: Inter Miami wins" or
+"Betting ON: Draw", and the payout condition, "Pays 100 only if Inter Miami did
+not win." The sentence is its own element precisely so the uppercase chip
+styling can never be the only thing stating the direction.
+`settlementBlock` renders only for `exit_reason == "settle"` and states
+"Market resolved NO — Inter Miami did not win — NO pays 100." followed by "This
+position held NO, so it was paid 100 per contract." `resolutionMeaning` turns a
+`yes`/`no` result into a claim about the match, handling the Draw leg
+separately ("the match was a draw" / "the match was not a draw"). A row whose
+`market_result` is absent renders "Market resolution not recorded" and says the
+payout is not explained rather than inferring a resolution from the side that
+was paid. The position sentence and `resolved <result>` also join the card's
+searchable text, so "against" is a usable filter. Cards carry `data-trade-id`.
+CSS reuses the existing `.tag` palette; the sentence chips opt out of `.tag`'s
+`white-space: nowrap` so they wrap rather than overflow at 360 px.
+
+**Before / after.** Trade 113 (`KXMIA-MIA`, side `no`, exit 100, market resolved
+`no`). Before: "Inter Miami wins · Major League Soccer · <date>", "$72.42",
+"Market settlement", exit price 100 — nothing on the card contradicts "Miami
+won". After, rendered in Chromium against the shipped page and the live server:
+"Betting AGAINST: Inter Miami wins", "Pays 100 only if Inter Miami did not
+win.", "Market resolved NO — Inter Miami did not win — NO pays 100.", "This
+position held NO, so it was paid 100 per contract." The string "Inter Miami
+won" does not occur anywhere on the card. Trade 112 (`KXMIA-TIE`, side `yes`,
+resolved `yes`) reads "Betting ON: Draw" and "Market resolved YES — the match
+was a draw — YES pays 100." A legacy row with no stored result reads "Market
+resolution not recorded".
+
+**Reasoning and trade-offs.** Rewriting `display_contract` per side (rendering
+the NO leg as "Miami does not win") was considered and rejected: the contract
+name is the exchange's, it is what the raw identifiers and the export show, and
+silently renaming it in one place would break the correspondence an audit
+depends on. Deriving the resolution from the payout (exit 100 implies the held
+side won) was rejected outright — it is exactly the inference that must never
+be made, and it would have printed a confident resolution for legacy rows that
+have none. Adding the side to the compact featured story as a chip was replaced
+by a plain sentence for the same reason the callout uses one: `.tag` is
+uppercase-transformed and a styled token is not a statement.
+
+**Validation.** `tests/test_settlement_display.py` (7 tests) asserts the API
+exposes `market_result`/`market_settled_ts`/`market_status` for the real
+draw-shaped fixture, that a legacy row reports null rather than an inference,
+that a deleted `markets` row does not break the listing, and that the lookup is
+ONE query for the whole page rather than one per trade. `test_frontend_contract`
+gains three tests pinning the new literals, ids and CSS rules; its existing
+`ALL SYSTEMS GOOD` assertions still pass. Four Playwright Chromium tests drive
+the shipped page: a NO settled trade renders the "against" wording and the
+resolution sentence and nowhere reads as the team having won; a YES-settled
+Draw trade reads as betting on the draw; an unknown-result row says so; and the
+settled cards produce 0 px of horizontal overflow at 360 px with no clipped leaf
+element. Chromium runs in this environment
+(`/opt/pw-browsers/chromium-1194/chrome-linux/chrome`, 141.0.7390.37), so the
+browser assertion was added rather than skipped. Suite 580 tests OK. Also
+verified against a running server on port 8731 in demo mode with a seeded
+settled row: `/api/trades` returned `market_result: "no"` and the rendered card
+showed the wording above with 0 page errors.
+
+**Risks / limitations.** The resolution is only as good as `markets.result`, so
+a settled trade whose market result was never captured shows "not recorded" —
+correct, but it means older rows explain less than new ones, and this change
+does not backfill them (nor should it). The wording assumes the YES leg is
+phrased as a claim, which `_display_names` guarantees for soccer game markets
+("X wins" / "Draw"); a series with a differently-phrased leg would still read
+correctly as "Betting AGAINST: <leg>" but the negation ("X did not win") would
+be less idiomatic. Nothing here validates that the stored result is right; it
+reports what was stored.
+
+**Follow-up.** None. Signals are not settled positions and were deliberately
+left alone.
+
+### CHG-2026-09-05-021 — Bound the arrival queue, and make what it discards explicit
+
+**Commit:** `0ef21dd`
+**Components:** `app/kalshi.py` (`KalshiWS`), `app/config.py` (`WS_QUEUE_*`),
+`app/engine.py` (`handle_ws` gap branch, `status()`), `app/exporter.py`
+(`_OBSERVABILITY_NAMES`), `.env.example`, `tests/test_ws_queue_bounds.py`
+
+**Observed / original behaviour.** CHG-2026-09-05-001 split `KalshiWS.run` into
+a reader that stamps arrival and pushes onto an `asyncio.Queue`, and a consumer
+that parses and dispatches. That queue was unbounded on purpose, so its depth
+would measure the backlog. In production on 2026-09-05 it measured a backlog
+nothing then bounded.
+
+The reader kept up perfectly: feed lag p50 63-148 ms throughout. The consumer
+fell behind and never recovered. Backlog reached **896,017 frames** and
+stabilised near **556,000**. `order_arrival_ms` reached **p95 2,280,666 ms (38
+minutes)**, max **2,895,826 ms**. Memory peaked at **3.77 GB of an 8 GB limit**.
+CPU averaged **0.12 of 8 vCPU**, so this was not compute saturation: the
+consumer was I/O- or lock-bound.
+
+The consequence is worse than lateness. Five real closed trades, with
+`book_age_ms` (CHG-2026-09-05-012) proving it:
+
+| trade | arrival delay | held | net |
+|---|---|---|---|
+| 112 (MIA/TIE yes) | 76.2 min | 25 s | +$107.87 |
+| 113 (MIA no) | 76.2 min | 24 s | +$72.42 |
+| 114 (MIA no) | 79.2 min | 9 s | +$96.14 |
+| 111 (Villarreal TIE no) | 42.1 min | 24 s | +$108.48 |
+| 110 (Villarreal TIE yes) | 41.3 min | 17 s | -$103.73 |
+
+Those matches had already finished. The bot processed frames about 77 minutes
+old, "entered" at pre-settlement prices, and the settlement frame — queued
+behind them — paid out 100 seconds later. About **+$281 of fabricated paper
+profit**. Before the reader/consumer split the same slowness produced a VISIBLE
+failure: the socket backed up and Kalshi dropped the connection. After it, the
+same slowness is silent.
+
+`PAPER_MAX_BOOK_AGE_MS=5000` was set in production as the immediate mitigation
+before this fix existed. It refuses a fill against a stale book
+(CHG-2026-09-05-014); it does not bound the queue, does not stop the process
+holding 3.77 GB of stale frames, and does not stop the bot operating minutes
+behind the exchange. It is a fill guard, not a transport guard.
+
+**Root cause.** A design gap, and mine to own: the unbounded queue was
+specified. Removing the socket's own backpressure removed the only thing that
+had been converting a slow consumer into a loud failure. An unbounded buffer in
+front of a real-time decision does not preserve the data — it preserves frames
+whose informational value expired, and spends memory to do it. The consumer's
+underlying slowness is a separate defect and is NOT addressed here.
+
+**Why necessary.** Without a bound, a consumer stall is unobservable except as a
+number on a status panel nobody was watching, and its output is not "late
+trades" but *trades against a past the market has already resolved*, booked as
+profit. Disclosure without a bound is not enough either: the frames were all
+there, and the study would still have replayed a bot that had traded 77 minutes
+in the past.
+
+**Exact change.** `WS_QUEUE_MAX` (default 20000, 0 = unbounded) bounds the
+queue; `WS_QUEUE_DROP_POLICY` selects the policy. Only `oldest` is implemented —
+for trading the newest market state is the only state worth having — and any
+other value normalises to `oldest` rather than failing open to unbounded.
+Enforcement is in `_read`: while `qsize() >= limit`, pop from the head.
+
+Every discard is counted in `queue_dropped_total` and accumulated into a
+summary carrying the count, the queue depth, the bound, the policy, how many
+were order-book frames, how many were unparseable, and the **span of exchange
+timestamps discarded** (`exchange_ts_min_ms`/`max_ms`/`span_ms`, read from the
+dropped frames themselves; a frame with no provider stamp contributes nothing
+rather than contributing the local clock). The summary is emitted through the
+existing `_emit`, which writes both a `feed_events` row of the new kind
+`queue_overflow` and a `recorder_marker` frame into the raw stream, so a later
+replay sees the hole instead of bridging silently across it. Emission is rate
+limited to one summary per `WS_QUEUE_OVERFLOW_REPORT_S` (default 1 s), and
+whatever the limiter is still holding is flushed synchronously when the reader
+stops, so the last window of an episode is never the one nobody hears about.
+
+Dropping an order-book delta corrupts book state exactly as a sequence gap
+does, so it goes through the same path: `_recover_dropped_books` dispatches an
+`orderbook_gap` frame — with `reason: "queue_overflow"` — straight to
+`Engine.handle_ws`, whose existing branch calls `desk.invalidate_books` and
+clears `book.ok`; the affected tickers are added to `_recovering_orderbooks`, so
+every further delta for them is refused until their snapshot lands; and a
+`get_snapshot` request goes out immediately. This is deliberately NOT rate
+limited by time: a newly affected market is disclosed and invalidated on the
+drop that first touches it, because the consumer must not be able to fill from
+it in the interim. Repeat drops for a market already invalidated are counted
+only, so the cost is bounded by the number of distinct markets per recovery
+cycle (54 tickers in the incident), not by the frame rate. A dropped book frame
+whose market cannot be read invalidates every subscribed market.
+
+The stall guard is a third coroutine beside the reader and consumer. When the
+depth stays at or above `WS_QUEUE_STALL_DEPTH` (0 derives half of
+`WS_QUEUE_MAX`, and leaves the guard off while the queue is unbounded) for
+longer than `WS_QUEUE_STALL_S` (default 60), it logs the fault through
+`on_state`, emits a `queue_stall_reconnect` feed event, drains the queue into
+`frames_discarded`, and closes the socket, which completes one of the tasks
+`run()` waits on and rebuilds the connection — re-subscribing, which yields
+fresh snapshots. `WS_RECONNECT_MIN_INTERVAL_S` (default 120) floors the interval
+between two forced reconnects, and a suppressed attempt is counted rather than
+queued. The decision is a pure function, `_stall_reconnect_due(depth, now)`, so
+it is testable without waiting on wall-clock time.
+
+`Engine.status()` and `KalshiWS.status()` report `queue_depth`, `queue_max`,
+`queue_drop_policy`, `queue_dropped_total`, `queue_overflow_events` and
+`queue_forced_reconnects` beside the existing `feed_backlog`.
+
+**Before / after.** Same input: 6 frames arriving into a queue bounded at 4
+while the consumer is blocked. Before: 6 frames queued, depth 6, nothing
+recorded, the consumer eventually processes frames 1 and 2 and trades on book
+state that is two frames stale — and at production scale, 556,000 frames and 38
+minutes stale. After: frames 1 and 2 are discarded from the head, the 4 newest
+survive, `queue_dropped_total` is 2, one `queue_overflow` ledger row and one raw
+marker record 2 dropped, depth 4, bound 4, and the exchange-timestamp span
+1,000-1,100 ms that was thrown away. Same input again with frame 1 an
+`orderbook_delta` for market A: additionally, an `orderbook_gap` with
+`reason: "queue_overflow"` reaches the engine on the drop, `books["A"].ok`
+becomes False, the desk's shadow book for A is invalidated, a `get_snapshot`
+for A goes out, and every further delta for A is refused until that snapshot
+arrives. A holed book cannot serve a fill: `book.ok` gates all six fill paths
+(`paper.py` 392, 570, 1009 and `engine.py` 477, 910, 940) and only
+`Book.apply_snapshot` sets it back to True — a queued delta applied afterwards
+does not, which is asserted directly.
+
+**Reasoning and trade-offs.** *Dropping the newest instead of the oldest* was
+rejected: it preserves the past and discards the present, which is the wrong way
+round for a live book, and it would have kept exactly the 77-minute-old frames
+that produced the fabricated trades. *A bounded `asyncio.Queue` with `maxsize`
+and a blocking `put`* was rejected: it restores backpressure onto `recv`, which
+is the old visible failure but reached slowly and without a record of what was
+lost; the explicit head-drop makes the loss countable. *Fixing the consumer's
+slowness in this change* was rejected as out of scope and separately reviewable
+— bounding and disclosure are the priority, and a faster consumer with an
+unbounded queue is still one bad hour from the same silent failure. *Reconnect
+only, without a bound* was rejected: a reconnect after 60 s of stall still
+leaves up to 60 s of stale processing, and the guard cannot fire more often than
+`WS_RECONNECT_MIN_INTERVAL_S`. *Failing closed on an unknown drop policy* was
+rejected because failing closed here means an unbounded queue, which is the
+defect.
+
+`WS_QUEUE_*` are transport knobs and stay OUT of `STRATEGY_PARAM_NAMES`: they
+decide which frames the process sees, not what it does with a frame it has seen,
+so they must not move `config_id` and re-partition the study. They ARE added to
+`exporter._OBSERVABILITY_NAMES`, because a bundle captured under a bound may
+contain deliberate holes and a replay has to be able to read the bound off the
+manifest.
+
+**Validation.** `tests/test_ws_queue_bounds.py`, 24 tests. The bound and the
+policy: overflow discards the oldest and the newest survive, with the ledger
+detail including the discarded exchange-timestamp span; `WS_QUEUE_MAX=0`
+restores the unbounded queue exactly (50 frames queued, 0 dropped, 0 events), so
+existing tests are unaffected; an unparseable discard is still counted; an
+unknown policy normalises to `oldest`, never to unbounded. Book safety: a
+dropped delta invalidates its market, dispatches `orderbook_gap` with
+`reason: "queue_overflow"`, sends `get_snapshot`, and causes the NEXT delta for
+that market to be refused while the following snapshot is accepted; a dropped
+trade alone invalidates nothing; a book frame with no readable market
+invalidates every subscribed market. Rate limiting: 59 discards inside one
+window produce exactly ONE `queue_overflow` event that still accounts for all
+59, while a newly affected market is disclosed without waiting. Stall guard:
+`_stall_reconnect_due` fires exactly once after the hold time, disarms when the
+queue drains, refuses a second reconnect inside the minimum interval (counting
+the suppression) and allows one after it, and is off while the queue is
+unbounded; `_watch_queue` drains 5 queued frames into `frames_discarded` and
+closes the socket; and driving `run()` end to end with a deliberately slow
+consumer (1 ms/frame) and a patched `websockets.connect` produces
+`connections >= 2` with `queue_forced_reconnects == 1` — the stall really does
+rebuild the connection, and the minimum interval really does stop the second
+one. Engine-level: an overflow gap clears `book.ok` for the affected market only,
+a queued delta does not revive it, a fresh snapshot does, the eventlog line reads
+"arrival queue overflow ... dropped=400" while a real sequence gap still reads
+"sequence gap sid=7 expected=11 received=40", and `status()` surfaces all six
+counters (and reports zeroes with no socket). Suite 562 tests OK after this
+commit, from 538. Smoke run on port 8731 in demo mode: `/api/status` reports
+`queue_depth 0`, `queue_max 20000`, `queue_drop_policy oldest`,
+`queue_dropped_total 0`, `queue_overflow_events 0`,
+`queue_forced_reconnects 0`, and the dashboard serves.
+
+**Risks / limitations.** This does not make the consumer faster, and with
+`WS_QUEUE_MAX=20000` a consumer as slow as the one measured will now DROP
+frames rather than queue them — that is the intended trade, but it means the raw
+archive will contain real holes under load, which is why every hole is
+ledgered and markered. 20,000 frames is roughly 18 s of the measured peak
+(64.7k frames/min); a stall shorter than that costs nothing, a longer one costs
+data. The stall guard's reconnect discards the queue, so up to `WS_QUEUE_MAX`
+frames are lost per forced reconnect, counted in `frames_discarded`. Recovery
+still depends on the snapshot arriving through the same queue, so under a deep
+backlog an invalidated book can stay invalid for a long time — correct (no fills
+from it) but it means missed opportunities, and the stall guard is what
+eventually resolves it. The `orderbook_gap` dispatch writes one `eventlog` row
+per newly affected market on the event loop, through `store.ex`, which commits;
+that is bounded per recovery cycle and matches the pre-existing sequence-gap
+path, but it is an fsync on the loop during exactly the condition that produced
+the stall. Finally, the fabricated +$281 across trades 110-114 stays in the
+ledger; this change stops it recurring and does not rewrite history.
+
+**Follow-up.** The consumer's slowness is unfixed and deliberately out of scope.
+Two specific blocking calls on the consumer coroutine were identified while
+working here and NOT changed, recorded so the next person does not have to find
+them again:
+
+1. `Engine.handle_ws` line 437 calls `self.recorder.write(...)` inline for every
+   `orderbook_snapshot`, `orderbook_delta`, `trade` and `market_lifecycle_v2`
+   frame. That is a synchronous `gzip` write — deflate compression plus buffered
+   file I/O, with an explicit `flush()` every 200 frames — on the event loop, at
+   1,782,137 `orderbook_delta` frames per two hours in the measured replay. This
+   is the strongest single candidate for an I/O-bound consumer.
+2. `store.ex` takes a process-wide `threading.Lock` and `commit()`s (an fsync) on
+   every call. `record_signal` reaches it on the consumer coroutine via
+   `store.insert_signal` and `store.add_latency`, and the `orderbook_gap` branch
+   via `store.log_event`. Because work dispatched with `asyncio.to_thread` writes
+   through the SAME lock, an event-loop caller can block waiting on a lock held
+   by a worker thread mid-fsync — which is precisely the "I/O- or lock-bound at
+   0.12 of 8 vCPU" signature the incident showed.
+
+Neither was measured under load in this pass; both are hypotheses with a
+mechanism, and each needs its own change with its own evidence.
 
 ### CHG-2026-09-05-020 — Record that `PRICE_FLOOR`'s rationale is now in doubt
 
