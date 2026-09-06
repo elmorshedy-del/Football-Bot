@@ -258,6 +258,40 @@ instead is the open question, and `consume_slices` (slices per second, and work
 per slice) is the instrument that distinguishes "scheduled rarely" from "queue
 oscillating to empty between samples".
 
+**Starved, not saturated — settled 2026-09-06 20:12 UTC.** 61 s window, 54
+markets, queue growing 10 -> 4,585, 376 frames/s:
+
+| | |
+|---|---|
+| consumer working time | 3,221 ms = **5.28%** of wall clock |
+| its own frame stages | 2,507 ms = 4.11% |
+| everything else measured (`periodic` + `status`) | 40 ms = **0.07%** |
+| slices | 667 = 10.9/s |
+| **work per slice** | **4.83 ms against a 5 ms budget** |
+
+The per-slice figure is what decides it. In the quiet window an hour earlier it
+was 1.91 ms: slices ended early because the queue emptied. Under load they run
+to the full budget, so the consumer is doing everything it is permitted to do
+and is handed the loop only 10.9 times a second -- a turnaround of ~92 ms.
+10.9 x 4.83 ms = 5.26%, which is the measured share. It is budget-limited, not
+work-limited.
+
+**And the loop is not visibly doing anything else.** `periodic` cost 28.8 ms
+over the window (0.05%) and `status` 11.5 ms (0.02%); their alarming maxima --
+`periodic.subthreshold` 374 ms, `status` 558 ms -- are cumulative since boot,
+from the earlier overload, and do not recur in this window. No dashboard was
+open: `/api/perf` shows 2 requests in 180 s totalling 10 ms, so response
+handling and serialisation are excluded. Railway CPU was 0.246 of 8 vCPU.
+
+So ~95% of wall clock is in nothing instrumented, while ~0.2 of a core is being
+burned somewhere. The untimed work on the loop is the **reader** -- `_read`'s
+`async for raw in ws`, which decrypts and decodes every one of those 22,910
+frames -- and `_handle_raw`'s `json.loads` and sequence gate, which sit inside
+`consume_ns` and so cannot explain a *low* share. Instrumenting the reader the
+same way is the next measurement. It has not been done, and no fix should be
+attempted before it is: the three wrong diagnoses in this document were each
+produced by reasoning one step past the last measurement.
+
 **Open.** What owns the remaining loop time. `Engine.status()` was one
 identified consumer -- 18 queries on the loop, 104 ms per call, from the 5 s
 broadcast and every `/api/status` poll and WebSocket hello -- now moved to a
