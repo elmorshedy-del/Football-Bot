@@ -14,6 +14,7 @@ Three changes driven by live evidence:
 * The 88 threshold was hard-coded inside the gate. It is now configuration, so
   it can be moved deliberately and is covered by the config fingerprint.
 """
+from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
@@ -162,3 +163,48 @@ class MappingTaskTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MinuteFloorIsReportedNotHardcodedTests(unittest.TestCase):
+    """The dashboard must name the floor the gate actually uses.
+
+    CHG-2026-09-04-011 lowered `SLEEVE_MIN_MINUTE` from 88 to 80 and
+    deliberately kept the stored outcome identifiers (`clock_88_plus`,
+    `clock_pre_88`) unchanged, because they are written across the whole study
+    and renaming them would stop the 88-era and 80-era rows from pooling.
+
+    The dashboard was then left rendering "Clock before minute 88" for a gate
+    that refuses below 80, and "88+ clock accepted" for one that accepts from
+    80. The operator who designed the bot read those labels and concluded the
+    floor was still 88. That is the same defect as a settlement card that reads
+    backwards: a label stating a number that is no longer the number.
+    """
+
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def test_the_api_reports_the_gates_whose_labels_carry_a_number(self):
+        source = (self.ROOT / "app" / "main.py").read_text()
+        self.assertIn('"sleeve_min_minute": config.SLEEVE_MIN_MINUTE', source)
+        self.assertIn('"price_floor": config.PRICE_FLOOR', source)
+
+    def test_the_browser_renders_the_configured_floor(self):
+        js = (self.ROOT / "static" / "app.js").read_text()
+        self.assertIn("state.config?.sleeve_min_minute", js)
+        self.assertIn("withMinuteFloor", js)
+        # Every human-readable "88" goes through the rewriter.
+        self.assertIn('replaceAll("minute 88"', js)
+        self.assertIn('replaceAll("88+"', js)
+
+    def test_an_unloaded_config_says_floor_rather_than_asserting_88(self):
+        """Before /api/config lands the page must not claim a number at all."""
+        js = (self.ROOT / "static" / "app.js").read_text()
+        self.assertIn('"the minute floor"', js)
+        self.assertIn('"minute-floor"', js)
+
+    def test_the_stored_identifiers_keep_their_historical_wording(self):
+        """Renaming them would break comparability across the two eras, which
+        is exactly why the labels had to change instead."""
+        clock_source = (self.ROOT / "app" / "match_clock.py").read_text()
+        self.assertIn('"clock_88_plus"', clock_source)
+        self.assertIn('"clock_pre_88"', clock_source)
+        self.assertIn("config.SLEEVE_MIN_MINUTE", clock_source)

@@ -16,6 +16,72 @@ work into `main`).
 **Deployment status:** the 2026-09-05 work IS now deployed; this section's
 entries are not, unless an entry says otherwise.
 
+### CHG-2026-09-06-007 — Say the minute floor the gate actually uses, not the one its identifiers are named after
+
+**Commit:** this change
+**Components:** `app/main.py` (`/api/config`), `static/app.js`
+(`minuteFloor`, `withMinuteFloor`, `humanOutcome`, `humanClockGate`,
+`filterMarkup`, clock stamp block, clock coverage), `static/index.html`,
+`tests/test_price_floor_and_clock.py`, `tests/test_dashboard_browser.py`,
+`tests/test_pr13_browser_followup.py`
+
+**Observed / original behaviour.** CHG-2026-09-04-011 lowered
+`SLEEVE_MIN_MINUTE` from 88 to 80 and deliberately kept the stored outcome
+identifiers — `clock_88_plus`, `clock_pre_88`, `sleeve_clock_pre_88`,
+`usable_for_88_gate` — unchanged, because they are written across the whole
+study and renaming them would stop the 88-era and 80-era rows pooling. That
+decision was right and stands.
+
+What it left behind was a dashboard that renders those identifiers literally:
+
+| shown to the reader | what the gate does |
+|---|---|
+| "88+ clock accepted" | accepts from minute **80** |
+| "Clock before minute 88" | refuses below **80** |
+| "Declined: persisted clock is before minute 88" | refuses below **80** |
+| "88+ clock gate" (filter), "88+ gate" (stamp), "88+ gate misses" | the 80 gate |
+| "Minute-88 diagnosis" (panel heading) | — |
+| "pre 88" (raw `unusable_reason`) | below 80 |
+
+A signal at minute 82 was therefore **accepted** while labelled "88+ clock
+accepted", and one at 79 refused as "before minute 88". The operator who
+designed the bot read those labels and concluded the floor was still 88, two
+days after changing it. `/api/config` did not export `SLEEVE_MIN_MINUTE` at
+all, so the page could not have shown the real number even if it had tried.
+
+This is the same defect as the settlement card of CHG-2026-09-05-022: a label
+stating a number that is no longer the number, on a page whose only job is to
+let someone audit what the bot did.
+
+**Root cause.** The floor became configurable and the identifiers were
+correctly frozen, but nothing separated *identifier* from *label*: the
+dashboard used the former as the latter.
+
+**Change.** `/api/config` exports `sleeve_min_minute` and `price_floor` — the
+two gates whose outcome labels carry a number. `withMinuteFloor()` rewrites
+"minute 88", "minute-88", "88+" and "pre 88" in any label to the configured
+value, and every human-readable path goes through it: the outcome and clock
+gate label tables, the filter dropdown and its heading, the clock stamp's gate
+row, the coverage tile, and the raw `unusable_reason` line. The panel heading
+"Minute-88 diagnosis" became "Match-clock diagnosis", which needs no number and
+so cannot drift again.
+
+Before `/api/config` lands, the wording degrades to "the minute floor" /
+"minute-floor" rather than asserting a number the page has not been told.
+
+**Invariants preserved.** No stored identifier changes: `clock_88_plus`,
+`clock_pre_88` and `usable_for_88_gate` are written, filtered and compared
+exactly as before, so the two eras still pool. No gate logic, no threshold and
+no strategy parameter is touched; `config_id` is unchanged.
+
+**Verification.** Four unit tests pin the contract (the API exports both gates,
+the browser reads the configured floor, an unloaded config asserts no number,
+the stored identifiers keep their historical wording) and two real-browser
+tests assert the rendering with `sleeve_min_minute: 80` served: "80+ clock
+accepted", "Clock before minute 80", "Declined: persisted clock is before
+minute 80", and **no "88" anywhere in the rendered trade card**. Full gate: 633
+tests OK, `compileall`, `ruff`, `node --check`, `git diff --check`.
+
 ### CHG-2026-09-06-006 — Measure the consumer's own share of the wall clock
 
 **Commit:** this change

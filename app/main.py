@@ -421,6 +421,16 @@ async def get_config():
             "goal_latency_poll_ms": config.GOAL_LATENCY_POLL_MS,
             "event_match_window_s": config.EVENT_MATCH_WINDOW_S,
             "match_clock_max_age_ms": config.MATCH_CLOCK_MAX_AGE_MS,
+            # The two gates whose OUTCOME LABELS carry a historical number.
+            # `clock_88_plus` / `clock_pre_88` are stable identifiers, written
+            # across the whole study, and CHG-2026-09-04-011 deliberately kept
+            # their wording when the floor moved 88 -> 80 so the eras stay
+            # comparable.  The dashboard was then left rendering "minute 88" for
+            # a gate that fires at 80, which is a label stating a number that is
+            # no longer the number.  Exporting the live values lets it say the
+            # real one while the identifiers stay put.
+            "sleeve_min_minute": config.SLEEVE_MIN_MINUTE,
+            "price_floor": config.PRICE_FLOOR,
             "league_prior": config.LEAGUE_PRIOR,
             "league_names": config.LEAGUE_NAMES}
 

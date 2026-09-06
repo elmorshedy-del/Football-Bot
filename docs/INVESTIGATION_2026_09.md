@@ -208,6 +208,28 @@ through `handle_ws` issues **96 SQLite statements in total -- 0.0008 per frame,
 not a throughput one: `process_trade`'s 118 ms max is a `record_signal` write on
 the network volume, and a stall like that costs the consumer a whole turn.
 
+**First readings after the fixes (2026-09-06 evening, 33 markets).** `status()`
+fell from 104 ms to ~0.5 ms per call, confirming the snapshot. `periodic` totals
+0.26% of wall clock. Sub-staging the periodic tick names the owner of its tail:
+`periodic.subthreshold` reached a **295 ms max** and `periodic.timeouts` 104 ms,
+both phases that write to SQLite on the loop. Their totals are trivial (460 ms
+and 333 ms over 298 s) so this is a tail, not a throughput cost -- but a 295 ms
+stall is 295 ms in which the process cannot see the market at all, which is the
+same harm the queue backlog does by a different route. Not yet fixed.
+
+**The consumer is starved, measured over a window that qualifies.** A cumulative
+`consume_share` since boot cannot answer this -- it blends the idle warm-up with
+the busy period, and a deep queue at one sampling instant does not mean the queue
+was deep across the averaging window. Taken as a delta instead, over 56 s with
+queue depth 1,761 at the start and 1,944 at the end, so backlogged throughout:
+the consumer worked **2,575 ms of 56,000 -- 4.6%** -- while processing 343
+frames/s, with Railway CPU at **0.246 of 8 vCPU**. Its own frame stages account
+for essentially all of that 4.6%. So the coroutine is not doing something
+expensive and is not competing for CPU; it is not being run. What the loop does
+instead is the open question, and `consume_slices` (slices per second, and work
+per slice) is the instrument that distinguishes "scheduled rarely" from "queue
+oscillating to empty between samples".
+
 **Open.** What owns the remaining loop time. `Engine.status()` was one
 identified consumer -- 18 queries on the loop, 104 ms per call, from the 5 s
 broadcast and every `/api/status` poll and WebSocket hello -- now moved to a

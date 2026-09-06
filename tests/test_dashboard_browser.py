@@ -185,7 +185,10 @@ API_FIXTURES = {
         "expectations": EXPECTATIONS_FIXTURE,
     },
     "/api/config": {"sleeve_start_before_expiry_min": 2,
-                    "sleeve_after_expiry_min": 12},
+                    "sleeve_after_expiry_min": 12,
+                    # The floor the gate actually uses, which is NOT the 88 the
+                    # stored outcome identifiers still carry.
+                    "sleeve_min_minute": 80, "price_floor": 35.0},
     "/api/matches": [],
     "/api/trades": {"open": [], "closed": [TRADE, LOSS_TRADE]},
     "/api/signals": [],
@@ -572,3 +575,36 @@ class DashboardBrowserTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_the_clock_gate_reads_the_floor_it_actually_uses(self):
+        """With SLEEVE_MIN_MINUTE=80 served by /api/config, nothing the reader
+        sees may still say 88 — while the stored identifiers keep it."""
+        page = self.open_dashboard()
+        self.show_trades_tab(page)
+
+        rendered = page.evaluate(
+            """() => ({
+                accepted: humanClockGate('clock_88_plus'),
+                declined: humanClockGate('clock_pre_88'),
+                sleeve: humanOutcome('sleeve_clock_pre_88'),
+                window: humanOutcome('sleeve_outside_window'),
+            })""")
+
+        self.assertEqual(rendered["accepted"], "80+ clock accepted")
+        self.assertEqual(rendered["declined"], "Clock before minute 80")
+        self.assertEqual(rendered["sleeve"],
+                         "Declined: persisted clock is before minute 80")
+        self.assertIn("minute-80", rendered["window"])
+        for text in rendered.values():
+            self.assertNotIn("88", text, f"still shows 88: {text}")
+        self.assertEqual(self.console_errors, [])
+
+    def test_before_the_config_loads_no_number_is_asserted(self):
+        page = self.open_dashboard()
+        wording = page.evaluate(
+            """() => { const real = state.config; state.config = {};
+                       const out = humanClockGate('clock_pre_88');
+                       state.config = real; return out; }""")
+
+        self.assertNotIn("88", wording)
+        self.assertIn("minute floor", wording)

@@ -108,6 +108,9 @@ def fixtures():
     )
     data["/api/config"] = {
         "sleeve_start_before_expiry_min": 2, "sleeve_after_expiry_min": 12,
+        # The floor the gate actually uses. The stored outcome identifiers
+        # still say 88; what the reader sees must say 80.
+        "sleeve_min_minute": 80, "price_floor": 35.0,
         "league_names": {"KXGAME": "Premier League"},
     }
     data["/api/trades"] = {"open": [], "closed": [winner, loser]}
@@ -292,7 +295,11 @@ class PR13BrowserFollowupTests(DashboardBrowserTests):
 
         page.select_option('#trade-filters [data-filter-field="gate"]', "declined")
         page.wait_for_function("() => document.querySelectorAll('#trade-list .trade-story').length === 1")
-        self.assertIn("CLOCK BEFORE MINUTE 88", page.inner_text("#trade-list").upper())
+        # The stored identifier is still `clock_pre_88`; the reader sees the
+        # floor the gate actually uses.
+        card = page.inner_text("#trade-list").upper()
+        self.assertIn("CLOCK BEFORE MINUTE 80", card)
+        self.assertNotIn("88", card)
         self.reset_filters(page)
 
         page.select_option('#trade-filters [data-filter-field="association"]', "unmatched")
@@ -367,7 +374,7 @@ class PR13BrowserFollowupTests(DashboardBrowserTests):
         page = self.open_dashboard(viewport={"width": 360, "height": 780})
         expectations = {
             "trades": ("Trailing profit lock", "90+5", "After entry", "10 seconds", "Arsenal"),
-            "signals": ("Paper order filled", "State-consistent match event", "88+ clock accepted", "Arsenal"),
+            "signals": ("Paper order filled", "State-consistent match event", "80+ clock accepted", "Arsenal"),
             "leagues": ("Premier League", "+$0.20", "2 trades"),
             "system": ("Order arrival (K4)", "80.0", "120.0"),
         }
