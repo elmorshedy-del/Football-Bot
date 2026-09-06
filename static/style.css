@@ -378,6 +378,23 @@ strong, .tabular { font-variant-numeric: tabular-nums; }
 .settlement-note.unknown { border-color: rgba(242, 189, 98, .3); background: var(--amber-soft); }
 .settlement-note p { margin: 0; color: var(--muted); font-size: .82rem; overflow-wrap: anywhere; }
 .settlement-note .settlement-sentence { color: var(--text); font-weight: 700; }
+/* Against intent. One card per measured number; the grid collapses to a single
+   column well before 360px so a verdict is never clipped on a phone. */
+.panel-note { margin: 0 0 14px; color: var(--subtle); font-size: .78rem; line-height: 1.5; }
+.expectations-list { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+.expectation {
+  display: grid; gap: 5px; min-width: 0; padding: 11px 12px;
+  border-radius: 10px; border: 1px solid var(--border);
+  background: rgba(255, 255, 255, .025);
+}
+.expectation.exceeding { border-color: rgba(255, 115, 126, .35); background: var(--red-soft); }
+.expectation.within { border-color: rgba(56, 217, 150, .25); }
+.expectation-head { display: flex; gap: 8px; align-items: baseline; justify-content: space-between; }
+.expectation-head strong { min-width: 0; overflow-wrap: anywhere; }
+.expectation-head .tag { white-space: normal; flex-shrink: 0; }
+.expectation-numbers { margin: 0; font-size: .95rem; overflow-wrap: anywhere; }
+.expectation-numbers .muted { font-size: .8rem; font-weight: 400; }
+.expectation small { color: var(--subtle); font-size: .72rem; line-height: 1.45; overflow-wrap: anywhere; }
 .trade-audit { padding: 20px; min-width: 0; }
 .event-association { padding: 15px; border-radius: 12px; background: var(--blue-soft); border: 1px solid rgba(86, 184, 255, .2); }
 .event-association.unmatched { background: rgba(255, 255, 255, .025); border-color: var(--border); }

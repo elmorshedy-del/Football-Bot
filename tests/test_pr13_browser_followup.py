@@ -5,6 +5,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from test_dashboard_browser import (
     API_FIXTURES,
+    EXPECTATIONS_FIXTURE,
     GAPPED_SAMPLES,
     LOSS_TRADE,
     PATH_SUMMARY,
@@ -35,6 +36,7 @@ def health_status(banner="all_systems_good", checks=None, recent_errors=None):
         "ws_state": "connected",
         "matches": 2,
         "recorded": 321,
+        "expectations": copy.deepcopy(EXPECTATIONS_FIXTURE),
         "health": {
             "ok": banner != "attention_required",
             "runtime_ok": banner != "attention_required",

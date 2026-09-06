@@ -148,12 +148,41 @@ UNKNOWN_RESULT_TRADE = dict(
     market_result=None, market_settled_ts=None, market_status=None,
 )
 
+# One row of each shape the panel has to render: inside a declared bound, past
+# one, no declared bound at all, and a zero-valued integrity count.  Exported so
+# the independent PR13 acceptance suite, which builds its own status payload,
+# renders the same panel instead of an empty one.
+EXPECTATIONS_FIXTURE = {
+    "rows": [
+        {"key": "order_arrival_ms", "label": "Order arrival", "unit": "ms",
+         "statistic": "p95", "observed": 2895826.2, "bound": 250.0,
+         "source": "Kill condition K4", "samples": 194, "age_s": 12.0,
+         "verdict": "EXCEEDING"},
+        {"key": "match_response_ms", "label": "Score-feed response",
+         "unit": "ms", "statistic": "p95", "observed": 159.1,
+         "bound": 250.0, "source": "GOAL_LATENCY_POLL_MS",
+         "samples": 500, "age_s": 2.0, "verdict": "WITHIN"},
+        {"key": "feed_ingress_ms", "label": "Feed ingress lag",
+         "unit": "ms", "statistic": "p95", "observed": 644.7,
+         "bound": None, "source": "No declared bound",
+         "samples": 500, "age_s": 2.0, "verdict": "UNBOUNDED"},
+        {"key": "queue_dropped_total",
+         "label": "Frames dropped by the queue bound", "unit": "count",
+         "statistic": "total", "observed": 0, "bound": 0,
+         "source": "Any drop is market data this process never saw",
+         "samples": None, "age_s": None, "verdict": "WITHIN"},
+    ],
+    "exceeding": ["order_arrival_ms"],
+    "unbounded": ["feed_ingress_ms"],
+}
+
 API_FIXTURES = {
     "/api/status": {
         "mode": "live", "health": {"ok": True, "runtime_ok": True,
                                    "banner": "all_good",
                                    "banner_text": "ALL SYSTEMS GOOD", "checks": {}},
         "started": 1772325000.0, "ws_state": "connected",
+        "expectations": EXPECTATIONS_FIXTURE,
     },
     "/api/config": {"sleeve_start_before_expiry_min": 2,
                     "sleeve_after_expiry_min": 12},
@@ -279,6 +308,10 @@ class DashboardBrowserTests(unittest.TestCase):
     def show_trades_tab(self, page):
         page.click('[data-tab="trades"]')
         page.wait_for_selector("#panel-trades:not([hidden])", timeout=5000)
+
+    def show_system_tab(self, page):
+        page.click('[data-tab="system"]')
+        page.wait_for_selector("#panel-system:not([hidden])", timeout=5000)
 
     # ------------------------------------------------------------------ click
 
@@ -474,6 +507,43 @@ class DashboardBrowserTests(unittest.TestCase):
                  .filter(el => el.children.length === 0
                             && el.scrollWidth > el.clientWidth + 1).length""")
         self.assertEqual(clipped, 0, "settlement wording is clipped at 360px")
+
+    def test_the_expectations_panel_names_what_is_exceeding(self):
+        """The operator's question is "is this number doing what it should".
+
+        A panel that only showed the measurements would be the latency table
+        again; what is asserted here is that each row carries its bound, its
+        source, and a verdict — and that the badge says how many are wrong
+        rather than merely that something is.
+        """
+        page = self.open_dashboard()
+        self.show_system_tab(page)
+        page.wait_for_selector("#expectations-list .expectation", timeout=10000)
+
+        # `.tag` uppercases in CSS, so this is what the operator actually reads.
+        self.assertEqual(page.inner_text("#expectations-verdict"), "1 EXCEEDING")
+        # Worst first: an operator should not have to hunt for the failure.
+        first = page.inner_text("#expectations-list .expectation:first-child")
+        self.assertIn("Order arrival", first)
+        self.assertIn("EXCEEDING", first)
+        self.assertIn("p95 ≤ 250 ms", first)
+        self.assertIn("Kill condition K4", first)
+
+        body = page.inner_text("#expectations-list")
+        self.assertIn("no declared bound", body)
+        self.assertIn("WITHIN", body)
+        self.assertEqual(self.console_errors, [])
+
+    def test_the_expectations_panel_fits_a_360px_phone(self):
+        page = self.open_dashboard(viewport={"width": 360, "height": 780})
+        self.show_system_tab(page)
+        page.wait_for_selector("#expectations-list .expectation", timeout=10000)
+
+        clipped = page.evaluate(
+            """() => [...document.querySelectorAll('#expectations-list *')]
+                 .filter(el => el.children.length === 0
+                            && el.scrollWidth > el.clientWidth + 1).length""")
+        self.assertEqual(clipped, 0, "expectation rows are clipped at 360px")
 
     # ------------------------------------------------------------------ flows
 

@@ -8,6 +8,80 @@ entries; correct them with a dated follow-up entry instead.
 
 ---
 
+## 2026-09-06
+
+**Branch:** `claude/football-bot-analysis-rxz1vz`
+**Base commit:** `eb9c88a` (merge of the bounded-queue and settlement-wording
+work into `main`).
+**Deployment status:** the 2026-09-05 work IS now deployed; this section's
+entries are not, unless an entry says otherwise.
+
+### CHG-2026-09-06-001 — Show every measured number against the bound it is supposed to respect
+
+**Commit:** this change
+**Components:** `app/store.py` (`expectations`, `_expectation_specs`,
+`_expectation_verdict`), `app/engine.py` (`status()`), `static/index.html`,
+`static/app.js` (`renderExpectations`), `static/style.css`,
+`tests/test_expectations.py`, `tests/test_frontend_contract.py`,
+`tests/test_dashboard_browser.py`, `tests/test_pr13_browser_followup.py`
+
+**Observed / original behaviour.** The operator asked to be able to see, without
+reading a ledger, whether latency and the other numbers the bot reports are
+"following intended or exceeding". They could not. The dashboard's latency table
+prints n / p50 / p95 / max / age and a `Threshold` column that is populated for
+exactly one kind — `order_arrival_ms`, from kill condition K4 — because
+`latency_kind_summary` only ever attaches that one threshold. Every other row
+showed a number with nothing to judge it against. `match_clock_age_ms` sat at a
+p50 of 18.4 s beside a configured `MATCH_CLOCK_MAX_AGE_MS` of 10 s, which is the
+knob that refuses sleeve candidates, and nothing on the page connected the two.
+
+**Root cause.** No layer paired a measurement with its declared bound. The
+obvious fix — passing more thresholds into `latency_kind_summary` — would have
+been wrong: `Engine.status` reads that function's `state` for K4, so a bound
+added for reporting would silently have become one that can stop the bot
+trading. A slow score feed would have raised BREACH, which no kill condition
+ever said it should.
+
+**Change.** A separate `store.expectations()` that pairs each number with its
+bound and returns a verdict, and a dashboard panel that renders it. It is
+observation only: it consumes the readiness dict `status()` has already
+computed, performs no write, and feeds no kill condition, health check or
+trading decision.
+
+A bound appears only where something already declares one, resolved from the
+running configuration on each call rather than copied:
+
+| number | bound | declared by |
+|---|---|---|
+| `order_arrival_ms` p95 | 250 ms | kill condition K4 |
+| `paper_entry_ms` p50 | `PAPER_ENTRY_LATENCY_MS` | the delay the desk simulates |
+| `match_clock_age_ms` p50 | `MATCH_CLOCK_MAX_AGE_MS` | above it the sleeve refuses |
+| `match_response_ms` p95 | `GOAL_LATENCY_POLL_MS` | the cadence it must sustain |
+| `backlog_frames` p95 | `ws_queue_stall_depth()` | where the stall guard reconnects |
+| `queue_dropped_total`, `feed_event_failures`, `archive_failures`, `recorder_failures` | 0 | a non-zero value is lost data, not slow data |
+
+`feed_ingress_ms`, `decision_ms`, `paper_exit_ms` and `scheduler_lag_ms` have no
+declared bound anywhere in the system. They are reported as `UNBOUNDED` and
+listed under `unbounded`, rather than being given an invented number that would
+read as design intent. Which numbers nobody ever declared an intent for is
+itself worth seeing.
+
+A measurement that is stale or still collecting reads `STALE` / `NO DATA`, never
+`WITHIN`: the 2026-09-05 stall left `order_arrival_ms` at a p95 of 38 minutes
+and then stale, and reporting that as passing would be worse than reporting
+nothing.
+
+**Verification.** 13 tests in `tests/test_expectations.py`, including that the
+bounds track the config rather than duplicating it, that a stale or collecting
+measurement never reads as passing, and — the invariant that makes this safe —
+that `latency_kind_summary` still attaches a threshold to `order_arrival_ms`
+alone, so K4 is unchanged. Two real-browser tests assert the panel names what is
+exceeding (worst first) and fits a 360 px viewport, and the contract test asserts
+the browser never hardcodes a bound of its own. Full gate: 604 tests OK,
+`compileall`, `ruff`, `node --check`, `git diff --check`.
+
+---
+
 ## 2026-09-05
 
 **Branch:** `claude/football-bot-analysis-rxz1vz`

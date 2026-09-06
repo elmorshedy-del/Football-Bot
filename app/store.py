@@ -959,6 +959,113 @@ def latency_readiness(limit=500, now=None, mode=None):
     }
 
 
+# --- Is each number doing what it is supposed to? ---------------------------
+# OBSERVATION ONLY.  Nothing below feeds a kill condition, the health banner,
+# the K4 gate or any trading decision: `latency_kind_summary`'s `state` is what
+# K4 reads, and attaching more thresholds there would silently turn a reporting
+# bound into a trading one.  This layer only puts each measured number beside
+# the bound it is supposed to respect, and says which.
+#
+# A bound is listed here only when something already declares it -- a kill
+# condition, or a configured knob the process itself acts on.  Where nothing
+# declares one, the row says so ("unbounded") instead of inventing a number;
+# the numbers with no declared intent are worth seeing as such.
+def _expectation_specs():
+    """The bounds, resolved from the running configuration on each call."""
+    return (
+        # key, label, latency kind, statistic, bound, source
+        ("order_arrival_ms", "Order arrival", "order_arrival_ms", "p95",
+         K4_THRESHOLD_MS,
+         "Kill condition K4"),
+        ("paper_entry_ms", "Paper entry latency", "paper_entry_ms", "p50",
+         config.PAPER_ENTRY_LATENCY_MS,
+         "PAPER_ENTRY_LATENCY_MS: the delay the desk is configured to simulate"),
+        ("match_clock_age_ms", "Match-clock age", "match_clock_age_ms", "p50",
+         config.MATCH_CLOCK_MAX_AGE_MS,
+         "MATCH_CLOCK_MAX_AGE_MS: above it the sleeve refuses a candidate"),
+        ("match_response_ms", "Score-feed response", "match_response_ms", "p95",
+         config.GOAL_LATENCY_POLL_MS,
+         "GOAL_LATENCY_POLL_MS: a response slower than the interval cannot hold cadence"),
+        ("backlog_frames", "Frames awaiting processing", "backlog_frames", "p95",
+         config.ws_queue_stall_depth() or None,
+         "WS_QUEUE_STALL_DEPTH: the depth the stall guard reconnects at"),
+        ("feed_ingress_ms", "Feed ingress lag", "feed_ingress_ms", "p95",
+         None, "No declared bound"),
+        ("decision_ms", "Decision time", "decision_ms", "p95",
+         None, "No declared bound"),
+        ("paper_exit_ms", "Paper exit latency", "paper_exit_ms", "p50",
+         None, "No declared bound"),
+        ("scheduler_lag_ms", "Scheduler lag", "scheduler_lag_ms", "p95",
+         None, "No declared bound"),
+    )
+
+
+def _expectation_verdict(observed, bound, state):
+    """WITHIN / EXCEEDING / UNBOUNDED / NO DATA / STALE, and nothing else.
+
+    `state` is the summary's own readiness state, so a stale or still-collecting
+    measurement is never reported as passing a bound it was not measured against.
+    """
+    if state in ("COLLECTING", "INVALID") or observed is None:
+        return "NO DATA"
+    if state == "STALE":
+        return "STALE"
+    if bound is None:
+        return "UNBOUNDED"
+    return "EXCEEDING" if observed > bound else "WITHIN"
+
+
+def expectations(readiness=None, counters=None, mode=None):
+    """Every measured number beside the bound it is supposed to respect.
+
+    `counters` carries the live transport integrity counts the ledger cannot
+    answer (queue drops, archive failures); each is expected to be zero, which
+    is a bound in the same sense as the latency ones: a non-zero value is lost
+    market data or a broken upload, not a slow one.
+    """
+    readiness = latency_readiness(mode=mode) if readiness is None else readiness
+    counters = counters or {}
+    rows = []
+    for key, label, kind, stat, bound, source in _expectation_specs():
+        summary = readiness.get(kind) or {}
+        observed = summary.get(stat)
+        rows.append({
+            "key": key, "label": label, "unit": "ms",
+            "statistic": stat, "observed": observed,
+            "bound": bound, "source": source,
+            "samples": summary.get("n", 0),
+            "age_s": summary.get("age_s"),
+            "verdict": _expectation_verdict(observed, bound, summary.get("state")),
+        })
+    for key, label, source in (
+        ("queue_dropped_total", "Frames dropped by the queue bound",
+         "Any drop is market data this process never saw"),
+        ("feed_event_failures", "Feed-event ledger write failures",
+         "A failed write is a gap the ledger cannot describe"),
+        ("archive_failures", "Raw-archive upload failures",
+         "A failed upload is a segment not yet safe to prune"),
+        ("recorder_failures", "Raw-recorder write failures",
+         "A failed write is a frame missing from the recording"),
+    ):
+        value = counters.get(key)
+        rows.append({
+            "key": key, "label": label, "unit": "count",
+            "statistic": "total", "observed": value,
+            "bound": 0, "source": source,
+            "samples": None, "age_s": None,
+            "verdict": ("NO DATA" if value is None else
+                        "EXCEEDING" if value > 0 else "WITHIN"),
+        })
+    return {
+        "rows": rows,
+        "exceeding": [row["key"] for row in rows if row["verdict"] == "EXCEEDING"],
+        # Which numbers nothing declares a bound for, as a property of the
+        # design rather than of today's samples: a row with no bound belongs
+        # here whether or not it currently has data to report.
+        "unbounded": [row["key"] for row in rows if row["bound"] is None],
+    }
+
+
 BID_PATH_MAX_SAMPLES = 4000
 
 

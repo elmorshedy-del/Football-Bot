@@ -827,6 +827,49 @@ function renderPositions() {
   const rows = state.trades.open || [];
   byId("position-list").innerHTML = rows.length ? rows.map(position => `<div class="position-row"><div class="metric-inline"><strong>${escapeHtml(position.display_game || "Unnamed match")}</strong><span class="tag ${strategyClass(position.strategy) === "price" ? "info" : "warn"}">${escapeHtml(strategyLabel(position.strategy))}</span></div>${positionCallout(position)}<p>${integer(position.remaining ?? position.size)} contracts remaining · entry ${cents(position.entry_px)} · best bid ${cents(position.best_bid)}</p><strong class="${(position.upnl || 0) >= 0 ? "positive" : "negative"}">${money(position.upnl || 0)} open mark</strong>${rawDetails("Raw identifiers", {trade_id: position.id, signal_id: position.signal_id, market: position.market, event: position.event, series: position.series, side: position.side})}</div>`).join("") : '<div class="empty-state">No open paper positions.</div>';
 }
+// --- Against intent --------------------------------------------------------
+// The operator's question is "are these numbers doing what they were meant to",
+// which the latency table alone cannot answer: it prints p50/p95 with a
+// threshold column that is populated for exactly one kind. The server pairs
+// each number with the bound something already declares for it and reports a
+// verdict; this only renders that, and never computes a bound of its own.
+const VERDICT_TAG = {WITHIN: "good", EXCEEDING: "bad", STALE: "warn", "NO DATA": "warn", UNBOUNDED: "info"};
+const VERDICT_ORDER = {EXCEEDING: 0, STALE: 1, "NO DATA": 2, UNBOUNDED: 3, WITHIN: 4};
+function expectationValue(row, value) {
+  if (!finite(value)) return "—";
+  if (row.unit === "count") return integer(value);
+  return `${Number(value).toFixed(value >= 100 ? 0 : 1)} ms`;
+}
+function expectationRow(row) {
+  const bound = finite(row.bound)
+    ? `${row.statistic === "total" ? "" : `${row.statistic} `}≤ ${expectationValue(row, row.bound)}`
+    : "no declared bound";
+  const samples = finite(row.samples) ? `${integer(row.samples)} samples` : "";
+  const age = finite(row.age_s) ? `${duration(row.age_s)} old` : "";
+  const context = [samples, age].filter(Boolean).join(" · ");
+  return `<div class="expectation ${String(row.verdict || "").toLowerCase().replace(" ", "-")}">
+    <div class="expectation-head"><strong>${escapeHtml(row.label)}</strong><span class="tag ${VERDICT_TAG[row.verdict] || "warn"}">${escapeHtml(row.verdict || "NO DATA")}</span></div>
+    <p class="expectation-numbers"><strong>${escapeHtml(expectationValue(row, row.observed))}</strong> <span class="muted">against ${escapeHtml(bound)}</span></p>
+    <small>${escapeHtml(row.source)}${context ? ` · ${escapeHtml(context)}` : ""}</small>
+  </div>`;
+}
+function renderExpectations() {
+  const data = state.status?.expectations || {};
+  const rows = [...(data.rows || [])].sort((a, b) =>
+    (VERDICT_ORDER[a.verdict] ?? 9) - (VERDICT_ORDER[b.verdict] ?? 9));
+  const exceeding = (data.exceeding || []).length;
+  const badge = byId("expectations-verdict");
+  if (badge) {
+    // Say what is wrong, not merely that something is: the count is the thing
+    // an operator acts on.
+    badge.textContent = !rows.length ? "Collecting"
+      : exceeding ? `${exceeding} exceeding` : "All within bounds";
+    badge.className = `tag ${!rows.length ? "warn" : exceeding ? "bad" : "good"}`;
+  }
+  byId("expectations-list").innerHTML = rows.length
+    ? rows.map(expectationRow).join("")
+    : '<div class="empty-state">Expectations appear once the first measurements land.</div>';
+}
 const LATENCY_STATE_TAG = {PASS: "good", BREACH: "bad", COLLECTING: "warn", STALE: "warn", INVALID: "bad"};
 // Canonical kinds are named in tests/test_health.py / app/store.py; render every
 // kind including COLLECTING and STALE so K4 is never hidden by a global LIMIT.
@@ -902,7 +945,7 @@ function renderAll() {
   renderHealth(); renderRuntime(); renderSleeves(); renderFilters(); renderTrades(); renderSignals(); renderEvents();
   renderTimingDiagnostics(); renderProviderEvents();
   renderEquity(); renderAssociationChart(); renderExitChart(); renderFeaturedTrades(); renderPositions(); renderLeagues();
-  renderMatches(); renderLatency(); renderClockCoverage(); renderClockObservations(); renderEvidence(); renderActivity();
+  renderMatches(); renderExpectations(); renderLatency(); renderClockCoverage(); renderClockObservations(); renderEvidence(); renderActivity();
 }
 
 async function refreshAll() {
