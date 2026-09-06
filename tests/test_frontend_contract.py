@@ -193,6 +193,16 @@ class FrontendContractTests(unittest.TestCase):
         # Never quietly subtracted: the card still prints summary.net.
         self.assertIn("money(summary.net || 0)", self.js)
 
+    def test_an_unmapped_match_says_why_it_is_unmapped(self):
+        """"Mapped to live clock: 0" alone reads as a league the provider does
+        not cover. That is how 136 Liga MX and MLS signals were misread on
+        2026-09-06, when Kalshi had a milestone for every one of them."""
+        for token in ("mapping_awaiting_milestone", "mapping_attempts",
+                      "No mapping lookup has run yet",
+                      "awaiting a provider milestone",
+                      "the provider returned none"):
+            self.assertIn(token, self.js)
+
     def test_each_measured_number_is_shown_against_its_declared_bound(self):
         for token in ("renderExpectations", "expectations-list",
                       "expectations-verdict", "row.bound", "row.verdict",

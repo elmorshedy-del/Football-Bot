@@ -161,10 +161,23 @@ class GoalLatencyObserver:
         # event -> fingerprint of the last substantive event, so a correction
         # arriving on a later poll still links to what it revises.
         self.last_substantive_fingerprint = {}
+        # Mapping outcomes.  Without these an unmapped event is unexplainable:
+        # `mapped_matches` alone cannot say whether the lookup was never run,
+        # ran and found nothing, or errored.
+        self.mapping_attempts = 0
+        self.mapping_resolved = 0
+        self.mapping_empty = 0
+        self.mapping_failures = 0
+        self.mapping_empty_events = {}   # event -> last time it returned none
 
     async def _resolve_new_events(self):
         now = time.time()
         active = set(self.event_tickers())
+        # An event that never resolved is not in `milestones`, so the drop loop
+        # below never sees it; without this the awaiting-milestone set grows for
+        # the life of the process.
+        for event in [e for e in self.mapping_empty_events if e not in active]:
+            self.mapping_empty_events.pop(event, None)
         dropped = set(self.milestones) - active
         if dropped:
             # The event is leaving the watch list, so its buffered observation
@@ -189,16 +202,33 @@ class GoalLatencyObserver:
                 response = await self.client.get(
                     "/milestones", limit=10, related_event_ticker=event,
                 )
+                self.mapping_attempts += 1
                 choices = [m for m in response.get("milestones") or []
                            if event in (m.get("related_event_tickers") or [])]
                 if not choices:
+                    # An empty result used to `continue` in silence, so three
+                    # different situations looked identical from outside: never
+                    # attempted, attempted and the provider has no milestone,
+                    # and attempted-but-the-task-never-ran.  On 2026-09-06 that
+                    # cost a wrong diagnosis: 136 signals across Liga MX and MLS
+                    # recorded `clock_unmapped` in one 30-minute window and were
+                    # read as those leagues lacking provider coverage.  They do
+                    # not -- Kalshi had a milestone for every one of those
+                    # events, updated during the window -- the mapping task was
+                    # starved by the arrival-queue stall of that morning.  The
+                    # counters below are what makes those cases distinguishable.
+                    self.mapping_empty += 1
+                    self.mapping_empty_events[event] = now
                     continue
                 milestone = choices[0]
                 milestone_id = str(milestone["id"])
                 self.milestones[event] = milestone_id
                 self.events_by_milestone[milestone_id] = event
+                self.mapping_empty_events.pop(event, None)
+                self.mapping_resolved += 1
                 self.clock_tracker.set_mapping(event, milestone_id)
             except (KeyError, RuntimeError, TypeError, ValueError) as exc:
+                self.mapping_failures += 1
                 self.last_error = f"milestone {event}: {type(exc).__name__}: {exc}"
                 self.clock_tracker.set_mapping(event, None, error=self.last_error)
 
@@ -503,6 +533,12 @@ class GoalLatencyObserver:
             "enabled": True,
             "poll_ms": config.GOAL_LATENCY_POLL_MS,
             "mapped_matches": len(self.events_by_milestone),
+            # Why an event is unmapped, not merely that it is.
+            "mapping_attempts": self.mapping_attempts,
+            "mapping_resolved": self.mapping_resolved,
+            "mapping_empty": self.mapping_empty,
+            "mapping_failures": self.mapping_failures,
+            "mapping_awaiting_milestone": sorted(self.mapping_empty_events),
             "polls": self.polls,
             "scoreless_payloads": self.scoreless_payloads,
             "goals": self.goals,
