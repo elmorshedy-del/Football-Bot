@@ -252,6 +252,65 @@ class BoundedQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ws.queue_overflow_events, 2)
         self.assertEqual(ws.queue_dropped_total, 3)
 
+    async def test_an_unsubscribed_market_is_disclosed_once_not_once_per_frame(self):
+        """"Newly affected" must mean newly SEEN, not newly acted on.
+
+        A book frame for a market this process never subscribed to has no book
+        to invalidate, so the immediate-disclosure path does nothing for it.
+        If that also left it unremembered, every repeat would read as newly
+        affected and force another emission -- a write per frame at exactly the
+        moment the consumer is already too slow, which is the defect the bound
+        exists to remove.  Production drops tens of thousands of these frames.
+        """
+        ws = self.make_ws(queue_max=1, WS_QUEUE_OVERFLOW_REPORT_S=3600.0)
+        queue = asyncio.Queue()
+        ws._queue = queue
+
+        await ws._read(FakeSocket(
+            [book_frame("FOREIGN", seq, seq * 10) for seq in range(1, 41)]), queue)
+
+        self.assertEqual(ws.queue_dropped_total, 39)
+        # One immediate disclosure for the market, then the teardown summary
+        # covering the other 38 -- not one emission per dropped frame.
+        self.assertEqual(ws.queue_overflow_events, 2)
+        gaps = [msg for msg in self.dispatched if msg["type"] == "orderbook_gap"]
+        self.assertEqual(len(gaps), 1)
+        # Nothing subscribed was holed, so nothing is invalidated or re-snapshotted.
+        self.assertEqual(gaps[0]["msg"]["market_tickers"], [])
+        self.assertEqual(self.sent, [])
+
+    async def test_unreadable_book_frames_invalidate_everything_once(self):
+        """The blanket invalidation is worth doing once, not once per frame."""
+        ws = self.make_ws(queue_max=1, WS_QUEUE_OVERFLOW_REPORT_S=3600.0)
+        queue = asyncio.Queue()
+        ws._queue = queue
+        anonymous = json.dumps({"type": "orderbook_delta", "sid": 7, "msg": {}})
+
+        await ws._read(FakeSocket([anonymous] * 40), queue)
+
+        self.assertEqual(ws.queue_dropped_total, 39)
+        self.assertEqual(ws.queue_overflow_events, 2)  # immediate + teardown
+        gaps = [msg for msg in self.dispatched if msg["type"] == "orderbook_gap"]
+        self.assertEqual([gap["msg"]["market_tickers"] for gap in gaps], [["A", "B"]])
+        self.assertEqual(len(self.sent), 1)
+
+    async def test_a_market_holed_again_after_recovering_is_invalidated_again(self):
+        """Remembering a market must not outlive its fresh snapshot."""
+        ws = self.make_ws(queue_max=1, WS_QUEUE_OVERFLOW_REPORT_S=3600.0)
+        queue = asyncio.Queue()
+        ws._queue = queue
+
+        await ws._read(FakeSocket([book_frame("A", 1, 10), trade_frame("B", 20)]), queue)
+        self.assertTrue(await ws._accept_orderbook_frame({
+            "type": "orderbook_snapshot", "sid": 7, "seq": 2,
+            "msg": {"market_ticker": "A"}}))
+
+        await ws._read(FakeSocket([book_frame("A", 3, 30), trade_frame("B", 40)]), queue)
+
+        invalidated = [msg["msg"]["market_tickers"] for msg in self.dispatched
+                       if msg["type"] == "orderbook_gap"]
+        self.assertEqual(invalidated, [["A"], ["A"]])
+
     # ------------------------------------------------------------ stall guard
 
     def test_the_stall_guard_forces_exactly_one_reconnect(self):

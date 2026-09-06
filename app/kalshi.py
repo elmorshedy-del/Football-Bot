@@ -445,9 +445,14 @@ class KalshiWS:
                 ticker = body.get("market_ticker") if isinstance(body, dict) else None
                 if ticker is None:
                     # An order-book frame whose market cannot be read must be
-                    # treated as though it could have been any of them.
+                    # treated as though it could have been any of them -- but
+                    # only while there is still a book left to invalidate.
+                    # Otherwise a run of unreadable frames would re-disclose
+                    # the same full invalidation once per frame, which is a
+                    # write per frame at exactly the moment the process is
+                    # already too slow to keep up.
                     pending["unknown_market"] += 1
-                    new_market = True
+                    new_market = not self._subscribed <= self._overflow_markets
                 elif ticker not in self._overflow_markets:
                     pending["markets"].add(ticker)
                     new_market = True
@@ -527,6 +532,13 @@ class KalshiWS:
                 targets = sorted(m for m in markets if m in self._subscribed)
             else:
                 targets = sorted(markets)
+            # Remember every market this episode was OBSERVED to hole, not just
+            # the ones there was anything to do about.  A dropped book frame for
+            # a market this process never subscribed to has no book to
+            # invalidate, but it is still "already seen": without this, each
+            # repeat of it would read as newly affected and force another
+            # immediate disclosure.
+            self._overflow_markets.update(markets)
             self._overflow_markets.update(targets)
             if sid is not None:
                 self._recovering_orderbooks.setdefault(sid, set()).update(targets)

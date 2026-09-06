@@ -99,6 +99,63 @@ for `asyncio.to_thread` to dispatch to. In production those rows go to a worker
 thread and the loop does not pay for them, so the measured in-process gain is a
 conservative lower bound on the relief the event loop actually gets.
 
+### CHG-2026-09-05-023 — Disclose an overflowing market once, not once per frame
+
+**Commit:** this change
+**Components:** `app/kalshi.py` (`_note_dropped`, `_recover_dropped_books`),
+`tests/test_ws_queue_bounds.py`
+
+**Observed / original behaviour.** Found in review of CHG-2026-09-05-021 before
+that change was deployed; never ran in production.
+
+The bounded queue rate-limits its overflow summary to one per
+`WS_QUEUE_OVERFLOW_REPORT_S`, with one deliberate exception: a market seen for
+the first time in an overflow episode is disclosed **immediately**, because its
+book has to be invalidated before the consumer can fill from it. "Seen for the
+first time" was implemented as "not in `_overflow_markets`", and
+`_overflow_markets` was only updated with the markets that were actually acted
+on — the intersection of the dropped frames' markets with `_subscribed`.
+
+Two kinds of frame are therefore never remembered, because there is nothing to
+do about either:
+
+1. an order-book frame for a market this process is not subscribed to (the feed
+   delivers these in volume — 69,122 in 6.5 h on 2026-08-30/31);
+2. an order-book frame whose `market_ticker` cannot be read, which is treated as
+   though it could have been any market and blanket-invalidates all of them.
+
+Every repeat of either read as newly affected, so each one forced its own
+immediate disclosure: a `queue_overflow` ledger row, a raw-stream marker and a
+dispatched `orderbook_gap` (which writes an event-log row) — **per dropped
+frame**, synchronously, while the consumer is by definition already too slow.
+Measured on the regression test: 39 emissions for 39 dropped frames where 2 are
+correct. The bound would have converted a silent stall into a write storm timed
+to arrive at the exact moment the process could least afford it.
+
+**Root cause.** Conflating "newly affected" with "newly acted on". The set is a
+seen-set, so it has to record what was seen.
+
+**Change.** `_recover_dropped_books` records every market the episode was
+observed to hole, not only the subscribed subset it could re-snapshot; and an
+unreadable book frame counts as newly affecting only while some subscribed
+market is still outside `_overflow_markets` — once everything is invalidated
+there is nothing left for the next such frame to disclose.
+
+**Invariants preserved.** A market with a book to invalidate is still disclosed
+immediately and still re-snapshotted through the sequence-gap path; recovery
+still clears a market from `_overflow_markets` when its fresh snapshot lands, so
+a market holed again after recovering is invalidated again; the reader's
+teardown flush still discloses the final window; no strategy parameter and no
+Gate A behaviour is touched.
+
+**Verification.** Three tests added to `tests/test_ws_queue_bounds.py`:
+40 dropped frames for an unsubscribed market produce one immediate disclosure
+plus the teardown summary (was 39 emissions, asserted against the pre-fix code);
+40 unreadable book frames blanket-invalidate once, not 39 times; and a market
+holed, re-snapshotted, then holed again is invalidated both times. Full gate:
+583 tests OK, `compileall`, `ruff check --select E9,F63,F7,F82`,
+`node --check static/app.js`, `git diff --check` all clean.
+
 ### CHG-2026-09-05-022 — Say which way round every trade was, and why a settlement paid
 
 **Commit:** `45d1b08`
