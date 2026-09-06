@@ -358,6 +358,26 @@ strong, .tabular { font-variant-numeric: tabular-nums; }
 .trade-economics span { display: block; color: var(--subtle); font-size: .68rem; text-transform: uppercase; }
 .trade-economics strong { display: block; margin-top: 3px; }
 .trade-reason { margin-top: 14px; padding: 11px 12px; border-left: 3px solid var(--green); color: var(--muted); background: var(--green-soft); }
+
+/* Which way round the bet was, and why a settlement paid what it paid. The
+   chips reuse the .tag palette but must WRAP: .tag is nowrap, and a sentence
+   like "Betting AGAINST: Manchester City wins" overflows 360px otherwise. */
+.position-callout { display: grid; gap: 4px; margin-top: 12px; min-width: 0; }
+.position-callout .tag,
+.settlement-note .tag { white-space: normal; text-align: left; max-width: 100%; overflow-wrap: anywhere; }
+.position-sentence { margin: 0; color: var(--text); font-weight: 800; overflow-wrap: anywhere; }
+.compact-story .position-sentence { color: var(--text); margin-top: 4px; font-size: .85rem; }
+.position-callout small { color: var(--subtle); font-size: .72rem; overflow-wrap: anywhere; }
+.settlement-note {
+  display: grid; gap: 6px; margin-top: 12px; padding: 11px 12px; min-width: 0;
+  border-radius: 10px; border: 1px solid var(--border);
+  background: rgba(255, 255, 255, .025);
+}
+.settlement-note.paid { border-color: rgba(56, 217, 150, .3); background: var(--green-soft); }
+.settlement-note.void { border-color: rgba(255, 115, 126, .3); background: var(--red-soft); }
+.settlement-note.unknown { border-color: rgba(242, 189, 98, .3); background: var(--amber-soft); }
+.settlement-note p { margin: 0; color: var(--muted); font-size: .82rem; overflow-wrap: anywhere; }
+.settlement-note .settlement-sentence { color: var(--text); font-weight: 700; }
 .trade-audit { padding: 20px; min-width: 0; }
 .event-association { padding: 15px; border-radius: 12px; background: var(--blue-soft); border: 1px solid rgba(86, 184, 255, .2); }
 .event-association.unmatched { background: rgba(255, 255, 255, .025); border-color: var(--border); }

@@ -143,6 +143,12 @@ class PR13BrowserFollowupTests(DashboardBrowserTests):
     test_mobile_360_has_no_horizontal_overflow_on_any_tab = None
     test_mobile_360_shows_required_trade_fields_without_truncation = None
     test_filters_league_view_and_download_control_respond = None
+    # The settlement-wording checks drive the base class's own `open_dashboard`,
+    # whose `trades` override this subclass's narrower stub does not carry.
+    test_a_no_settled_trade_can_never_be_read_as_the_team_having_won = None
+    test_a_yes_settled_draw_trade_reads_as_betting_on_the_draw = None
+    test_an_unrecorded_resolution_says_so_instead_of_inferring_one = None
+    test_settlement_wording_survives_the_360px_viewport = None
 
     def open_dashboard(self, viewport=None, status_sequence=None, export_behavior="ready"):
         page = self.browser.new_page(viewport=viewport or {"width": 1280, "height": 900})

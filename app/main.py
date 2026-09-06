@@ -258,6 +258,30 @@ def _rows_by_signal_id(signal_ids, mode=None):
     )}
 
 
+def _market_settlements(tickers):
+    """Settlement outcome of each parent market, keyed by ticker.
+
+    The dashboard cannot explain a settlement payout without it: a trade row
+    records the side it held and what it was paid, but not how the market
+    resolved, so "Miami wins" sat next to "100" and read as though Miami had
+    won a match that was in fact a draw.  Deliberately NOT mode-scoped: a market
+    is one exchange object, observed in whatever mode happened to be running,
+    and `markets` carries no capture mode for that reason.
+
+    A ticker with no stored result is simply absent, so the caller reports the
+    resolution as unrecorded rather than inferring one from the payout.
+    """
+    tickers = sorted({ticker for ticker in tickers if ticker})
+    if not tickers:
+        return {}
+    marks = ",".join("?" for _ in tickers)
+    return {row["ticker"]: row for row in store.q(
+        f"""SELECT ticker,result,settled_ts,status
+              FROM markets WHERE ticker IN ({marks})""",
+        tuple(tickers),
+    )}
+
+
 def _trades_by_signal_id(signal_ids, mode=None):
     signal_ids = sorted({int(value) for value in signal_ids if value is not None})
     if not signal_ids:
@@ -487,8 +511,16 @@ async def trades(limit: int = 200, mode: str | None = None):
         observations_by_event = _observations_by_event(
             _event_observations(signal_rows.values(), mode=selector)
         )
+        settlements = _market_settlements(row.get("market") for row in rows)
         for r in rows:
             r.pop("book_at_entry", None)
+            # How the PARENT MARKET resolved, so the card can say why a payout
+            # followed instead of leaving the reader to infer it from the side.
+            # Absent for a legacy row, which the dashboard reports as such.
+            settlement = settlements.get(r.get("market")) or {}
+            r["market_result"] = settlement.get("result")
+            r["market_settled_ts"] = settlement.get("settled_ts")
+            r["market_status"] = settlement.get("status")
             signal = signal_rows.get(r.get("signal_id"))
             r.update(_display_names(
                 r.get("market"), r.get("event"),
