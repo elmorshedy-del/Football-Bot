@@ -150,10 +150,25 @@ const latencyLabels = {
   match_response_ms: "Match-feed response", goal_provider_response: "Match-feed response",
   match_clock_age_ms: "Match-clock age", scheduler_lag_ms: "Scheduler lag",
 };
-function humanOutcome(value) { return outcomeLabels[value] || String(value || "Unknown outcome").replaceAll("_", " "); }
+function humanOutcome(value) { return withMinuteFloor(outcomeLabels[value] || String(value || "Unknown outcome").replaceAll("_", " ")); }
 function humanExit(value) { return exitLabels[value] || String(value || "Unknown exit").replaceAll("_", " "); }
 function humanAssociation(value) { return associationLabels[value] || String(value || "unmatched").replaceAll("_", " "); }
-function humanClockGate(value) { return clockGateLabels[value] || String(value || "not recorded").replaceAll("_", " "); }
+// The stored outcome identifiers keep their historical "88" wording on purpose:
+// they are written across the whole study and renaming them would break
+// comparability between the 88-era and 80-era rows (CHG-2026-09-04-011). What
+// the READER sees must still be the number the gate actually uses, which has
+// been 80 since 2026-09-04. `sleeve_min_minute` comes from /api/config; if it
+// has not loaded yet the wording stays generic rather than asserting a number.
+function minuteFloor() {
+  const value = state.config?.sleeve_min_minute;
+  return Number.isFinite(value) ? value : null;
+}
+function withMinuteFloor(label) {
+  const floor = minuteFloor();
+  if (floor === null) return label.replaceAll("minute 88", "the minute floor").replaceAll("minute-88", "minute-floor").replaceAll("pre 88", "pre the floor").replaceAll("pre_88", "pre_floor").replaceAll("88+", "minute-floor");
+  return label.replaceAll("minute 88", `minute ${floor}`).replaceAll("minute-88", `minute-${floor}`).replaceAll("pre 88", `pre ${floor}`).replaceAll("pre_88", `pre_${floor}`).replaceAll("88+", `${floor}+`);
+}
+function humanClockGate(value) { return withMinuteFloor(clockGateLabels[value] || String(value || "not recorded").replaceAll("_", " ")); }
 function humanStatus(value) {
   const text = String(value || "unknown").replaceAll("_", " ");
   return text.charAt(0).toUpperCase() + text.slice(1);
@@ -385,7 +400,7 @@ function clockStampBlock(stamp) {
   const kind = usable ? "good" : legacy ? "warn" : "warn";
   const outcome = stamp.gate_outcome || (usable ? "clock_88_plus" : reason ? `clock_${reason}` : null);
   const chip = outcome ? `<span class="tag ${usable ? "good" : "warn"}">${escapeHtml(humanClockGate(outcome))}</span>` : "";
-  return `<div class="clock-stamp ${kind}"><div><span>Match clock</span><strong>${escapeHtml(clock)}</strong></div><div><span>Age</span><strong>${escapeHtml(age)}</strong></div><div><span>Precision</span><strong>${escapeHtml(precision.replaceAll("_", " "))}</strong></div><div><span>Provider status</span><strong>${escapeHtml(status)}</strong></div>${chip ? `<div><span>88+ gate</span><strong>${chip}</strong></div>` : ""}${legacy ? '<div class="clock-legacy">Legacy signal recorded before clock stamps were persisted.</div>' : ""}${!usable && !legacy && reason ? `<div class="clock-reason">${escapeHtml(reason.replaceAll("_", " "))}</div>` : ""}</div>`;
+  return `<div class="clock-stamp ${kind}"><div><span>Match clock</span><strong>${escapeHtml(clock)}</strong></div><div><span>Age</span><strong>${escapeHtml(age)}</strong></div><div><span>Precision</span><strong>${escapeHtml(precision.replaceAll("_", " "))}</strong></div><div><span>Provider status</span><strong>${escapeHtml(status)}</strong></div>${chip ? `<div><span>${escapeHtml(minuteFloor() === null ? "Minute-floor" : minuteFloor() + "+")} gate</span><strong>${chip}</strong></div>` : ""}${legacy ? '<div class="clock-legacy">Legacy signal recorded before clock stamps were persisted.</div>' : ""}${!usable && !legacy && reason ? `<div class="clock-reason">${escapeHtml(withMinuteFloor(reason.replaceAll("_", " ")))}</div>` : ""}</div>`;
 }
 function tradeHighBlock(trade) {
   // Executable held-side best bid after entry (never mid/ask/last/settlement).
@@ -522,11 +537,12 @@ function filterOptions() {
     .map(name => `<option value="${escapeHtml(name)}" ${filters.match === name ? "selected" : ""}>${escapeHtml(name)}</option>`).join("");
 }
 function filterMarkup(scope, visible, total) {
+  const floor = minuteFloor(), gateName = floor === null ? "Minute-floor" : `${floor}+`;
   const gateOptions = [
-    ["accepted", "88+ gate accepted"], ["declined", "88+ gate declined"],
-    ...Object.entries(clockGateLabels),
+    ["accepted", `${gateName} gate accepted`], ["declined", `${gateName} gate declined`],
+    ...Object.entries(clockGateLabels).map(([key, label]) => [key, withMinuteFloor(label)]),
   ];
-  return `<label class="filter-field">Search<input type="search" data-filter-field="query" value="${escapeHtml(filters.query)}" placeholder="Team, contract, event"></label><label class="filter-field">Sleeve<select data-filter-field="strategy"><option value="all">Both sleeves</option><option value="gate_a" ${filters.strategy === "gate_a" ? "selected" : ""}>Gate A</option><option value="price_only_late_score" ${filters.strategy === "price_only_late_score" ? "selected" : ""}>Price-only</option></select></label><label class="filter-field">Match<select data-filter-field="match"><option value="all">All matches</option>${filterOptions()}</select></label><label class="filter-field">Result<select data-filter-field="result"><option value="all">All results</option><option value="executed" ${filters.result === "executed" ? "selected" : ""}>Executed signals</option><option value="declined" ${filters.result === "declined" ? "selected" : ""}>Declined signals</option><option value="profitable" ${filters.result === "profitable" ? "selected" : ""}>Profitable trades</option><option value="loss" ${filters.result === "loss" ? "selected" : ""}>Losing trades</option></select></label><label class="filter-field">88+ clock gate<select data-filter-field="gate"><option value="all">Any gate outcome</option>${gateOptions.map(([key, label]) => `<option value="${key}" ${filters.gate === key ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}</select></label><label class="filter-field">Event link<select data-filter-field="association"><option value="all">All associations</option>${Object.entries(associationLabels).map(([key, label]) => `<option value="${key}" ${filters.association === key ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}</select></label><label class="filter-field">Period<select data-filter-field="period"><option value="all">All recorded time</option><option value="1" ${filters.period === "1" ? "selected" : ""}>Last 24 hours</option><option value="7" ${filters.period === "7" ? "selected" : ""}>Last 7 days</option><option value="30" ${filters.period === "30" ? "selected" : ""}>Last 30 days</option></select></label><button class="reset-filter" data-reset-filters type="button">Reset</button><div class="filter-count">Showing ${integer(visible)} of ${integer(total)} ${scope}. Filters apply to both audit views.</div>`;
+  return `<label class="filter-field">Search<input type="search" data-filter-field="query" value="${escapeHtml(filters.query)}" placeholder="Team, contract, event"></label><label class="filter-field">Sleeve<select data-filter-field="strategy"><option value="all">Both sleeves</option><option value="gate_a" ${filters.strategy === "gate_a" ? "selected" : ""}>Gate A</option><option value="price_only_late_score" ${filters.strategy === "price_only_late_score" ? "selected" : ""}>Price-only</option></select></label><label class="filter-field">Match<select data-filter-field="match"><option value="all">All matches</option>${filterOptions()}</select></label><label class="filter-field">Result<select data-filter-field="result"><option value="all">All results</option><option value="executed" ${filters.result === "executed" ? "selected" : ""}>Executed signals</option><option value="declined" ${filters.result === "declined" ? "selected" : ""}>Declined signals</option><option value="profitable" ${filters.result === "profitable" ? "selected" : ""}>Profitable trades</option><option value="loss" ${filters.result === "loss" ? "selected" : ""}>Losing trades</option></select></label><label class="filter-field">${escapeHtml(gateName)} clock gate<select data-filter-field="gate"><option value="all">Any gate outcome</option>${gateOptions.map(([key, label]) => `<option value="${key}" ${filters.gate === key ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}</select></label><label class="filter-field">Event link<select data-filter-field="association"><option value="all">All associations</option>${Object.entries(associationLabels).map(([key, label]) => `<option value="${key}" ${filters.association === key ? "selected" : ""}>${escapeHtml(label)}</option>`).join("")}</select></label><label class="filter-field">Period<select data-filter-field="period"><option value="all">All recorded time</option><option value="1" ${filters.period === "1" ? "selected" : ""}>Last 24 hours</option><option value="7" ${filters.period === "7" ? "selected" : ""}>Last 7 days</option><option value="30" ${filters.period === "30" ? "selected" : ""}>Last 30 days</option></select></label><button class="reset-filter" data-reset-filters type="button">Reset</button><div class="filter-count">Showing ${integer(visible)} of ${integer(total)} ${scope}. Filters apply to both audit views.</div>`;
 }
 function bindFilters() {
   document.querySelectorAll("[data-filter-field]").forEach(control => control.addEventListener(control.type === "search" ? "input" : "change", () => {
@@ -907,7 +923,7 @@ function renderClockCoverage() {
     ["Mapped to live clock", coverage.mapped],
     ["Clock present", coverage.clock_present],
     ["Clock fresh", coverage.clock_fresh],
-    ["88+ gate misses", coverage.clock_gate_candidate_misses],
+    [`${minuteFloor() === null ? "Minute-floor" : minuteFloor() + "+"} gate misses`, coverage.clock_gate_candidate_misses],
   ];
   byId("clock-coverage").innerHTML = cells.map(([label, value]) => `<div class="metric-cell"><span>${escapeHtml(label)}</span><strong>${integer(value || 0)}</strong></div>`).join("");
   const faults = coverage.faults || [], mapping = coverage.mapping_errors || [];
