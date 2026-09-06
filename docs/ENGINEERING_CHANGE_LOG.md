@@ -16,6 +16,59 @@ work into `main`).
 **Deployment status:** the 2026-09-05 work IS now deployed; this section's
 entries are not, unless an entry says otherwise.
 
+### CHG-2026-09-06-003 — Say how much of the headline net was priced against a stale book
+
+**Commit:** this change
+**Components:** `app/store.py` (`_stale_fills`, `_stale_fill_threshold_ms`,
+`STALE_FILL_DISCLOSURE_MS`, `_strategy_summary`), `static/app.js`
+(`staleFillNote`), `static/style.css`, `tests/test_book_age_context.py`,
+`tests/test_frontend_contract.py`
+
+**Observed / original behaviour.** Trades 110-114 of 2026-09-05 entered against
+book state 41-79 minutes old, for matches that had already finished, and booked
+the settlement that was queued behind them — about **+$281 of fabricated paper
+profit**, which is still sitting inside the reported net and inside every
+derived figure. `PAPER_MAX_BOOK_AGE_MS=5000` stops it happening again
+(CHG-2026-09-05-014) and the incident is written up in CHG-2026-09-05-021, but
+the dashboard went on printing one net with nothing to say which part of it came
+from prices the exchange had stopped offering.
+
+The L2 replay (A5c) makes the general form of this worse than five trades: every
+absolute P&L figure taken from paper fills during a backlog is affected, in
+proportion to how far behind the process was.
+
+**Root cause.** `book_age_ms` has been recorded on every fill since
+CHG-2026-09-05-012, and nothing read it back.
+
+**Change.** `_strategy_summary` gains `stale_fills`: how many closed trades were
+filled against a book older than the disclosure line, what they contributed
+gross and net, their ids, the worst age seen, and how many trades record no age
+at all. The sleeve card states it under the net.
+
+Three decisions worth recording:
+
+- **Disclosed, never subtracted.** Those fills are a true record of what the bot
+  did; removing them from the aggregate would hide a defect instead of showing
+  it. The headline stays the whole ledger and the note says what is inside it.
+- **Measured, not enumerated.** The condition is each fill's own recorded
+  `book_age_ms`, not a hardcoded list of trade ids, so it keeps holding for any
+  future stall and needs no maintenance.
+- **"Unmeasured" is its own bucket.** Trades from before the capture pass have
+  no `book_age_ms`; they are counted as unmeasured and never as clean, because
+  "not measured" and "measured and fine" are different claims.
+
+The line is `PAPER_MAX_BOOK_AGE_MS` when the guard is on — the age the desk
+actually refuses at, so the report and the behaviour agree — and
+`STALE_FILL_DISCLOSURE_MS` (5,000 ms) when it is off, since the trades most in
+need of disclosure are exactly the ones taken before any guard existed.
+
+**Verification.** Four tests: a stale fill is named with what it contributed;
+the headline still carries every trade (2 trades, net unchanged at $112.87); a
+fill with no recorded age is `unmeasured` and never counted clean; and the line
+follows the guard when the guard is set. Frontend contract asserts the card
+still prints `summary.net` unmodified. Full gate: 617 tests OK, `compileall`,
+`ruff`, `node --check`, `git diff --check`.
+
 ### CHG-2026-09-06-002 — Stop capping the consumer at 16 frames per loop turn, and stop recovery amplifying itself
 
 **Commit:** this change

@@ -183,6 +183,16 @@ class FrontendContractTests(unittest.TestCase):
         self.assertIn("white-space: normal", self.css)
         self.assertIn("@media (max-width: 360px)", self.css)
 
+    def test_a_headline_net_discloses_what_came_from_a_stale_book(self):
+        """The net is not wrong; presenting it without provenance is."""
+        for token in ("staleFillNote", "summary.stale_fills",
+                      "priced against a book already older than",
+                      "because it is what the bot did"):
+            self.assertIn(token, self.js)
+        self.assertIn(".stale-note", self.css)
+        # Never quietly subtracted: the card still prints summary.net.
+        self.assertIn("money(summary.net || 0)", self.js)
+
     def test_each_measured_number_is_shown_against_its_declared_bound(self):
         for token in ("renderExpectations", "expectations-list",
                       "expectations-verdict", "row.bound", "row.verdict",

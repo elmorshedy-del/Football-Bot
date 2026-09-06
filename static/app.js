@@ -335,6 +335,21 @@ function renderRuntime() {
   byId("kill-button").textContent = killEnabled ? "Kill switch engaged" : "Kill switch";
 }
 
+// A net that silently contains fills priced against market state minutes old is
+// the same defect as a settlement card that reads backwards: the number is not
+// wrong, the presentation of it is. Trades 110-114 of 2026-09-05 entered against
+// books 41-79 minutes stale and contributed about +$281. They stay in the total
+// — they are what the bot did — with the contribution stated beside it.
+function staleFillNote(summary) {
+  const stale = summary.stale_fills || {};
+  if (!stale.n) {
+    if (!stale.unmeasured) return "";
+    return `<p class="stale-note unmeasured">${integer(stale.unmeasured)} closed ${stale.unmeasured === 1 ? "trade records" : "trades record"} no book age, so ${stale.unmeasured === 1 ? "it cannot" : "they cannot"} be checked either way.</p>`;
+  }
+  const seconds = finite(stale.max_book_age_ms) ? ` The oldest was ${duration(stale.max_book_age_ms / 1000)} behind.` : "";
+  const unmeasured = stale.unmeasured ? ` A further ${integer(stale.unmeasured)} record no book age at all.` : "";
+  return `<p class="stale-note"><strong>${money(stale.net || 0)} of this came from ${integer(stale.n)} ${stale.n === 1 ? "fill" : "fills"} priced against a book already older than ${integer(stale.threshold_ms)} ms.</strong> Included above, because it is what the bot did.${seconds}${unmeasured}</p>`;
+}
 function sleeveCard(strategy, summary) {
   const positions = (state.trades.open || []).filter(row => row.strategy === strategy);
   const openMark = positions.reduce((sum, row) => sum + (finite(row.upnl) ? row.upnl : 0), 0);
@@ -342,7 +357,7 @@ function sleeveCard(strategy, summary) {
   const description = strategy === "price_only_late_score" ?
     "Independent price-pattern sleeve. It infers a late score state without consuming the match feed." :
     "Original confirmed sweep sleeve with independent positions, lockouts, fills, and exits.";
-  return `<article class="sleeve-card ${strategyClass(strategy)}"><div class="sleeve-top"><div><h3>${escapeHtml(strategyLabel(strategy))}</h3><p>${escapeHtml(description)}</p></div><span class="tag ${status === "PASS" ? "good" : status === "FAIL" ? "bad" : "warn"}">${escapeHtml(humanStatus(status))}</span></div><div class="sleeve-net ${(summary.net || 0) >= 0 ? "positive" : "negative"}">${money(summary.net || 0)}</div><p class="muted">Closed realized net after $${Math.abs(summary.fees || 0).toFixed(2)} in recorded fees</p><div class="metric-grid"><div class="metric-cell"><span>Closed trades</span><strong>${integer(summary.closed || 0)}</strong></div><div class="metric-cell"><span>Win rate</span><strong>${summary.closed ? percent(summary.win_pct) : "Collecting"}</strong></div><div class="metric-cell"><span>Net / trade</span><strong>${summary.closed ? money(summary.net_per_fill || 0) : "Collecting"}</strong></div><div class="metric-cell"><span>Open positions</span><strong>${integer(summary.open || 0)}</strong></div><div class="metric-cell"><span>Open mark</span><strong class="${openMark >= 0 ? "positive" : "negative"}">${money(openMark)}</strong></div><div class="metric-cell"><span>Partial realized</span><strong>${money(summary.open_partial_realized_net || 0)}</strong></div><div class="metric-cell"><span>95% interval</span><strong>${summary.ci95 ? `${money(summary.ci95[0])} to ${money(summary.ci95[1])}` : "Collecting"}</strong></div><div class="metric-cell"><span>Study samples</span><strong>${integer(gate.n_signals || 0)} / ${integer(gate.needed || 50)}</strong></div></div></article>`;
+  return `<article class="sleeve-card ${strategyClass(strategy)}"><div class="sleeve-top"><div><h3>${escapeHtml(strategyLabel(strategy))}</h3><p>${escapeHtml(description)}</p></div><span class="tag ${status === "PASS" ? "good" : status === "FAIL" ? "bad" : "warn"}">${escapeHtml(humanStatus(status))}</span></div><div class="sleeve-net ${(summary.net || 0) >= 0 ? "positive" : "negative"}">${money(summary.net || 0)}</div><p class="muted">Closed realized net after $${Math.abs(summary.fees || 0).toFixed(2)} in recorded fees</p>${staleFillNote(summary)}<div class="metric-grid"><div class="metric-cell"><span>Closed trades</span><strong>${integer(summary.closed || 0)}</strong></div><div class="metric-cell"><span>Win rate</span><strong>${summary.closed ? percent(summary.win_pct) : "Collecting"}</strong></div><div class="metric-cell"><span>Net / trade</span><strong>${summary.closed ? money(summary.net_per_fill || 0) : "Collecting"}</strong></div><div class="metric-cell"><span>Open positions</span><strong>${integer(summary.open || 0)}</strong></div><div class="metric-cell"><span>Open mark</span><strong class="${openMark >= 0 ? "positive" : "negative"}">${money(openMark)}</strong></div><div class="metric-cell"><span>Partial realized</span><strong>${money(summary.open_partial_realized_net || 0)}</strong></div><div class="metric-cell"><span>95% interval</span><strong>${summary.ci95 ? `${money(summary.ci95[0])} to ${money(summary.ci95[1])}` : "Collecting"}</strong></div><div class="metric-cell"><span>Study samples</span><strong>${integer(gate.n_signals || 0)} / ${integer(gate.needed || 50)}</strong></div></div></article>`;
 }
 function renderSleeves() {
   const sleeves = state.stats.sleeves || {gate_a: state.stats.combined || state.stats, price_only_late_score: {}};
