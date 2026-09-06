@@ -8,6 +8,184 @@ entries; correct them with a dated follow-up entry instead.
 
 ---
 
+## 2026-09-06
+
+**Branch:** `claude/football-bot-analysis-rxz1vz`
+**Base commit:** `eb9c88a` (merge of the bounded-queue and settlement-wording
+work into `main`).
+**Deployment status:** the 2026-09-05 work IS now deployed; this section's
+entries are not, unless an entry says otherwise.
+
+### CHG-2026-09-06-002 — Stop capping the consumer at 16 frames per loop turn, and stop recovery amplifying itself
+
+**Commit:** this change
+**Components:** `app/kalshi.py` (`_consume`, `request_snapshot`,
+`_recover_orderbook`, `_accept_orderbook_frame`), `app/config.py`
+(`WS_CONSUMER_SLICE_MS`, `WS_SNAPSHOT_RETRY_S`), `app/exporter.py`,
+`.env.example`, `tests/test_ws_queue_bounds.py`
+
+**Observed / original behaviour.** CHG-2026-09-05-021 bounded the arrival queue
+and said explicitly that the consumer's underlying slowness was a separate
+defect it did not address. Deployed on 2026-09-06, the bound did its job and
+made that defect legible: on a 135-market Saturday the process dropped
+**676,093 frames** across **3,344 overflow episodes** and the stall guard forced
+**55 reconnects**.
+
+The ledger shows the shape of it. Reading `/api/feed-events` for 16:48-16:56
+UTC: 220 `snapshot_requested`, 161 `gap`, 95 `queue_overflow`, 3
+`queue_stall_reconnect`, in eight minutes. A representative run, one second
+apart each:
+
+```
+16:55:58 snapshot_requested {markets: 36, reason: gap}
+16:55:59 gap  {expected: 57335, received: 57808, invalidated: 36, backlog: 19999}
+16:56:01 gap  {expected: 57824, received: 58186, invalidated: 36, backlog: 19999}
+16:56:02 gap  {expected: 58201, received: 58966, invalidated: 36, backlog: 19999}
+16:56:03 queue_stall_reconnect {queue_depth: 20000, held_s: 62.7, drained: 20000}
+```
+
+Those gaps are **self-inflicted**: the reader dropped the frames to hold the
+bound, and the consumer then rediscovered the loss as an unknown sequence gap
+and answered it with the most expensive recovery available, once per second, for
+every market.
+
+Three separate defects compound here, and all three were measured, not inferred:
+
+1. **The consumer was capped at 16 frames per event-loop turn.**
+   `CONSUMER_YIELD_EVERY = 16` forced `await asyncio.sleep(0)` every 16 frames,
+   so throughput was 16 frames per turn regardless of what a frame cost or how
+   much CPU was idle. Production scheduler lag was p50 19 ms / p95 165 ms, which
+   makes that cap **97-800 frames/s**; measured throughput was **239.5
+   frames/s**; the in-process benchmark for the same work is **~19,000
+   frames/s**; CPU was **0.10 of 8 vCPU, max 0.22**, and memory 0.73 GB. Over
+   98% of the shortfall was waiting for the loop to come back, not doing work.
+2. **`request_snapshot` fired once per rejected delta, unbounded.** Its own
+   docstring said so. With 36 books holed at once and thousands of deltas a
+   second, recovery was sending thousands of `get_snapshot` frames a second,
+   each a websocket send taking `_lock` on the consumer path, competing with the
+   reader for that same lock, and each answered by a snapshot pushed into the
+   queue that was already overflowing.
+3. **Every gap re-requested every market.** `_recover_orderbook` rewrote the
+   whole pending set and re-asked for all subscribed markets on each gap, with
+   no suppression for a recovery already in flight.
+
+Together: the bound drops frames → the drops read as gaps → each gap re-requests
+36 snapshots → the snapshots refill the queue → more drops. Recovery was the
+largest single load on the process it was recovering.
+
+**Root cause.** Frames per event-loop turn was a constant where it needed to be
+a time budget; and recovery had no idea it was already recovering.
+
+**Change.**
+- `_consume` drains on a **time slice** (`WS_CONSUMER_SLICE_MS`, default 5 ms):
+  it processes frames until the queue is empty or the slice is spent, then
+  yields. The slice bounds how long anything else on the loop waits — 5 ms
+  against a measured 19-165 ms of scheduler lag — while throughput becomes a
+  function of what a frame costs. When the consumer is keeping up the queue
+  empties and `await queue.get()` yields on its own, exactly as before. `0`
+  restores yield-after-every-frame.
+- `request_snapshot` asks at most once per market per recovery episode,
+  re-asking only after `WS_SNAPSHOT_RETRY_S` (default 5 s) so a snapshot that
+  never arrives is still retried. The pending set already refuses every further
+  delta, so one request is all recovery needed.
+- `_recover_orderbook` records every gap but skips the duplicate blanket
+  re-request while a recovery covering the same markets is in flight and inside
+  the retry interval. Suppression is refused the moment the gap covers a market
+  the in-flight recovery does not, so a newly subscribed market always recovers.
+- A market's entries are cleared when its snapshot lands, so a fresh hole can
+  ask again immediately; both maps are cleared on reconnect.
+
+`WS_CONSUMER_SLICE_MS` and `WS_SNAPSHOT_RETRY_S` are transport knobs and are NOT
+in `STRATEGY_PARAM_NAMES`; they are in the export manifest's observability
+block, because they decide which frames a study got to see.
+
+**Invariants preserved.** Gate A detection, confirmation, sizing, entry, exit,
+fee, lockout and settlement are untouched. A book that lost frames still stops
+serving fills until the exchange re-describes it; every gap and every discard is
+still ledgered; the stall guard and the queue bound are unchanged.
+
+**Verification.** 8 tests added. The throughput tests count frames per real
+event-loop turn using a competing task, on an injected clock, and were run
+against the previous implementation to confirm they fail on it: the old design
+measures exactly `[16, 16, 16, 12]` frames per turn, the new one ~50 for a
+0.1 ms frame and 5-6 for a 1 ms frame, with a 0 ms slice yielding after every
+frame. Recovery tests pin one send per market per episode (49 of 50 calls
+coalesced), re-arming after the snapshot lands, 10 in-flight gaps recorded but
+not re-requested, recovery running again once the books are back, and
+suppression refused when a gap covers a market the in-flight set does not. Full
+gate: 612 tests OK, `compileall`, `ruff`, `node --check`, `git diff --check`.
+
+**Not addressed.** The synchronous `store.ex()` commit-per-statement traffic on
+the event loop (H3) and the 0.5-0.6 s dashboard reads are still there; they
+inflate the loop turnaround the slice now tolerates rather than being removed by
+it. Whether they still matter is now measurable rather than theoretical.
+
+### CHG-2026-09-06-001 — Show every measured number against the bound it is supposed to respect
+
+**Commit:** this change
+**Components:** `app/store.py` (`expectations`, `_expectation_specs`,
+`_expectation_verdict`), `app/engine.py` (`status()`), `static/index.html`,
+`static/app.js` (`renderExpectations`), `static/style.css`,
+`tests/test_expectations.py`, `tests/test_frontend_contract.py`,
+`tests/test_dashboard_browser.py`, `tests/test_pr13_browser_followup.py`
+
+**Observed / original behaviour.** The operator asked to be able to see, without
+reading a ledger, whether latency and the other numbers the bot reports are
+"following intended or exceeding". They could not. The dashboard's latency table
+prints n / p50 / p95 / max / age and a `Threshold` column that is populated for
+exactly one kind — `order_arrival_ms`, from kill condition K4 — because
+`latency_kind_summary` only ever attaches that one threshold. Every other row
+showed a number with nothing to judge it against. `match_clock_age_ms` sat at a
+p50 of 18.4 s beside a configured `MATCH_CLOCK_MAX_AGE_MS` of 10 s, which is the
+knob that refuses sleeve candidates, and nothing on the page connected the two.
+
+**Root cause.** No layer paired a measurement with its declared bound. The
+obvious fix — passing more thresholds into `latency_kind_summary` — would have
+been wrong: `Engine.status` reads that function's `state` for K4, so a bound
+added for reporting would silently have become one that can stop the bot
+trading. A slow score feed would have raised BREACH, which no kill condition
+ever said it should.
+
+**Change.** A separate `store.expectations()` that pairs each number with its
+bound and returns a verdict, and a dashboard panel that renders it. It is
+observation only: it consumes the readiness dict `status()` has already
+computed, performs no write, and feeds no kill condition, health check or
+trading decision.
+
+A bound appears only where something already declares one, resolved from the
+running configuration on each call rather than copied:
+
+| number | bound | declared by |
+|---|---|---|
+| `order_arrival_ms` p95 | 250 ms | kill condition K4 |
+| `paper_entry_ms` p50 | `PAPER_ENTRY_LATENCY_MS` | the delay the desk simulates |
+| `match_clock_age_ms` p50 | `MATCH_CLOCK_MAX_AGE_MS` | above it the sleeve refuses |
+| `match_response_ms` p95 | `GOAL_LATENCY_POLL_MS` | the cadence it must sustain |
+| `backlog_frames` p95 | `ws_queue_stall_depth()` | where the stall guard reconnects |
+| `queue_dropped_total`, `feed_event_failures`, `archive_failures`, `recorder_failures` | 0 | a non-zero value is lost data, not slow data |
+
+`feed_ingress_ms`, `decision_ms`, `paper_exit_ms` and `scheduler_lag_ms` have no
+declared bound anywhere in the system. They are reported as `UNBOUNDED` and
+listed under `unbounded`, rather than being given an invented number that would
+read as design intent. Which numbers nobody ever declared an intent for is
+itself worth seeing.
+
+A measurement that is stale or still collecting reads `STALE` / `NO DATA`, never
+`WITHIN`: the 2026-09-05 stall left `order_arrival_ms` at a p95 of 38 minutes
+and then stale, and reporting that as passing would be worse than reporting
+nothing.
+
+**Verification.** 13 tests in `tests/test_expectations.py`, including that the
+bounds track the config rather than duplicating it, that a stale or collecting
+measurement never reads as passing, and — the invariant that makes this safe —
+that `latency_kind_summary` still attaches a threshold to `order_arrival_ms`
+alone, so K4 is unchanged. Two real-browser tests assert the panel names what is
+exceeding (worst first) and fits a 360 px viewport, and the contract test asserts
+the browser never hardcodes a bound of its own. Full gate: 604 tests OK,
+`compileall`, `ruff`, `node --check`, `git diff --check`.
+
+---
+
 ## 2026-09-05
 
 **Branch:** `claude/football-bot-analysis-rxz1vz`

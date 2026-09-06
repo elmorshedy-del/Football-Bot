@@ -166,7 +166,6 @@ def _backlog_call_style(callback):
 # the websockets keepalive task only run when the consumer yields, so a busy
 # consumer must give the loop back regularly; sixteen frames is well under a
 # millisecond of handler time and keeps arrival stamps within that of receipt.
-CONSUMER_YIELD_EVERY = 16
 RECONNECT_DELAY_S = 3.0
 
 # Frame types that carry order-book state.  Dropping one of these leaves the
@@ -244,6 +243,13 @@ class KalshiWS:
         # cleared when their fresh snapshot lands, so a market that loses deltas
         # again after recovering is invalidated again.
         self._overflow_markets = set()
+        # When each market's snapshot was last asked for, and when each sid's
+        # blanket gap recovery last ran, so recovery cannot re-ask faster than
+        # the exchange can answer.  Cleared per market when its snapshot lands.
+        self._snapshot_requested_at = {}
+        self._gap_recovery_at = {}
+        self.snapshot_requests_coalesced = 0
+        self.gap_recoveries_coalesced = 0
         self._overflow = self._blank_overflow()
         self._last_overflow_emit = None
         self._stall_since = None
@@ -365,15 +371,39 @@ class KalshiWS:
             self._lifecycle_sid = sid
 
     async def request_snapshot(self, ticker):
+        """Ask for one market's snapshot, at most once per market per episode.
+
+        The engine calls this for every delta a holed book rejects, which is
+        unbounded while that book is being rebuilt: during the 2026-09-06 drop
+        storm, 36 markets were recovering at once against thousands of deltas a
+        second, so recovery was sending thousands of `get_snapshot` frames a
+        second -- each one a websocket send taking `_lock`, from the consumer
+        path, competing with the reader for the same lock, and each answered
+        with a snapshot that went back into the queue that was already
+        overflowing.  Recovery was the largest single load on the process it
+        was trying to recover.
+
+        One request per market is all recovery needs: the pending set already
+        refuses every further delta until the snapshot lands.  A request is
+        repeated only after `WS_SNAPSHOT_RETRY_S`, so a snapshot that never
+        arrives is still retried.
+        """
         async with self._lock:
-            if self._orderbook_sid is not None and ticker in self._subscribed:
-                # Deliberately not a ledger event: this fires once per rejected
-                # delta, which is unbounded while a book is being rebuilt.  The
-                # ledger records recovery (`gap` -> `snapshot_requested`), which
-                # is what explains a discontinuity in the study.
-                await self._send("update_subscription", {"sid": self._orderbook_sid,
-                                                         "action": "get_snapshot",
-                                                         "market_tickers": [ticker]})
+            sid = self._orderbook_sid
+            if sid is None or ticker not in self._subscribed:
+                return
+            now = time.monotonic()
+            last = self._snapshot_requested_at.get(ticker)
+            if last is not None and now - last < config.WS_SNAPSHOT_RETRY_S:
+                self.snapshot_requests_coalesced += 1
+                return
+            self._snapshot_requested_at[ticker] = now
+            # Deliberately not a ledger event: the ledger records recovery
+            # (`gap` -> `snapshot_requested`), which is what explains a
+            # discontinuity in the study.
+            await self._send("update_subscription", {"sid": sid,
+                                                     "action": "get_snapshot",
+                                                     "market_tickers": [ticker]})
 
     async def _recover_orderbook(self, sid, expected, received):
         """Invalidate books and request snapshots without replacing the stream.
@@ -387,7 +417,31 @@ class KalshiWS:
             if active_sid is None or (self._orderbook_sid is not None and sid != active_sid):
                 return
             tickers = sorted(self._subscribed)
+            already = self._recovering_orderbooks.get(active_sid)
+            now = time.monotonic()
+            last = self._gap_recovery_at.get(active_sid)
+            # A recovery already in flight covers this gap: every book is
+            # already invalid and every snapshot already asked for.  Re-running
+            # it is not free -- it re-requests a snapshot for every market -- and
+            # during a drop storm the gaps arrive faster than the snapshots can
+            # answer them.  Production, 2026-09-06: 161 gaps in eight minutes,
+            # each re-requesting 36 markets, feeding the queue whose overflow
+            # was manufacturing the gaps.  The gap is still recorded; only the
+            # duplicate re-request is suppressed, and only until the retry
+            # interval, so a recovery that stalls is still retried.
+            if (already and already >= set(tickers) and last is not None
+                    and now - last < config.WS_SNAPSHOT_RETRY_S):
+                self.gap_recoveries_coalesced += 1
+                self._emit("gap", {"sid": active_sid, "expected": expected,
+                                   "received": received,
+                                   "invalidated": len(already),
+                                   "backlog": self.backlog,
+                                   "recovery": "already_in_flight"})
+                return
+            self._gap_recovery_at[active_sid] = now
             self._recovering_orderbooks[active_sid] = set(tickers)
+            for ticker in tickers:
+                self._snapshot_requested_at[ticker] = now
             self._emit("gap", {"sid": active_sid, "expected": expected,
                                "received": received, "invalidated": len(tickers),
                                "backlog": self.backlog})
@@ -646,10 +700,14 @@ class KalshiWS:
         if message.get("type") == "orderbook_snapshot" and ticker in pending:
             pending.remove(ticker)
             # Recovered: a later overflow that hits this market again must
-            # invalidate it again rather than assume it is still invalid.
+            # invalidate it again rather than assume it is still invalid, and a
+            # later hole must be able to ask for a snapshot without waiting out
+            # the retry interval of the request this frame just answered.
             self._overflow_markets.discard(ticker)
+            self._snapshot_requested_at.pop(ticker, None)
             if not pending:
                 self._recovering_orderbooks.pop(sid, None)
+                self._gap_recovery_at.pop(sid, None)
                 self._emit("snapshot_complete", {"sid": sid, "reason": "snapshots_received"})
             return True
         return ticker not in pending
@@ -705,19 +763,43 @@ class KalshiWS:
             self._report_overflow(queue.qsize())
 
     async def _consume(self, queue):
-        """Drain the arrival queue; yields periodically so the reader keeps up."""
-        since_yield = 0
+        """Drain the arrival queue, yielding on a TIME slice, not a frame count.
+
+        Yielding every `CONSUMER_YIELD_EVERY` frames capped throughput at that
+        many frames per event-loop turn, whatever the frames cost and whatever
+        the machine had spare.  Measured in production on 2026-09-06, with 135
+        markets and CPU at 0.10 of 8 vCPU: scheduler lag p50 19 ms / p95 165 ms,
+        so 16 frames per turn is 97-800 frames/s.  Observed throughput was 240/s
+        against bursts the queue could not absorb -- 676,093 frames dropped, 55
+        forced reconnects -- while the in-process benchmark for the same work is
+        ~19,000 frames/s.  Over 98% of the shortfall was waiting for the loop to
+        come back, not doing the work.
+
+        A time slice decouples the two: drain until the queue is empty or the
+        slice is spent, then yield.  Throughput becomes a function of what a
+        frame costs, and the slice bounds how long anything else waits.  When
+        the consumer is keeping up the queue empties and `await queue.get()`
+        yields on its own, exactly as before.
+        """
+        slice_s = max(0.0, config.WS_CONSUMER_SLICE_MS) / 1000.0
         while True:
             raw, wall, mono = await queue.get()
-            backlog = queue.qsize()
-            if backlog > self.max_backlog:
-                self.max_backlog = backlog
-            await self._handle_raw(raw, wall, mono, backlog)
-            self.frames_consumed += 1
-            since_yield += 1
-            if since_yield >= CONSUMER_YIELD_EVERY:
-                since_yield = 0
-                await asyncio.sleep(0)
+            deadline = time.monotonic() + slice_s
+            while True:
+                backlog = queue.qsize()
+                if backlog > self.max_backlog:
+                    self.max_backlog = backlog
+                await self._handle_raw(raw, wall, mono, backlog)
+                self.frames_consumed += 1
+                # `get_nowait` rather than `get`: an empty queue must end the
+                # slice and yield, never hold the loop waiting inside it.
+                if not slice_s or time.monotonic() >= deadline:
+                    break
+                try:
+                    raw, wall, mono = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+            await asyncio.sleep(0)
 
     def _discard_backlog(self):
         queue, self._queue = self._queue, None
@@ -745,6 +827,8 @@ class KalshiWS:
                     self._queue = asyncio.Queue()
                     self._overflow = self._blank_overflow()
                     self._overflow_markets.clear()
+                    self._snapshot_requested_at.clear()
+                    self._gap_recovery_at.clear()
                     self._last_overflow_emit = None
                     self._stall_since = None
                     self.on_state("connected")

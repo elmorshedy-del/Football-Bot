@@ -1556,6 +1556,8 @@ class Engine:
             latency_readiness = {}
         k4 = latency_readiness.get("order_arrival_ms") or {"state": "COLLECTING"}
         k4_blocking = k4.get("state") in {"BREACH", "INVALID"}
+        archive_obj = getattr(self, "archive", None)
+        archive_status = archive_obj.status() if archive_obj else {}
         checks = {
             "websocket": {"healthy": ws_healthy, "status": self.ws_state},
             "recorder": {"healthy": bool(recorder.get("healthy")),
@@ -1661,9 +1663,22 @@ class Engine:
                 # manifest and `GET /api/archive` carry, plus how the archive
                 # task itself is behaving.  Read from a cached snapshot the
                 # background task refreshes off the loop.
-                "archive": (archive.status()
-                            if (archive := getattr(self, "archive", None)) else {}),
+                "archive": archive_status,
                 "feed_event_failures": getattr(self, "_feed_event_failures", 0),
+                # Every measured number beside the bound it is supposed to
+                # respect, so an operator can see at a glance which ones are
+                # doing what they were meant to.  Observation only: it reuses
+                # the readiness already computed above and feeds nothing.
+                "expectations": store.expectations(
+                    readiness=latency_readiness,
+                    counters={
+                        "queue_dropped_total": (ws.queue_dropped_total
+                                                if ws is not None else 0),
+                        "feed_event_failures": getattr(
+                            self, "_feed_event_failures", 0),
+                        "archive_failures": archive_status.get("failures"),
+                        "recorder_failures": recorder.get("failures"),
+                    }),
                 "feed_lag_p50": round(lat[len(lat) // 2], 1) if lat else None,
                 "feed_lag_p95": round(lat[int(0.95 * len(lat))], 1) if len(lat) > 20 else None}
 

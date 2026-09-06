@@ -14,10 +14,12 @@ silent: the queue is bounded, every discard is counted and ledgered, and a book
 that lost frames stops serving fills until the exchange re-describes it.
 """
 import asyncio
+import collections
 import json
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from app import config
@@ -310,6 +312,153 @@ class BoundedQueueTests(unittest.IsolatedAsyncioTestCase):
         invalidated = [msg["msg"]["market_tickers"] for msg in self.dispatched
                        if msg["type"] == "orderbook_gap"]
         self.assertEqual(invalidated, [["A"], ["A"]])
+
+    # ------------------------------------------------- consumer throughput
+
+    async def drain_with_clock(self, frames, cost_ms, slice_ms):
+        """Drain `frames` frames, charging `cost_ms` to each, on a fake clock.
+
+        Returns how many frames were handled in each event-loop turn -- the
+        quantity the old design fixed at 16 however cheap a frame was.  Turns
+        are counted by a competing task, because that is what a turn IS: the
+        point at which everything else on the loop gets to run.
+        """
+        ws = self.make_ws(queue_max=0, WS_CONSUMER_SLICE_MS=slice_ms)
+        queue = asyncio.Queue()
+        for index in range(frames):
+            queue.put_nowait((trade_frame("A", index), 1.0, 1.0))
+        ws._queue = queue
+
+        now, turn = [0.0], [0]
+        per_turn = collections.Counter()
+
+        async def handle(raw, wall, mono, backlog):
+            now[0] += cost_ms / 1000.0
+            per_turn[turn[0]] += 1
+
+        async def count_turns():
+            while True:
+                await asyncio.sleep(0)
+                turn[0] += 1
+
+        ws._handle_raw = handle
+        # Patch the NAME `app.kalshi` binds, never `time.monotonic` itself: the
+        # event loop reads the real one, and a frozen clock underneath it would
+        # be measuring the harness rather than the code.
+        clock = SimpleNamespace(monotonic=lambda: now[0], time=lambda: 1_000.0)
+        with patch("app.kalshi.time", clock):
+            tasks = [asyncio.ensure_future(count_turns()),
+                     asyncio.ensure_future(ws._consume(queue))]
+            for _ in range(frames * 4):
+                if queue.empty():
+                    break
+                await asyncio.sleep(0)
+            for task in tasks:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        return [per_turn[key] for key in sorted(per_turn)]
+
+    async def test_the_consumer_drains_a_time_slice_not_a_frame_count(self):
+        """The old `CONSUMER_YIELD_EVERY = 16` capped throughput at 16 frames
+        per event-loop turn however cheap a frame was.  Production, 2026-09-06:
+        scheduler lag p50 19 ms / p95 165 ms, so that cap is 97-800 frames/s
+        against ~19,000 frames/s of measured capacity, with CPU at 0.10 of 8
+        vCPU.  Frames per turn must follow the time budget instead."""
+        cheap = await self.drain_with_clock(400, cost_ms=0.1, slice_ms=5.0)
+        self.assertGreater(min(cheap[:-1] or cheap), 16,
+                           "a cheap frame must not still cost a whole loop turn")
+        # 5 ms of 0.1 ms frames is ~50, and never the old fixed 16.
+        self.assertTrue(all(40 <= size <= 60 for size in cheap[:-1]), cheap)
+
+    async def test_an_expensive_frame_shortens_the_batch_instead_of_the_slice(self):
+        """The slice bounds how long anything else on the loop waits, so a
+        costlier frame buys fewer frames per turn -- not a longer turn."""
+        pricey = await self.drain_with_clock(60, cost_ms=1.0, slice_ms=5.0)
+        self.assertTrue(all(5 <= size <= 7 for size in pricey[:-1]), pricey)
+
+    async def test_a_zero_slice_yields_after_every_frame(self):
+        """The escape hatch stays available and means what it says."""
+        every = await self.drain_with_clock(20, cost_ms=1.0, slice_ms=0.0)
+        self.assertEqual(set(every), {1})
+
+    # ---------------------------------------- recovery must not amplify itself
+
+    async def test_a_market_is_asked_for_one_snapshot_per_recovery_episode(self):
+        """The engine calls `request_snapshot` for every delta a holed book
+        rejects, which is unbounded while the book is being rebuilt: during the
+        2026-09-06 storm that was thousands of websocket sends a second, each
+        taking `_lock` on the consumer path and each answered with a snapshot
+        into the overflowing queue."""
+        ws = self.make_ws(queue_max=0)
+        for _ in range(50):
+            await ws.request_snapshot("A")
+
+        self.assertEqual(len(self.sent), 1, "recovery re-asked for the same book")
+        self.assertEqual(ws.snapshot_requests_coalesced, 49)
+        self.assertEqual(self.sent[0][1]["market_tickers"], ["A"])
+
+    async def test_a_snapshot_that_lands_re_arms_the_next_request(self):
+        """Coalescing must not outlive the request it coalesced."""
+        ws = self.make_ws(queue_max=0)
+        ws._recovering_orderbooks[7] = {"A"}
+        await ws.request_snapshot("A")
+        await ws.request_snapshot("A")
+        self.assertEqual(len(self.sent), 1)
+
+        self.assertTrue(await ws._accept_orderbook_frame({
+            "type": "orderbook_snapshot", "sid": 7, "seq": 5,
+            "msg": {"market_ticker": "A"}}))
+        await ws.request_snapshot("A")
+
+        self.assertEqual(len(self.sent), 2, "a fresh hole must be able to ask again")
+
+    async def test_a_gap_while_recovery_is_in_flight_is_recorded_not_re_requested(self):
+        """161 gaps in eight minutes each re-requested all 36 markets, feeding
+        the queue whose overflow was manufacturing the gaps."""
+        ws = self.make_ws(queue_max=0)
+        await ws._recover_orderbook(7, 100, 200)
+        self.assertEqual(len(self.sent), 1)
+        first = self.sent[0][1]["market_tickers"]
+        self.assertEqual(first, ["A", "B"])
+
+        for expected in range(201, 211):
+            await ws._recover_orderbook(7, expected, expected + 5)
+
+        self.assertEqual(len(self.sent), 1, "recovery re-requested while in flight")
+        self.assertEqual(ws.gap_recoveries_coalesced, 10)
+        # Every gap is still on the record; only the duplicate work is skipped.
+        gaps = [detail for kind, detail in self.events if kind == "gap"]
+        self.assertEqual(len(gaps), 11)
+        self.assertEqual(gaps[-1]["recovery"], "already_in_flight")
+        self.assertNotIn("recovery", gaps[0])
+
+    async def test_recovery_still_runs_again_once_the_books_are_back(self):
+        ws = self.make_ws(queue_max=0)
+        await ws._recover_orderbook(7, 100, 200)
+        for ticker in ("A", "B"):
+            await ws._accept_orderbook_frame({
+                "type": "orderbook_snapshot", "sid": 7, "seq": 5,
+                "msg": {"market_ticker": ticker}})
+
+        await ws._recover_orderbook(7, 300, 400)
+
+        self.assertEqual(len(self.sent), 2)
+        self.assertEqual(ws.gap_recoveries_coalesced, 0)
+
+    async def test_a_gap_covering_a_market_recovery_missed_is_never_suppressed(self):
+        """Suppression is only safe while the in-flight set covers everything
+        this gap invalidates; a market subscribed since must still recover."""
+        ws = self.make_ws(queue_max=0)
+        await ws._recover_orderbook(7, 100, 200)
+        ws._subscribed.add("C")
+
+        await ws._recover_orderbook(7, 300, 400)
+
+        self.assertEqual(len(self.sent), 2)
+        self.assertEqual(self.sent[1][1]["market_tickers"], ["A", "B", "C"])
 
     # ------------------------------------------------------------ stall guard
 

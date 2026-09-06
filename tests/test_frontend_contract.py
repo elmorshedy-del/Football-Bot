@@ -24,6 +24,7 @@ class FrontendContractTests(unittest.TestCase):
             "export-panel", "export-audit-button", "export-full-button",
             "export-cancel-button", "export-progress", "export-error",
             "raw-segment-list",
+            "expectations-list", "expectations-verdict",
         ):
             self.assertIn(f'id="{element_id}"', self.html)
         self.assertIn("ALL SYSTEMS GOOD", self.js)
@@ -181,6 +182,25 @@ class FrontendContractTests(unittest.TestCase):
         """`.tag` is nowrap; a wrapped sentence chip must opt out explicitly."""
         self.assertIn("white-space: normal", self.css)
         self.assertIn("@media (max-width: 360px)", self.css)
+
+    def test_each_measured_number_is_shown_against_its_declared_bound(self):
+        for token in ("renderExpectations", "expectations-list",
+                      "expectations-verdict", "row.bound", "row.verdict",
+                      "no declared bound", "exceeding"):
+            self.assertIn(token, self.js)
+        for rule in (".expectations-list", ".expectation.exceeding",
+                     ".expectation-numbers"):
+            self.assertIn(rule, self.css)
+
+    def test_the_browser_never_invents_a_bound_of_its_own(self):
+        """Bounds come from `store.expectations`, which reads them from the
+        kill conditions and the running config.  A number hardcoded here would
+        read as declared intent while tracking nothing."""
+        panel = self.js.split("function renderExpectations")[1].split("\nfunction ")[0]
+        self.assertNotIn("250", panel)
+        self.assertNotIn("1000", panel)
+        # The panel must state the shortfall rather than merely tally it.
+        self.assertIn("exceeding`", self.js)
 
 
 if __name__ == "__main__":
