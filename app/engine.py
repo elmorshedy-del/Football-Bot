@@ -116,6 +116,9 @@ class Engine:
     # Replaced by a per-instance dict on first use.  A class-level default
     # rather than a class-level dict, so no two engines can ever share timings.
     _stages = None
+    # Same reason: tests build an Engine without running `__init__`, and
+    # `status()` must report rather than raise.  None means "read live once".
+    _readiness_snapshot = None
 
     def __init__(self, queue):
         self.q = queue
@@ -183,6 +186,9 @@ class Engine:
         # stage name -> [count, total_ns, max_ns].  A list, not a tuple or a
         # dataclass: it is updated in place on the hot path.
         self._stages = {}
+        # Latency readiness, refreshed off the loop by `periodic_task`; None
+        # until the first refresh lands, when `status()` reads it live once.
+        self._readiness_snapshot = None
         self._feed_event_failures = 0
         self._feed_event_tasks = set()
         self._path_write_tasks = set()
@@ -1526,30 +1532,35 @@ class Engine:
         last_stats = 0.0
         while True:
             await asyncio.sleep(config.BROADCAST_COALESCE_MS / 1000.0)
-            self.desk.check_timeouts()
-            # expire stale pendings
-            now = time.time()
-            # A near miss on a market that then goes quiet would otherwise sit
-            # held until its next trade, which may never come before the match
-            # ends.  Flushing on the same clock bounds that wait.
-            self.detector.flush_subthreshold(now * 1000.0)
-            # Also retries startup watches when no new book frame arrives.
-            self._expire_signal_paths(now)
-            for p in [p for p in self.pending if now >= p["deadline"]]:
-                self.record_signal(p["cand"], None, "unconfirmed")
-            self.pending = [p for p in self.pending if now < p["deadline"]]
-            # coalesced price updates
-            dirty = []
-            for tk, ps in self.prices.items():
-                if ps["dirty"]:
-                    ps["dirty"] = False
-                    m = self.meta.get(tk, {})
-                    dirty.append({"ticker": tk, "event": m.get("event"),
-                                  "series": m.get("series"), "last": ps["last"],
-                                  "bid": ps["bid"], "ask": ps["ask"],
-                                  "late": self.is_late(tk)})
-            if dirty:
-                self.broadcast({"type": "prices", "prices": dirty})
+            # This body runs on the event loop on every coalesce tick, so it is
+            # one of the few things that can starve the frame consumer.  Timed
+            # for the same reason the frame path is: so the next question about
+            # where the loop goes is answered from data.
+            with self.stage("periodic"):
+                self.desk.check_timeouts()
+                # expire stale pendings
+                now = time.time()
+                # A near miss on a market that then goes quiet would otherwise
+                # sit held until its next trade, which may never come before the
+                # match ends.  Flushing on the same clock bounds that wait.
+                self.detector.flush_subthreshold(now * 1000.0)
+                # Also retries startup watches when no new book frame arrives.
+                self._expire_signal_paths(now)
+                for p in [p for p in self.pending if now >= p["deadline"]]:
+                    self.record_signal(p["cand"], None, "unconfirmed")
+                self.pending = [p for p in self.pending if now < p["deadline"]]
+                # coalesced price updates
+                dirty = []
+                for tk, ps in self.prices.items():
+                    if ps["dirty"]:
+                        ps["dirty"] = False
+                        m = self.meta.get(tk, {})
+                        dirty.append({"ticker": tk, "event": m.get("event"),
+                                      "series": m.get("series"), "last": ps["last"],
+                                      "bid": ps["bid"], "ask": ps["ask"],
+                                      "late": self.is_late(tk)})
+                if dirty:
+                    self.broadcast({"type": "prices", "prices": dirty})
             if now - last_stats > 5:
                 last_stats = now
                 self._flush_feed_latency()
@@ -1557,8 +1568,17 @@ class Engine:
                 # the event loop; running it inline here stalled live collection
                 # and every dashboard request for its whole duration every 5s.
                 stats = await store.read(store.stats)
+                # Same seam, same reason: 18 queries over the latency series,
+                # off the loop, so `status()` below is pure in-memory assembly.
+                try:
+                    self._readiness_snapshot = await store.read(
+                        store.latency_readiness)
+                except Exception as exc:  # noqa: BLE001 - reporting only
+                    self._record_error("status", exc)
+                with self.stage("status"):
+                    status = self.status()
                 self.broadcast({"type": "stats", "stats": stats,
-                                "status": self.status()})
+                                "status": status})
 
     def _flush_feed_latency(self):
         """One feed-lag and one backlog sample per stats tick.
@@ -1625,10 +1645,26 @@ class Engine:
         recent_errors = [row for row in self.errors if row["ts"] >= recent_cutoff]
         execution_errors = [row for row in recent_errors
                             if row["component"].startswith("paper")]
-        try:
-            latency_readiness = store.latency_readiness()
-        except Exception:
-            latency_readiness = {}
+        # Readiness is 18 SQLite queries over the latency series, and `status()`
+        # runs on the EVENT LOOP -- from the 5 s broadcast, from every
+        # `/api/status` poll and from every WebSocket hello.  Measured at 104 ms
+        # per call in production, which is loop time the frame consumer does not
+        # get: the whole frame path costs 101 us per frame and only ~2.3% of
+        # wall clock, so what starves it is work like this, not its own cost.
+        #
+        # The line directly below in `periodic_task` already dispatches
+        # `store.stats` through `store.read` for exactly this reason.  This uses
+        # the snapshot that task refreshes off the loop, falling back to a live
+        # read only before the first refresh has landed.  Staleness is bounded
+        # by the broadcast interval and is harmless: readiness is a 500-sample
+        # aggregate, and `k4_blocking` feeds the health banner only -- it gates
+        # no trade, no fill and no kill.
+        latency_readiness = self._readiness_snapshot
+        if latency_readiness is None:
+            try:
+                latency_readiness = store.latency_readiness()
+            except Exception:
+                latency_readiness = {}
         k4 = latency_readiness.get("order_arrival_ms") or {"state": "COLLECTING"}
         k4_blocking = k4.get("state") in {"BREACH", "INVALID"}
         archive_obj = getattr(self, "archive", None)

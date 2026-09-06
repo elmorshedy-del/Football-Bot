@@ -16,6 +16,74 @@ work into `main`).
 **Deployment status:** the 2026-09-05 work IS now deployed; this section's
 entries are not, unless an entry says otherwise.
 
+### CHG-2026-09-06-005 — The frame path is not the bottleneck: take `status()`'s 18 queries off the loop
+
+**Commit:** this change
+**Components:** `app/engine.py` (`status()`, `periodic_task`, `_readiness_snapshot`),
+`tests/test_ws_queue_bounds.py`
+
+**Observed / original behaviour.** CHG-2026-09-06-004 added per-stage timing to
+the frame path. Its first production readings answer the question that has been
+guessed at since 2026-09-04, and the answer is that **the frame path is
+innocent**.
+
+Cumulative over 372 s and 97,257 frames on the live process:
+
+| stage | n | mean | total | local baseline |
+|---|---:|---:|---:|---:|
+| `record` | 97,257 | 47.1 µs | 4,578 ms | 25.6 µs |
+| `on_book` | 94,056 | 31.9 µs | 2,999 ms | 23.5 µs |
+| `process_trade` | 3,198 | 200.8 µs | 642 ms | 61.5 µs |
+| `book_apply` | 94,056 | 12.2 µs | 1,143 ms | 2.6 µs |
+| `observe` | 97,254 | 2.6 µs | 255 ms | 1.7 µs |
+| **total** | | **~101 µs/frame** | **9,617 ms** | ~66 µs/frame |
+
+9.6 s of work in 372 s of wall clock: the entire frame path costs **2.6% of the
+process's time**, at 101 µs per frame against 66 µs measured locally on the same
+recorded frames. Throughput was 261 frames/s. The consumer is not slow — it is
+starved, spending 97.4% of its time waiting for the event loop to come back.
+
+A separate replay measurement rules out the other standing suspect: driving
+120,000 real recorded frames through `handle_ws` issues **96 SQLite statements
+in total — 0.0008 per frame, 0.8% of the run**. Commit-per-statement traffic on
+the loop (H3) is real, but it is not what is capping the frame path.
+
+**Root cause of the change made here.** `Engine.status()` calls
+`store.latency_readiness()` — 9 kinds × 2 queries over the latency series — and
+`status()` runs **on the event loop**: from the 5-second broadcast, from every
+`/api/status` poll, and from every WebSocket hello. `/api/perf` measures
+`/api/status` at **104 ms**. The line immediately below it in `periodic_task`
+already dispatches `store.stats` through `store.read` with a comment saying
+inline execution "stalled live collection and every dashboard request for its
+whole duration every 5s". The identical argument applies to readiness and had
+not been made.
+
+**Change.** `periodic_task` refreshes `self._readiness_snapshot` through
+`store.read` on the same 5-second tick, and `status()` reads that snapshot,
+falling back to a live read only before the first refresh lands. `periodic_task`
+and `status()` are now themselves timed as stages, so the remaining loop budget
+gets the same treatment the frame path just had.
+
+**Why the staleness is safe.** Readiness is a 500-sample aggregate, so a value
+up to one broadcast interval old is not materially different. `k4_blocking`
+derived from it feeds the health banner and the `latency_evidence` check only:
+it gates no trade, no fill and no kill. A test states this so a future change
+that makes K4 load-bearing has to confront it.
+
+**Verification.** 4 tests: `status()` reads the snapshot rather than the
+database; a snapshot that has not landed yet still reports; an Engine built
+without `__init__` carries the default; and the refresh goes through
+`store.read`. Full gate: 626 tests OK, `compileall`, `ruff`, `node --check`,
+`git diff --check`.
+
+**Still open.** This removes one identified consumer of loop time, not all of
+it: 104 ms per `status()` call, several calls a second with a dashboard open,
+against a loop turnaround of 42-203 ms (p50-p95). What owns the remainder is now
+the question, and `periodic` and `status` timings will name their own share on
+the next reading. `process_trade` at a 200.8 µs mean and a **118 ms max** is a
+second thread worth pulling: the detector's 300 s deque scan (A4) is the known
+candidate.
+
 ### CHG-2026-09-06-004 — Measure where the per-frame cost goes
 
 **Commit:** this change
