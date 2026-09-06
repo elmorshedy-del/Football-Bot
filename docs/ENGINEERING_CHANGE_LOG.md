@@ -16,6 +16,55 @@ work into `main`).
 **Deployment status:** the 2026-09-05 work IS now deployed; this section's
 entries are not, unless an entry says otherwise.
 
+### CHG-2026-09-06-004 — Measure where the per-frame cost goes
+
+**Commit:** this change
+**Components:** `app/engine.py` (`Engine.stage`, `stage_costs`, `handle_ws`,
+`status()`), `tests/test_ws_queue_bounds.py`
+
+**Observed / original behaviour.** With the consumer no longer capped at 16
+frames per event-loop turn (CHG-2026-09-06-002), production drains a deep
+backlog instead of spiralling: a 14,666-frame queue cleared to 188 in 46 s while
+sustaining 470 frames/s, against 55 forced reconnects and 676,093 dropped frames
+on the previous build.
+
+But it still hit the bound on the peak burst — 1,463 frames dropped across 31
+episodes — because sustained throughput settles at **320-470 frames/s**, which
+is **2-3 ms per frame**. The in-process benchmark for the same work is ~65 µs.
+Nothing in the process measured where the other ~97% went, so every candidate
+(SQLite commits on the loop, dashboard reads, per-book strategy evaluation,
+forward-path sampling) was equally consistent with the evidence, which is to say
+none of them was evidence.
+
+**Root cause.** The frame path had no per-stage timing at all.
+
+**Change.** `Engine.stage(name)` times one stage of the frame path into an
+in-memory `{name: [count, total_ns, max_ns]}`, and `status()` reports
+`consumer_stages` with count, total, mean and max per stage. `handle_ws` wraps
+five: `record` (the raw recorder write), `book_apply`, `on_book`, `observe` and
+`process_trade`. Counters are cumulative, so a caller differences two reads
+rather than having a window chosen for them; nothing is persisted and nothing
+here can influence a decision.
+
+Part E of the investigation is the reason this is stated so narrowly: every
+instrumentation layer added since 2026-08-30 ran on the trading loop and became
+the latency it had been added to explain. So its own cost is a correctness
+property, and it is measured rather than asserted — **1.14 µs per stage**
+including the context-manager machinery, about 5.7 µs for a book frame's five
+stages, or 0.2-0.3% of the 2-3 ms being explained. A test pins it under 50 µs so
+a future change that makes it expensive fails rather than quietly distorting the
+thing it measures.
+
+**Verification.** 5 tests: stages are reported with their own counts and costs;
+a stage that raises is still counted and still raises; two engines never share
+timings; an engine that has seen no frames reports `{}` rather than failing; and
+the measured per-call cost is under budget. Full gate: 622 tests OK,
+`compileall`, `ruff`, `node --check`, `git diff --check`.
+
+**Next.** This does not fix the throughput ceiling — it makes the next fix
+evidence-led instead of speculative. Read `consumer_stages` off `/api/status`
+during a busy period and the dominant stage names itself.
+
 ### CHG-2026-09-06-003 — Say how much of the headline net was priced against a stale book
 
 **Commit:** this change
