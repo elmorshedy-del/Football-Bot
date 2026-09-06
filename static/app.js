@@ -927,11 +927,26 @@ function renderClockCoverage() {
   ];
   byId("clock-coverage").innerHTML = cells.map(([label, value]) => `<div class="metric-cell"><span>${escapeHtml(label)}</span><strong>${integer(value || 0)}</strong></div>`).join("");
   const faults = coverage.faults || [], mapping = coverage.mapping_errors || [];
+  // An unmapped match must say WHY. "Mapped to live clock: 0" alone reads as a
+  // league the provider does not cover, which on 2026-09-06 is exactly how 136
+  // Liga MX and MLS signals were misread: the provider had a milestone for
+  // every one of them and the mapping task had simply not run.
+  const goal = state.status?.goal_latency || {};
+  const awaiting = goal.mapping_awaiting_milestone || [];
+  const attempts = goal.mapping_attempts;
+  let note = "";
+  if (finite(attempts) && attempts === 0) {
+    note = '<div class="clock-fault-row warn"><strong>No mapping lookup has run yet</strong><span>an unmapped match here has not been asked about, not refused</span></div>';
+  } else if (awaiting.length) {
+    note = `<div class="clock-fault-row warn"><strong>${integer(awaiting.length)} match${awaiting.length === 1 ? "" : "es"} awaiting a provider milestone</strong><span>${escapeHtml(awaiting.slice(0, 6).join(", "))}${awaiting.length > 6 ? ` +${integer(awaiting.length - 6)} more` : ""} · looked up and the provider returned none</span></div>`;
+  }
   if (!faults.length && !mapping.length) {
-    byId("clock-faults").innerHTML = '<div class="empty-state">No live-clock faults reported for watched matches.</div>';
+    byId("clock-faults").innerHTML = note ||
+      '<div class="empty-state">No live-clock faults reported for watched matches.</div>';
     return;
   }
   byId("clock-faults").innerHTML = [
+    note,
     ...faults.map(row => `<div class="clock-fault-row warn"><strong>${escapeHtml(row.event || "unknown event")}</strong><span>${escapeHtml(String(row.reason || "unknown reason").replaceAll("_", " "))}</span></div>`),
     ...mapping.map(row => `<div class="clock-fault-row bad"><strong>${escapeHtml(row.event || "unknown event")}</strong><span>Mapping error: ${escapeHtml(String(row.error || "unknown"))}</span></div>`),
   ].join("");

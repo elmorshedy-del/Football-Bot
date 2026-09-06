@@ -216,3 +216,95 @@ class ClockPersistenceHandoffTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MappingOutcomesAreDistinguishableTests(unittest.IsolatedAsyncioTestCase):
+    """An unmapped event must say WHY it is unmapped.
+
+    On 2026-09-06, 136 signals across Liga MX and MLS recorded
+    `clock_unmapped` inside one 30-minute window, and were diagnosed as those
+    two competitions lacking provider coverage. They do not: Kalshi returns a
+    milestone for every one of those events, and the milestone for the Liga MX
+    fixture carried `last_updated_ts` inside the very window the signals were
+    refused in. The mapping task had simply not run, starved by the
+    arrival-queue stall of that morning.
+
+    The lookup's empty result was a bare `continue`, so "never attempted",
+    "attempted, provider had nothing" and "attempted, task never ran" were
+    indistinguishable from outside — which is what made the wrong reading
+    available in the first place.
+    """
+
+    def observer(self, milestones, active):
+        class Client:
+            async def get(self, path, **_params):
+                if path == "/milestones":
+                    return {"milestones": list(milestones)}
+                return {"live_datas": []}
+
+        return GoalLatencyObserver(Client(), lambda: set(active), lambda *_a: [])
+
+    async def test_an_empty_lookup_is_counted_and_the_event_named(self):
+        observer = self.observer([], {"E"})
+
+        await observer._resolve_new_events()
+
+        status = observer.status()
+        self.assertEqual(status["mapping_attempts"], 1)
+        self.assertEqual(status["mapping_empty"], 1)
+        self.assertEqual(status["mapping_resolved"], 0)
+        self.assertEqual(status["mapping_awaiting_milestone"], ["E"])
+        self.assertEqual(status["mapped_matches"], 0)
+
+    async def test_a_milestone_for_another_event_does_not_count_as_resolved(self):
+        """The filter requires the event in `related_event_tickers`; a
+        near-miss must read as empty, not as a resolution."""
+        observer = self.observer(
+            [{"id": "M", "related_event_tickers": ["SOMETHING-ELSE"]}], {"E"})
+
+        await observer._resolve_new_events()
+
+        self.assertEqual(observer.status()["mapping_empty"], 1)
+        self.assertEqual(observer.status()["mapping_resolved"], 0)
+
+    async def test_resolving_clears_the_awaiting_note(self):
+        milestones = []
+        observer = self.observer(milestones, {"E"})
+        await observer._resolve_new_events()
+        self.assertEqual(observer.status()["mapping_awaiting_milestone"], ["E"])
+
+        milestones.append({"id": "M", "related_event_tickers": ["E"]})
+        observer.last_mapping_attempt.clear()   # skip the 30 s retry floor
+        await observer._resolve_new_events()
+
+        status = observer.status()
+        self.assertEqual(status["mapping_resolved"], 1)
+        self.assertEqual(status["mapping_awaiting_milestone"], [])
+        self.assertEqual(status["mapped_matches"], 1)
+
+    async def test_a_dropped_event_stops_being_reported_as_awaiting(self):
+        active = {"E"}
+        observer = self.observer([], active)
+        await observer._resolve_new_events()
+        self.assertEqual(observer.status()["mapping_awaiting_milestone"], ["E"])
+
+        active.clear()
+        await observer._resolve_new_events()
+
+        self.assertEqual(observer.status()["mapping_awaiting_milestone"], [])
+
+    async def test_a_lookup_error_is_counted_separately_from_an_empty_one(self):
+        class Failing:
+            async def get(self, path, **_params):
+                if path == "/milestones":
+                    raise ValueError("provider rejected the query")
+                return {"live_datas": []}
+
+        observer = GoalLatencyObserver(Failing(), lambda: {"E"}, lambda *_a: [])
+
+        await observer._resolve_new_events()
+
+        status = observer.status()
+        self.assertEqual(status["mapping_failures"], 1)
+        self.assertEqual(status["mapping_empty"], 0)
+        self.assertIn("provider rejected the query", status["last_error"])

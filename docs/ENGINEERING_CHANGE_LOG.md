@@ -16,6 +16,75 @@ work into `main`).
 **Deployment status:** the 2026-09-05 work IS now deployed; this section's
 entries are not, unless an entry says otherwise.
 
+### CHG-2026-09-06-008 — Say WHY a match is unmapped, not merely that it is
+
+**Commit:** this change
+**Components:** `app/goal_latency.py` (`_resolve_new_events`, `status()`),
+`static/app.js` (`renderClockCoverage`), `tests/test_goal_latency.py`,
+`tests/test_frontend_contract.py`
+
+**Observed / original behaviour.** Of the newest 400 signals, 136 carried the
+clock-gate outcome `clock_unmapped` — 34%, the single largest refusal. They
+were all Liga MX (79) and MLS (57), 100% of both leagues, while every other
+competition mapped cleanly. **That was diagnosed as those two competitions
+lacking provider coverage, and the diagnosis was wrong.**
+
+The provider has them. Querying Kalshi directly:
+
+```
+GET /milestones?related_event_ticker=KXLIGAMXGAME-26SEP05ATLALA
+  → id 2e8ef749…, related_event_tickers: ['KXLIGAMXGAME-26SEP05ATLALA', …]
+    start_date       2026-09-06T03:00:00Z
+    last_updated_ts  2026-09-06T05:27:27Z
+```
+
+A milestone existed, matched the discovery filter exactly, and was being
+updated by the provider **inside the very window the signals were refused in**.
+The same holds for both MLS fixtures.
+
+What the signals actually share is not a league but a clock: all 136 fall
+between **05:16 and 05:45 UTC**, across three events, while every league that
+mapped traded later in the day. That window is on the pre-fix build, before the
+arrival queue was bounded at 12:01 UTC — the morning of `order_arrival_ms` p95
+at 38 minutes. The mapping task, which makes one sequential REST call per
+unmapped event, did not run. Liga MX and MLS are simply the competitions whose
+kick-offs land in the early-UTC hours, which is when the bot was at its worst.
+
+**Root cause of the misdiagnosis.** `if not choices: continue` — a bare skip.
+Nothing counted the attempt, nothing recorded the empty result, and
+`set_mapping` was not called, so no `mapping_errors` entry appeared either.
+From outside, three different situations were indistinguishable: the lookup was
+never run, the lookup ran and the provider had nothing, and the lookup ran and
+failed. The dashboard showed "Mapped to live clock: 0", which reads as the
+first interpretation an operator reaches for — no provider coverage.
+
+**Change.** The mapper counts `mapping_attempts`, `mapping_resolved`,
+`mapping_empty` and `mapping_failures`, and names the events currently awaiting
+a milestone (`mapping_awaiting_milestone`), all exported through the observer's
+status. The clock-coverage panel states which case applies: "No mapping lookup
+has run yet — an unmapped match here has not been asked about, not refused", or
+"N matches awaiting a provider milestone … looked up and the provider returned
+none". No mapping logic, no retry cadence and no gate behaviour changes.
+
+**A leak the tests caught.** The awaiting set was first cleaned up inside the
+existing dropped-event loop, which iterates `set(self.milestones) - active` —
+only events that had *resolved*. An event that never mapped is never in
+`milestones`, so its entry would have persisted for the life of the process.
+It is now pruned against the active set on every pass, and a test covers a
+match that comes and goes without ever mapping.
+
+**Verification.** 5 tests: an empty lookup is counted and the event named; a
+milestone whose `related_event_tickers` does not contain the event reads as
+empty rather than resolved; resolving clears the awaiting note; a dropped event
+stops being reported; and a lookup error counts separately from an empty
+result. Full gate: 639 tests OK, `compileall`, `ruff`, `node --check`,
+`git diff --check`.
+
+**What this does not do.** It does not make Liga MX or MLS map — nothing was
+stopping them. The prediction it makes falsifiable is that both will map
+normally the next time they play on the fixed build, and if they do not, the
+counters will now say which of the three cases it is.
+
 ### CHG-2026-09-06-007 — Say the minute floor the gate actually uses, not the one its identifiers are named after
 
 **Commit:** this change

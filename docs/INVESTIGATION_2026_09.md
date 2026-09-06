@@ -148,6 +148,34 @@ The two recorded hours were replayed properly: books rebuilt from snapshots and 
 - **The persistence gate does not survive its own cost**: charged the 15 s of entry price it needs, kept trades are -$29.67 mean (n=4) against +$8.11 if you pretend to enter at the sweep, and the gate is largely a price filter in disguise (kept median entry 50.1c vs discarded 14.1c). n=2-4, so not a verdict, but hypothesis C1 is not confirmed.
 - **Not credible yet**: fading the sweep near market determination shows +$1,090 (n=19, 58% wins). It is the largest positive in the study and the arm most flattered by a too-expensive ask. Test it properly on a clean recording; do not act on it.
 
+### A5d. "Liga MX and MLS have no clock" was wrong (2026-09-06, corrected same day)
+
+34% of the newest 400 signals refused with `clock_unmapped`, and all of them
+were Liga MX (79) and MLS (57) -- 100% of both leagues, while every other
+competition mapped cleanly. Read as a provider-coverage gap in those two
+competitions. It is not.
+
+Kalshi returns a milestone for every one of those events. The Liga MX fixture's
+milestone carries `start_date 2026-09-06T03:00:00Z` and `last_updated_ts
+2026-09-06T05:27:27Z` -- the provider was actively updating it inside the window
+the signals were refused in.
+
+What the 136 signals actually share is a 30-minute window, **05:16-05:45 UTC**,
+across three events. Every league that mapped traded later in the day. That
+window is on the pre-fix build, before the arrival queue was bounded: the
+morning of `order_arrival_ms` p95 at 38 minutes. The mapping task -- one
+sequential REST call per unmapped event -- did not run. Liga MX and MLS are the
+competitions whose kick-offs land in the early-UTC hours, which is when the bot
+was at its worst.
+
+**The lesson is about the instrument, not the leagues.** `if not choices:
+continue` recorded nothing, so "never attempted", "attempted, provider had
+nothing" and "attempted, task never ran" were indistinguishable, and the
+dashboard's "Mapped to live clock: 0" invited the league-shaped reading.
+Counters now separate the three cases (CHG-2026-09-06-008). The falsifiable
+prediction: both leagues map normally the next time they play on the fixed
+build.
+
 ### A6. Signature completeness per record type (what is missing to analyse honestly)
 
 | Record | Present | Missing |
