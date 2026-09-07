@@ -1,5 +1,12 @@
 # Systematic audit plan
 
+> **Read [`RESEARCH_STRATEGY.md`](RESEARCH_STRATEGY.md) first.** It states what the bot is for, what
+> finishing looks like, and why the historical backtest comes before more live data. This audit asks
+> *is the machine honest?*; that document asks *is it pointed at anything real?* Neither is
+> sufficient alone. One hard dependency: **W7 must complete before any live-data claim in that
+> document's Stage 2.** Its Stage 0 is unaffected — it uses Kalshi's own tape, which none of the
+> bot's recording defects touch.
+
 ## Why this exists
 
 Every defect found between 2026-09-04 and 2026-09-07 was found **incidentally, while looking for
