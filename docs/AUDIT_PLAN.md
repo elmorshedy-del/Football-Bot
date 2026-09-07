@@ -450,8 +450,6 @@ Without the ledger you cannot distinguish *"we checked 47 parameters and 40 are 
 
 ---
 
----
-
 ## 10. What not to do
 
 - **Do not fix anything during the audit.** Findings only.
