@@ -23,6 +23,138 @@ population nowhere near exhausted.
 
 ---
 
+## 0. The map
+
+*This section explains the rest. Nothing here is new information — it is the same document, laid out
+so it can be picked up cold, on any day, without remembering the previous conversation.*
+
+### The whole thing in six sentences
+
+1. The bot watches Kalshi soccer markets for **sweeps** — sudden bursts of trading in one direction —
+   and bets that the price keeps moving that way for a minute or two afterwards.
+2. That "keeps moving" is called **drift**, and whether it exists at all is the entire thesis. It has
+   never been established.
+3. After 12 days, 2,163 detected sweeps and 100 completed trades, the answer is **−$872.65 and a
+   confidence interval containing zero** — meaning *we do not know*, not *it loses*.
+4. The reason we cannot know is **variance**: results are spread so widely (σ = $61.32 per trade)
+   that a real $5 edge would need 2,362 trades — about two years — to become visible.
+5. The variance is **self-inflicted by the sizing rule**, not by the market, so it is fixable.
+6. Meanwhile Kalshi will sell us ~1,000 past matches for free, and the detector reads *trades*, which
+   those matches contain — so **the question can be answered in days by computer instead of years by
+   waiting.** That is W0, and everything else waits behind it.
+
+### Two layers, and why they get confused
+
+Almost every confusion in this project comes from mixing these up. They are different questions.
+
+```mermaid
+flowchart TB
+    subgraph L1["LAYER 1 · One trade  (milliseconds → minutes)"]
+        A["A burst of trades prints"] --> B["Gates decide: trade or refuse?"]
+        B --> C["Fill, hold, exit"]
+    end
+    subgraph L2["LAYER 2 · The project  (weeks → months)"]
+        D["Is the idea real?"] --> E["Which settings are right?"]
+        E --> F["Does it survive real execution?"]
+        F --> G["Turn on profit mode"]
+    end
+    L1 -.->|"produces the evidence"| L2
+    L2 -.->|"decides which gates deserve to exist"| L1
+```
+
+**Layer 1 questions** sound like: *why didn't it trade that?* *why was the size different?* *why does
+it say 88?* These are about the machine.
+
+**Layer 2 questions** sound like: *is this even the right strategy?* *are these gates
+overengineered?* *when can it be profitable?* These are about the project.
+
+A Layer 1 answer can be completely correct and still worthless, because the gate it defends is
+protecting a strategy that does not work. **That is why W0 runs first.** Auditing gates before
+knowing whether the idea is real is polishing a machine that may not need to exist.
+
+### Where things actually stand
+
+Memorise nothing; this table is the scoreboard.
+
+```mermaid
+flowchart LR
+    S["2,163 sweeps<br/>detected"] --> U["1,627 unconfirmed<br/>75% — no second leg moved"]
+    S --> C["536 confirmed"]
+    C --> R["436 refused<br/>price cap, floor,<br/>no book, fee model"]
+    C --> T["100 traded<br/>4.6% of all sweeps"]
+    T --> G["gross −$323.91"]
+    T --> F["fees −$548.74<br/>63% of the total loss"]
+    G --> N["net −$872.65"]
+    F --> N
+```
+
+| | Number | What it means |
+|---|---|---|
+| Sweeps detected | 2,163 | The detector is not short of material |
+| Reached a trade | 100 (4.6%) | The gates refuse ~95% of what is found |
+| Net | −$872.65 | Paper money; no capital was ever at risk |
+| Of which fees | $548.74 | **The fee load is larger than the trading loss** |
+| Confidence interval | [−$24.32, +$6.27] | Contains zero → undecided, in both directions |
+| σ per trade | $61.32 | The reason it is undecided |
+| Second strategy (sleeve) | 365 signals, **0 trades ever** | 91% blocked by infrastructure, not by strategy |
+
+The single most important line is the fees one. **Fees are 63% of the loss.** A strategy can have a
+genuine edge and still lose money on this fee schedule — which is why W8 exists, and why it is the
+workstream most likely to conclude that no gate change matters at all.
+
+### The words that keep coming up
+
+| Term | Plain meaning |
+|---|---|
+| **Gate A** | The sweep detector. The only strategy that has ever placed a trade |
+| **The sleeve** | The second strategy (price-only late-score). 365 signals, never once traded |
+| **Sweep** | A burst of trades pushing one contract in one direction within 150 ms |
+| **Leg / contract** | One of the three outcomes — Home, Draw, Away. They sum to ~100¢ |
+| **`dl`** | How far the price moved, on a scale where 2¢→4¢ counts as much as 50¢→67¢ |
+| **Sibling confirmation** | A second leg moving the same way within ±50 ms. Real news moves more than one leg |
+| **Drift** | Does the price keep going your way after you enter. **The entire thesis** |
+| **σ (sigma)** | How spread out the results are. Large σ = noise drowns the signal |
+| **Power / *n* needed** | How many trades before the noise cancels out and the truth shows |
+| **Fill assumption** | What price you *assume* you got. Moved the same 29 trades from −$863 to +$550 |
+| **`config_id`** | Fingerprint of the 47 settings + code. Different fingerprints cannot be pooled |
+| **Round-trip fee** | ~3.5¢ per contract to get in and out near 50¢ |
+| **Fixed-dollar sizing** | Always spend $100 — so a cheap contract buys 6× more of them. The variance culprit |
+| **Book / depth / L2** | The resting orders waiting to be hit. The thing past trade data cannot show |
+| **Taker / maker** | Hitting someone's order (pay the fee) vs resting your own (cheaper) |
+| **K2** | The built-in kill condition on profitability. Currently **FAIL** |
+
+### What is actually undecided — and it is yours, not an agent's
+
+| Decision | The options | Recommendation | What would change it |
+|---|---|---|---|
+| **Study bot or profit bot?** | Tight gates protect money; wide gates gather information. It is currently built as the first and judged as the second | **Study** until an interval excludes zero | Nothing — this one is a preference, not a fact |
+| **Run W0 before anything else?** | Backtest ~1,000 past matches now, or keep collecting live | **Run W0 first** | If the tape turns out not to contain what the detector needs — checkable in an afternoon |
+| **Fixed contracts instead of fixed dollars?** | $100 per trade vs a fixed number of contracts | **Fixed contracts** — it cuts required sample by ~4× | Evidence that cheap contracts drift *more*, which would make the current bias deliberate |
+| **Keep the 35¢ price floor?** | It was set to stop losses that were actually caused by sizing | **Delete it once sizing is fixed** — it discards half the sample to treat a symptom | If W0 shows cheap contracts genuinely do not drift |
+
+If none of these is decided, the bot keeps running and keeps producing data that cannot settle
+anything. **Deciding nothing is itself a decision, and it costs about two years.**
+
+### How to check any answer — including mine
+
+Every question below has a real mistake behind it, made during this investigation. You do not need
+to read code to ask them, and asking them catches the error class without knowing the answer.
+
+| Ask | The mistake it catches |
+|---|---|
+| **"Measured, or inferred?"** | SQLite was blamed for the latency. Replaying 120,000 real frames found 96 database statements total — 0.8% of the run |
+| **"Over what window? Current or since-startup?"** | A cumulative average made a function look like a 13 ms problem. Measured over a live window it was 859 µs |
+| **"Were the conditions the test needs actually present?"** | Two starvation checks reported *not discriminating* — the queue was never backed up while measured, so neither could conclude |
+| **"Is that 'not measured', or 'measured and fine'?"** | The mapping bug hid in exactly that gap for weeks: zero looked like *no coverage*, it meant *never looked* |
+| **"Which of the four is it — idea, threshold, implementation, or instrument?"** | A sizing defect was diagnosed as a price problem and fixed with a price floor. Still wrong today |
+| **"What did you check and find *clean*?"** | A findings list cannot tell you whether 5 problems were found in 5 places or in 500. That is why a coverage ledger is mandatory |
+| **"What would have proved you wrong?"** | "Liga MX has no clock coverage" survived until someone looked — Kalshi had a milestone for every single match |
+
+The seventh is the strongest. An agent that cannot say what would have falsified its claim has not
+tested anything; it has described its own reasoning back to you.
+
+---
+
 ## 1. What is this bot for?
 
 It serves two goals that pull in opposite directions, and has never been told which it is.
@@ -332,8 +464,6 @@ fee and sizing model to be viable — and whether anything in the record clears 
 
 **Known trap.** This is the workstream most likely to conclude that no gate change matters, because
 the fee load dominates. That is a legitimate and important result. Do not soften it.
-
----
 
 ---
 
