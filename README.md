@@ -371,6 +371,12 @@ running next. Read it before believing a P&L figure — one of its own sections
 retracts the profitability numbers in another, and a later one retracts an
 earlier diagnosis of the latency.
 
+[`docs/AUDIT_PLAN.md`](docs/AUDIT_PLAN.md) is what to do about it: the goal the
+bot is being held to, why the live sample cannot decide it in any useful time,
+what a historical backtest can answer instead, and the workstreams in the order
+they should run. It is the decision document — start with W0, because if the
+underlying idea is wrong, none of the rest is worth auditing.
+
 ## Architecture
 
 ```mermaid

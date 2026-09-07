@@ -1,16 +1,10 @@
-# Systematic audit plan
+# Audit and decision plan
 
-> **Read [`RESEARCH_STRATEGY.md`](RESEARCH_STRATEGY.md) first.** It states what the bot is for, what
-> finishing looks like, and why the historical backtest comes before more live data. This audit asks
-> *is the machine honest?*; that document asks *is it pointed at anything real?* Neither is
-> sufficient alone. One hard dependency: **W7 must complete before any live-data claim in that
-> document's Stage 2.** Its Stage 0 is unaffected — it uses Kalshi's own tape, which none of the
-> bot's recording defects touch.
+One document. It decides what the bot is for, whether the idea is real, whether the machine that
+implements it is honest, and what each possible answer means for what happens next.
 
-## Why this exists
-
-Every defect found between 2026-09-04 and 2026-09-07 was found **incidentally, while looking for
-something else**:
+It exists because **every defect found between 2026-09-04 and 2026-09-07 was found incidentally,
+while looking for something else** — eight for eight:
 
 | Found | While looking for |
 |---|---|
@@ -23,50 +17,170 @@ something else**:
 | Position size being a leftover, not a rule | a question about why sizes differ |
 | Two MLS winners unreachable under today's config | a remark that MLS looked good |
 
-That is not thoroughness. It is luck with a large surface area, and it means **the count of
-undiscovered defects is unknown** — every probe so far has returned something, which is the
-signature of a population nowhere near exhausted.
-
-Three facts set the scale of the problem:
-
-- **47 parameters in `STRATEGY_PARAM_NAMES`, 100 closed trades.** Roughly one trade per two
-  tuneable knobs. Nothing fitted on that sample can be trusted, individually or collectively.
-- **37 `except: … pass` and 66 bare `continue`** in `app/`. Each is a place the system can decline
-  to tell you something. Two of today's findings came from exactly this construct.
-- **2,163 Gate A signals produced 100 trades (4.6%); 365 sleeve signals produced 0.** Most of the
-  system's behaviour has never been observed in the only mode that matters.
+That is not thoroughness. It is luck with a large surface area, and it means **the undiscovered
+population is unknown** — every probe so far has returned something, which is the signature of a
+population nowhere near exhausted.
 
 ---
 
-## Rules of engagement
+## 1. What is this bot for?
 
-These exist because they are the specific ways this investigation went wrong. They are not general
-advice; each one has a corpse behind it.
+It serves two goals that pull in opposite directions, and has never been told which it is.
 
-1. **Write the falsifier before the measurement.** State what result would prove the hypothesis
-   wrong, then measure. Three wrong diagnoses this session (SQLite as the latency cause; Liga MX as
-   a coverage gap; "widen the spread limit") came from reasoning one step past the last measurement.
-2. **Deltas, never cumulative means.** Cumulative counters are polluted by startup and by past
-   incidents. A cumulative reading made `status()` look like a 13 ms regression when the windowed
-   value was 859 µs.
-3. **"Not measured" is not "measured and fine".** They must be different buckets in every output.
-   The mapping bug was invisible precisely because these were conflated.
+| | A profit bot wants | A study bot wants |
+|---|---|---|
+| Refusals | as many as possible — refusing is free | as few as possible — refusing costs information |
+| Position size | as large as conviction allows | as small as measurement allows |
+| Gates | tight, to protect capital | wide, to observe the population |
+| Success | money | a number you can act on |
+
+**It is built like the first and judged like the second.** That is the root of the recurring
+confusion: every gate was added with profit logic, and every complaint about it is study logic.
+Both are reasonable; they answer different questions, and nobody picked the question.
+
+**Decision required, and it is the operator's.** The recommendation, stated plainly:
+
+> **This is a study bot until it has an edge estimate whose confidence interval excludes zero.
+> Profit is a later mode, switched on deliberately, not drifted into.**
+
+Everything below assumes that answer.
+
+---
+
+## 2. Can the current setup ever decide? No.
+
+Measured on the 95 clean closed trades (the 5 stale-book fills excluded):
+
+```
+mean net per trade   -$12.15
+standard deviation    $61.32
+95% interval         [-$24.48, +$0.19]
+```
+
+The interval contains zero. It also contains −$24. After 12 days of live trading the honest
+statement is **"we do not know, in either direction"**.
+
+| true edge per trade | trades needed | at ~100 trades/month |
+|---|---:|---:|
+| $2 | 14,759 | 147 months |
+| $5 | 2,362 | **23.6 months** |
+| $10 | 590 | 5.9 months |
+| $20 | 148 | 1.5 months |
+
+*(80% power, 95% two-sided, at the observed σ = $61.32.)*
+
+An edge worth having is probably $2–$10 after fees. **At the current variance and trade rate that is
+one to twelve years.** The project cannot reach a conclusion this way.
+
+**The variance is self-inflicted.** σ = $61.32 on a $100 stake is the fixed-dollar sizing rule:
+$100 buys 1,164 contracts at 8.6¢ and 173 at 57.9¢, so the payoff distribution is six times wider at
+the cheap end. Required sample scales with σ² — **halving the standard deviation cuts the required
+trades by four.** Fixed-contract sizing is therefore not a returns tweak; it is what makes the
+experiment finishable. That is why it leads every change list.
+
+---
+
+## 3. What can be answered without waiting
+
+Verified against the live Kalshi API on 2026-09-07:
+
+```
+1,776 settled markets across 10 of ~22 soccer series   = ~592 matches
+extrapolated across all series                          ≈ 1,000+ matches
+history reaches back to                                  2026-07-17 (7 weeks)
+
+per trade: created_time (µs), yes_price_dollars, no_price_dollars,
+           count_fp, taker_side, taker_outcome_side, trade_id
+```
+
+**The decisive fact: the detector consumes trades, not books.** `Detector.on_trade` takes prints,
+so every admission test replays *exactly* — not approximated:
+
+| Gate | Needs | Available historically? |
+|---|---|---|
+| `DL_MIN` — log-odds displacement | prices in the burst | **yes** |
+| `LEVELS_MIN` — distinct price levels | prices in the burst | **yes** |
+| `SIZE_MIN` — contracts | `count_fp` | **yes** |
+| `CONF_MS` / `CONF_SIGN` — sibling confirmation | sibling prints, timestamps | **yes** |
+| Post-event drift — *the candidate edge itself* | later prints | **yes** |
+
+What the tape cannot give: order-book depth, spread, book mids, book age. So **Gate A is ~90%
+backtestable; the price-only sleeve is largely not.**
+
+**The fill objection is smaller than it looks.** A5c established that reconstructing fills from the
+bot's own recorded books was worse than useless — the reconstructed ask was worse than a real
+contemporaneous executed print in **29 of 29 cases, median +12¢**. A print at price P proves a trade
+happened at P. The honest model is to price entries from executed prints and **report a range across
+assumptions**, because the same 29 trades priced at −$863, −$229 or +$550 on that choice alone.
+
+**So: no, you cannot one-shot a deployable config from prints** — execution reality is exactly what
+prints omit, and that is where much of the loss lives. But you can compress **one to twelve years of
+live discovery into days of computation**, and reach the live phase already knowing which questions
+are worth spending real fills on.
+
+| | Backtest (~1,000 matches, free, now) | Live bot (slow, expensive, real) |
+|---|---|---|
+| Does post-event drift exist? | **answer here** | confirm out of sample |
+| At what horizon, how big? | **here** | confirm |
+| Does the detector select for it? | **here** | confirm |
+| Do the 47 parameters matter? | **here — sweep them** | fix the survivors |
+| What do fills actually cost? | no | **only here** |
+| What does latency cost? | no | **only here** |
+| Do spreads permit entry after a goal? | no | **only here** |
+
+The live bot stops being the instrument of discovery — which it is bad at — and becomes the
+instrument of confirmation and execution realism, which is the only thing it is uniquely good at.
+
+---
+
+## 4. Rules of engagement
+
+These are not general advice. Each has a corpse behind it from this investigation.
+
+1. **Write the falsifier before the measurement.** Three wrong diagnoses this session (SQLite as the
+   latency cause; Liga MX as a coverage gap; "widen the spread limit") came from reasoning one step
+   past the last measurement.
+2. **Deltas, never cumulative means.** A cumulative reading made `status()` look like a 13 ms
+   regression when the windowed value was 859 µs.
+3. **"Not measured" is not "measured and fine".** Different buckets, every output. The mapping bug
+   was invisible precisely because these were conflated.
 4. **A non-discriminating reading changes nothing.** If the conditions the test needs were not met,
-   record that and stop. Do not act on a reading that both hypotheses predict.
-5. **Record what was checked and found clean.** A findings list alone cannot distinguish thorough
-   coverage from a lucky probe. The coverage ledger is a required deliverable, not a nicety.
+   record that and stop.
+5. **Record what was checked and found clean.** A findings list alone cannot distinguish coverage
+   from a lucky probe. The coverage ledger is a required deliverable.
 6. **Separate the four verdicts.** Every finding is exactly one of: *idea is wrong*, *threshold is
    wrong*, *implementation is wrong*, *instrument is wrong*. Conflating these is how a sizing defect
    became a price filter.
-7. **No fixes during the audit.** Findings only. A fix mid-audit changes the thing being measured
-   and invalidates every subsequent workstream. Batch them afterwards.
+7. **No fixes during the audit.** Findings only. A fix mid-audit changes the thing being measured.
 
 ---
 
-## Workstreams
+## 5. Workstreams
 
-Eight, each targeting a defect class the evidence has already demonstrated. They are independent
-unless the dependency section says otherwise.
+**W0 decides whether W1–W8 matter.** Run it first.
+
+### W0 · Historical backtest — is the idea real at all?
+**Question.** Across ~1,000 matches of Kalshi's own trade tape, does post-event price drift exist,
+how large is it, at what horizon, and does the detector select for it?
+
+**Method.** Pull every settled soccer market's trade tape (cursor-paginated, cached to disk). Feed
+prints into the **existing `Detector` class** — the real one, not a reimplementation, so what is
+tested is what production runs. For every candidate, measure forward movement at +5 s, +15 s, +30 s,
++60 s, +120 s, +300 s, priced from executed prints. Sweep the parameters that are computable from
+prints. Report every result as a **range across fill assumptions**.
+
+**Deliverable.** Drift magnitude and dispersion by horizon, by league, and by whether sibling
+confirmation fired; plus a parameter sensitivity table.
+
+**Acceptance.** A number for the drift, with an interval, robust or not robust to the fill
+assumption — stated either way.
+
+**Known trap.** A backtest that reports one number is lying. The same 29 trades priced at −$863,
+−$229 or +$550 on the entry model alone.
+
+**Blocked by nothing. Uses Kalshi's tape, so none of the bot's recording defects touch it.**
+
+---
 
 ### W1 · Decision reconstructability
 **Question.** For every outcome the system can record, can a decision be fully reconstructed from
@@ -221,9 +335,16 @@ the fee load dominates. That is a legitimate and important result. Do not soften
 
 ---
 
-## Sequencing
+---
+
+## 6. Sequencing
 
 ```
+W0 (backtest) ──> decides whether the rest is worth running at all
+                  │
+                  ├─ idea real ──> W1–W8 proceed, then live confirmation
+                  └─ idea dead ──> stop; only W8 (economics) still informative
+
 W7 (data manifest) ──┬──> W8 (economics)
                      └──> any statistical claim in W1–W6
 
@@ -231,13 +352,59 @@ W2, W3, W4, W5 ──> independent, run in parallel, no data dependency
 W6 ──> before re-measuring anything performance-related
 ```
 
-Run **W7 first**. Run **W2, W3, W4, W5 in parallel** — they are code-reading work needing no live
-data. **W1 and W6** need a running system. **W8 last**, because it depends on W7's verdict and
-W5's sizing analysis.
+Run **W0 first**, alone. Then **W7**. Then **W2, W3, W4, W5 in parallel** — code-reading work needing
+no live data. **W1 and W6** need a running system. **W8 last**, depending on W7's verdict and W5's
+sizing analysis.
 
 ---
 
-## Running it with Fable
+## 7. Decision gates
+
+Pre-registered, so the answer cannot be negotiated after the fact.
+
+### From W0 — these decide everything
+
+| Result | Verdict | Audit | Bot |
+|---|---|---|---|
+| Drift ≥ 2× round-trip fee, across ≥ 3 leagues, robust to fill assumption | Idea sound | Run W1–W8 in full | Re-derive parameters from W0, then live confirmation |
+| Drift exists but < round-trip fee | Idea real, economics dead | Run W8 only | Attack fees (maker entry) or stop |
+| Drift only under the most favourable fill assumption | Not established | Pause | Do not deploy; fix method first |
+| **No drift at any horizon across 1,000 matches** | **The idea is wrong** | **Stop — do not audit gates on a dead strategy** | Stop. Do not tune |
+| Confirmation does not select for drift | Confirmation is not an admission rule | Note in W4 | Demote to a recorded label |
+
+> **If W0 says the idea is wrong, that is a successful outcome.** It costs days instead of years and
+> is the single highest-value result available right now. The failure mode to avoid is spending
+> another twelve months of live collection to learn the same thing.
+
+### From the integrity workstreams
+
+| Result | Meaning | Action |
+|---|---|---|
+| W4: most parameters underpowered | The config is fitted to noise | Re-derive from W0; delete what has no effect |
+| W7: most live history unusable | Live evidence is thinner than the trade count suggests | Weight W0 higher still |
+| W8: required edge exceeds anything observed | Mechanics forbid profit regardless of signal | Fee model first, or stop |
+| W3: silent-failure sites on decision paths | Unknown behaviour remains | Fix before any live confirmation run |
+
+---
+
+## 8. Staged plan
+
+**Stage 0 — W0 backtest.** Blocked by nothing. Start here.
+
+**Stage 1 — re-derive parameters** from ~1,000 matches instead of tens of trades. Expect deletions;
+47 parameters will not survive contact with real power.
+
+**Stage 2 — live confirmation mode.** Reconfigure the bot as a measurement instrument: **fixed
+contracts, small**; gates wide, keeping only what W0 justified; every episode recorded. Purpose:
+confirm out of sample, and measure the four things prints cannot show — fill quality, latency cost,
+post-goal spread reality, and fee load in practice. **Requires W7 complete.**
+
+**Stage 3 — profit mode.** Only after Stage 2's interval excludes zero *and* W8's fee model closes.
+A deliberate switch, with sizing and exposure chosen on purpose.
+
+---
+
+## 9. Running it with Fable
 
 **One workstream per agent session.** They share no state; a shared session pollutes each with the
 others' priors, which is exactly how the incidental-finding pattern started.
@@ -283,28 +450,31 @@ Without the ledger you cannot distinguish *"we checked 47 parameters and 40 are 
 
 ---
 
-## What not to do
+---
 
-- **Do not fix anything during the audit.** Findings only. A fix changes the system other
-  workstreams are measuring.
+## 10. What not to do
+
+- **Do not fix anything during the audit.** Findings only.
+- **Do not run W1–W8 before W0.** Auditing the gates of a dead strategy is wasted effort.
 - **Do not pool data across `config_id` eras** without W7's explicit clearance.
 - **Do not accept "there is a comment explaining it"** as a passing verdict in W3.
 - **Do not report a cumulative mean** as a current rate anywhere.
-- **Do not let an agent conclude from a non-discriminating measurement.** If the conditions were not
-  met, the finding is "not measured", and that is a legitimate deliverable.
+- **Do not report a single backtest number.** Range across fill assumptions, or it is not a result.
+- **Do not let an agent conclude from a non-discriminating measurement.**
 - **Do not skip the coverage ledger** because the findings list looks productive.
 
 ---
 
-## What this audit will probably conclude
+## 11. What this will probably conclude
 
-Stated in advance, so the audit can contradict it rather than confirm it:
+Stated in advance, so it can be contradicted rather than confirmed:
 
 1. Most of the 47 parameters are underpowered — fitted on samples of tens.
 2. The fee load requires an edge larger than anything in the record.
-3. Several more label/reality drifts exist, in the same places: identifiers used as labels.
+3. Several more label/reality drifts exist, in the same place: identifiers used as labels.
 4. More silent-failure sites exist on paths that matter.
 5. The sleeve's entry conditions are jointly unsatisfiable near a goal, not merely strict.
+6. Post-event drift is real but smaller than the round-trip fee.
 
-If the audit returns these five and nothing else, it has under-delivered — the whole premise is that
-the unknown population is larger than the known one.
+If it returns these six and nothing else, it has under-delivered — the whole premise is that the
+unknown population is larger than the known one.
