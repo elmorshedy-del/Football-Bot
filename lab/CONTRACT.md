@@ -248,6 +248,27 @@ zero rows; httpx list params produce the right form):
 
 **This persists after full-time** — historical games return their complete final event list.
 
+The milestone object itself (from `/milestones`) carries four fields worth storing:
+
+```json
+{"id":"191c4fc6-eae6-49da-a350-b0428eb8c68c",
+ "source_id":"sr:sport_event:66299476",
+ "start_date":"2026-09-06T00:30:00Z",
+ "end_date":"2026-09-06T03:02:40Z",
+ "details":{"home_team_id":"a24c84e6-...","away_team_id":"2f088540-...",
+            "tie_id":"111193d4-...","league":"MLS"}}
+```
+
+- **`source_id` is Kalshi's Sportradar sport-event id.** Store it. It is an exact join key to
+  Kalshi's own upstream provider, making a Sportradar integration a drop-in with no name
+  matching at all.
+- `details.tie_id` names the TIE leg directly — prefer it over matching the `"Tie"` subtitle.
+- **`start_date` is the SCHEDULED kickoff and is not a clock** — measured ~14 minutes wrong
+  (§5). Store it; never derive match time from it.
+- `end_date` equals the market `close_time`.
+- `live_data.details.last_play.occurence_ts` is an exact unix stamp for the final play
+  (02:38:19 on ATXSJ, twelve seconds after the equaliser) — a free anchor for the fitted clock.
+
 Verified across 29 MLS games: `event_type` ∈ {`score_change`, `yellow_card`, `red_card`}
 only. **There is no VAR event type and no penalty event type.** A goal that was overturned
 simply never appears. Ground truth for VAR/penalties must come from the provider in §4.
@@ -296,6 +317,29 @@ approximate one.
 
 **Kalshi cannot provide it.** `expected_expiration_time` was verified 47 minutes wrong;
 `close_time` is padded; markets close early when a winner is declared. Do not use them.
+
+### Spike result — the free tier is dead (measured, not assumed)
+
+`lab/clock_spike.py` ran against a free API-Football key and returned NO-GO:
+
+```
+Free plans do not have access to this season, try from 2022 to 2024.
+exact_periods available : 0/711 (0.0%)
+```
+
+Our range is MLS 2025-2026, so free coverage is zero rather than partial. **A paid plan is
+required for `exact_periods`.** Also ruled out by measurement: TheSportsDB free publishes 5
+MLS fixtures for 2026; football-data.org free has no MLS.
+
+Kalshi cannot substitute. On `KXMLSGAME-26SEP05ATXSJ`, goals labelled 8' and 90+7' have their
+tape repricings at 00:51:41 and 02:38:07 against a milestone `start_date` of 00:30:00. Those
+anchors solve consistently to a real kickoff of **00:43:41** and a halftime of ~17.4 minutes
+— the scheduled time is out by nearly fourteen minutes.
+
+That same arithmetic is the first evidence `anchored_fit` genuinely works: two anchors did
+solve kickoff and halftime consistently. Its precision is bounded by the integer-minute
+labels at ~±30s, exactly the resolution separating minute 88 from minute 89, so it stays a
+labelled fallback and never the default. The clock gate below is not optional.
 
 **The exact anchor is `fixture.periods`** from API-Football — `first` and `second` are unix
 timestamps of when each half *actually* kicked off:
@@ -420,6 +464,9 @@ CREATE TABLE games (
   home_team_uuid          VARCHAR,        -- Sportradar, joins custom_strike.soccer_team
   away_team_uuid          VARCHAR,
   milestone_id            VARCHAR,
+  sportradar_event_id     VARCHAR,        -- milestone.source_id, 'sr:sport_event:NNN'
+  scheduled_start         TIMESTAMP,      -- milestone.start_date. NOT a clock: ~14min out.
+  last_play_ts            BIGINT,         -- unix s, exact stamp of the final play
   apifootball_fixture_id  BIGINT,
   unmatched_reason        VARCHAR,        -- why no fixture id; NULL when matched
   periods_first           BIGINT,         -- unix s, actual H1 kickoff
