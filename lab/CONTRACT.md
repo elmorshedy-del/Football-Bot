@@ -49,7 +49,7 @@ One owner per directory. Do not write outside your own.
 
 The entire user-visible surface uses exactly these eight nouns:
 
-> **Game · Leg · Shock · Goal · Entry · Run · Sweep · Clock**
+> **Game · Leg · Shock · Goal · Entry · Run · Sweep · Clock · Shape**
 
 | Word | Means |
 |---|---|
@@ -61,6 +61,7 @@ The entire user-visible surface uses exactly these eight nouns:
 | **Run** | One backtest over the frozen Entry inventory with one settings set. |
 | **Sweep** | Many Runs across a parameter grid. |
 | **Clock** | Exact match time — minute and stoppage. |
+| **Shape** | What a Shock's price path looks like in its first moments. See §5A. |
 
 **Banned from every user-visible string** (UI text, API field names, chart labels, error
 messages, column headers):
@@ -208,6 +209,10 @@ settled before the cutoff use `GET /historical/markets/{ticker}/candlesticks`.
  "volume_fp":"2.52","open_interest_fp":"45952.09"}
 ```
 
+A request is **capped at 5000 candles**, so a full match window must be chunked
+(4000 minutes per request is a safe stride). The endpoint returns the truncated
+set without an error, so an unchunked request silently loses the tail.
+
 `yes_bid`/`yes_ask` are **the only historical record of the spread**, and the per-leg spread
 metric depends on them. In minutes with no trade, `price` has only `previous_dollars`.
 
@@ -322,6 +327,74 @@ Every game carries `clock_source`:
 over games whose `clock_source` is not `exact_periods`, unless explicitly overridden, and
 every result displays the excluded count. Studies keyed on `t_minus_last_print` need no
 provider and are always available.
+
+---
+
+## 5A. Shape — what the move looks like, and what it costs to look
+
+A Shock is not just a size and a time; it has a *shape*, and the user's question
+is whether shape separates a real goal from one that is about to be chalked off
+by VAR, or a penalty awarded but not yet taken. The existing bot already leans on
+one shape fact — a sibling leg confirming with the opposite sign within ±50 ms —
+so the platform's job is to **measure** that rather than inherit it as an
+assumption.
+
+**The discipline that keeps this honest.** Shape can only inform a decision if it
+is observed *before* the decision. Observing costs time, and time costs price.
+So Shape is not a separate study from latency — it is the same axis:
+
+> waiting `shape_window_ms` buys you information and costs you entry price
+
+Every Shape feature is computed strictly within `[detect_ts, detect_ts +
+shape_window_ms]`, and the engine **must assert** `shape_window_ms <=
+decision_ms` for any feature used in an entry rule. A feature measured after the
+commit point is hindsight, not a feature. This is invariant 1 (no lookahead)
+applied to Shape, and it gets its own test.
+
+### The eight features
+
+Columns on `shocks`. Eight, fixed, each independently meaningful in plain
+English. **No classifier, no learned model, no embedding.** The point is that the
+user can read any one of these and know what it means.
+
+| Column | Type | Meaning |
+|---|---|---|
+| `legs_confirming` | UTINYINT | How many legs moved with the expected opposite sign (0–2). The sibling-confirmation idea, measured. |
+| `confirm_lag_ms` | DOUBLE | Milliseconds from the first leg's move to the second leg's confirming move. NULL when nothing confirmed. On ATXSJ both legs moved inside one 100 ms bucket. |
+| `sum_legs_drift` | DOUBLE | Maximum abs(sum of leg prices − 1) inside the window. How far the triplet stopped being coherent — a market-maker uncertainty proxy. |
+| `path_efficiency` | DOUBLE | abs(net move) / sum of abs(tick-to-tick moves) on the target leg. 1.0 is a straight line; low is whipsaw. On ATXSJ, TIE ran 0.30→0.50→0.31→0.53→0.32 — that churn is the signal. |
+| `direction_flips` | INTEGER | Sign changes in the target leg's path inside the window. |
+| `frac_of_final_move` | DOUBLE | Share of the eventual total move already completed by the end of the window. **Uses post-window data and is therefore DIAGNOSTIC ONLY — it must never appear in an entry rule.** Flagged as such in code. |
+| `size_in_window` | DECIMAL(18,2) | Contracts traded across all legs inside the window. Conviction proxy. |
+| `taker_imbalance` | DOUBLE | abs(buy − sell) / total on the target leg, 0..1. One-way flow versus two-way disagreement. |
+
+`shape_window_ms` is a parameter (default 500), swept like any other. Features are
+recomputed per window rather than stored once, or the sweep is meaningless.
+
+### What gets shown
+
+One view, folded into Board band A — **not** a new page:
+
+1. **Median price path by outcome class**, normalised to the pre-shock price and
+   the eventual move, overlaid for `confirmed_goal` / `reversed` / `orphan`, with
+   an interquartile band. This answers "what does a real goal look like versus one
+   about to be overturned" by eye, with no model to distrust.
+2. **The wait-versus-price curve**: for each `shape_window_ms` in the sweep, the
+   mean entry price given up against the share of `reversed` Shocks avoided. This
+   is the decision the user actually faces, stated as one line.
+
+**Class sizes are displayed next to every Shape chart, always.** With roughly 480
+Shocks in the whole dataset the `reversed` class is expected to be only 20–40
+cases. That is enough to look at and form a hypothesis; it is **not** enough to
+fit a decision rule on. Any Shape-conditioned entry rule must carry the same
+event-clustered confidence interval as everything else, and the UI must never
+draw a median path without saying how many Shocks are behind it.
+
+### Vocabulary
+
+**Shape** is the ninth permitted word, joining the eight in §2. It is concrete and
+self-describing, which is why it earns an exception. No other word is added
+without the same justification.
 
 ---
 
