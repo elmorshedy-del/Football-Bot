@@ -576,9 +576,41 @@ POST /api/sql                       → read-only DuckDB query
 Responses always include `{"rows": [...], "total": N, "excluded": {"clock": N, "no_tape": N}}`.
 **`excluded` is never omitted** — the user must always see what the filter removed.
 
-`/api/sql` is read-only: a `query_only` DuckDB connection, statement timeout, hard row cap,
-and it rejects anything that is not a single `SELECT`/`WITH`. It never interpolates user
-text into SQL; the query is passed as-is to a read-only connection.
+### 7.1 `/api/sql` — the escape hatch, wired both ways
+
+SQL is not a side tool bolted on; it is how the user asks anything the Board did not
+anticipate, and it must query **everything** — all ~29M trade prints, plus shocks, shape
+features, state changes, entries, fills and run ledgers. Not a summary layer.
+
+Safety: a `query_only` DuckDB connection, statement timeout, hard row cap, and rejection of
+anything that is not a single `SELECT`/`WITH`. User text is never interpolated into SQL; the
+query string is handed as-is to a read-only connection. These bound the blast radius, not
+the user's curiosity.
+
+**Two-way flow with the Board is required, and is what makes this worth building:**
+
+1. **Query to Board.** Any result set containing a `shock_id`, `event_ticker` or `entry_id`
+   column gets a "use as filter" action. Taking it pushes those ids into the Board filter as
+   a single chip labelled with the query name, and every band narrows to exactly that set.
+   An arbitrary question thereby becomes a lens the user can explore visually, back-test over
+   and sweep — rather than a result they have to read and then recreate by hand.
+
+2. **Board to query.** Every aggregate rendered on the Board carries the SQL that produced
+   it. Clicking any number offers both "show the rows" and "open as SQL", seeding the editor
+   with that working query. The user never starts from a blank editor, and learns the schema
+   by modifying something that already runs instead of reading this document.
+
+Also required:
+
+- **Schema browser** pinned beside the editor: every table, column, type, row count, and a
+  one-line meaning per column. Nobody can query tables they cannot see.
+- **Starting queries**, about twenty, each answering a real question about this dataset
+  (late shocks by minute, legs ranked by spread at shock time, reversed shocks and what they
+  cost, entries that lost most, shape features by outcome class). They are documentation that
+  happens to execute.
+- **Saved queries**, named and URL-addressable, so a query written once becomes a permanent
+  lens rather than something retyped.
+- Results chartable in place, and exportable as CSV or Parquet.
 
 ---
 
@@ -610,6 +642,11 @@ convention (CI runs `node --check`).
 | `codemirror` 6 | MIT | SQL editor |
 
 Two screens only: **Board** and **Explore**. Data health is a status strip, not a page.
+
+Explore is the Perspective workspace plus the SQL editor of §7.1, and both directions of the
+Board/query loop must work from it. The user's stated reason for wanting SQL is "I can find
+whatever comes to mind" — so the measure of this screen is whether an arbitrary question can
+be asked and then carried back into the Board without retyping anything.
 
 Board layout: pinned filter bar, then band A (what am I looking at) → band B (what would
 have happened) → band C (the actual cases). Clicking any mark anywhere adds a chip to the
