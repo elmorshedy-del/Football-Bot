@@ -14,6 +14,9 @@ const PROBE_IDLE_MS = Number(process.env.PROBE_IDLE_MS || 15_000);
 const CF_TOKEN = process.env.CF_API_TOKEN || "";
 const CF_ZONE = process.env.CF_ZONE_TAG || "";
 const MEDIA_PATH_LIKE = process.env.MEDIA_PATH_LIKE || "/api/xtream/media/%";
+const INGEST_TOKEN = process.env.INGEST_TOKEN || "";
+const SESSION_RETAIN = Number(process.env.SESSION_RETAIN || 500);
+const SESSION_STALE_MS = Number(process.env.SESSION_STALE_MS || 90_000);
 
 const MAX_SAMPLES = Math.max(60, Math.ceil((RETAIN_HOURS * 3600_000) / CENSUS_INTERVAL_MS));
 
@@ -295,11 +298,112 @@ async function runProbe(streamId) {
 }
 
 // ---------------------------------------------------------------------------
+// Live stream telemetry.
+//
+// Workers flush an invocation's console logs only when the invocation ENDS, so
+// a stream that hangs for 45 minutes is invisible in Workers Logs for those 45
+// minutes — precisely the window worth watching. The media adapter therefore
+// pushes small beacons out over the wire while the stream is still open, and
+// this is where they land.
+// ---------------------------------------------------------------------------
+const sessions = new Map(); // sessionId -> { id, events[], ... }
+
+function pruneSessions() {
+  while (sessions.size > SESSION_RETAIN) {
+    const oldest = sessions.keys().next().value;
+    sessions.delete(oldest);
+  }
+}
+
+function ingest(beacon) {
+  const id = String(beacon.sid || "").slice(0, 64);
+  if (!id) return { ok: false, error: "sid required" };
+  const now = Date.now();
+  let session = sessions.get(id);
+  if (!session) {
+    session = {
+      id,
+      startedAt: new Date(now).toISOString(),
+      lastSeen: new Date(now).toISOString(),
+      events: [],
+      bytes: 0,
+      firstByteMs: null,
+      endReason: null,
+      channel: beacon.ch == null ? null : String(beacon.ch).slice(0, 64),
+      colo: beacon.colo == null ? null : String(beacon.colo).slice(0, 16),
+    };
+    sessions.set(id, session);
+    pruneSessions();
+  }
+  session.lastSeen = new Date(now).toISOString();
+  if (Number.isFinite(Number(beacon.bytes))) session.bytes = Number(beacon.bytes);
+  if (session.firstByteMs == null && Number.isFinite(Number(beacon.ttfb))) session.firstByteMs = Number(beacon.ttfb);
+  if (beacon.reason) session.endReason = String(beacon.reason).slice(0, 120);
+
+  const event = {
+    ts: new Date(now).toISOString(),
+    phase: String(beacon.phase || "beacon").slice(0, 32),
+    tMs: Number.isFinite(Number(beacon.t)) ? Number(beacon.t) : null,
+    bytes: Number.isFinite(Number(beacon.bytes)) ? Number(beacon.bytes) : null,
+    gapMs: Number.isFinite(Number(beacon.gap)) ? Number(beacon.gap) : null,
+    note: beacon.reason ? String(beacon.reason).slice(0, 120) : null,
+  };
+  session.events.push(event);
+  if (session.events.length > 400) session.events.splice(0, session.events.length - 400);
+  log("beacon", { sid: id, phase: event.phase, bytes: event.bytes, gap: event.gapMs, reason: event.note });
+  return { ok: true, events: session.events.length };
+}
+
+function sessionState(session) {
+  if (session.endReason) return "ended";
+  return Date.now() - new Date(session.lastSeen).getTime() > SESSION_STALE_MS ? "stalled-or-lost" : "open";
+}
+
+function sessionSummary(session) {
+  const gaps = session.events.map((e) => e.gapMs).filter((g) => Number.isFinite(g));
+  const sorted = [...gaps].sort((a, b) => a - b);
+  // Prefer the Worker's own elapsed clock (beacon `t`) over collector wall time:
+  // a beacon delayed in flight would otherwise inflate the throughput figure.
+  const reported = session.events.map((e) => e.tMs).filter((t) => Number.isFinite(t));
+  const elapsedMs = reported.length
+    ? Math.max(...reported)
+    : new Date(session.lastSeen).getTime() - new Date(session.startedAt).getTime();
+  return {
+    id: session.id,
+    state: sessionState(session),
+    channel: session.channel,
+    colo: session.colo,
+    startedAt: session.startedAt,
+    lastSeen: session.lastSeen,
+    elapsedMs,
+    bytes: session.bytes,
+    megabytes: Number((session.bytes / 1048576).toFixed(2)),
+    firstByteMs: session.firstByteMs,
+    throughputMbps: elapsedMs > 0 ? Number(((session.bytes * 8) / elapsedMs / 1000).toFixed(2)) : null,
+    maxGapMs: sorted.length ? sorted[sorted.length - 1] : null,
+    p90GapMs: sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(0.9 * sorted.length))] : null,
+    endReason: session.endReason,
+    beacons: session.events.length,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // HTTP surface
 // ---------------------------------------------------------------------------
 function json(res, status, body) {
   res.writeHead(status, { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" });
   res.end(JSON.stringify(body, null, 2));
+}
+
+function readBody(req) {
+  return new Promise((resolve) => {
+    let data = "";
+    req.on("data", (chunk) => {
+      if (data.length < 256_000) data += chunk;
+    });
+    req.on("end", () => resolve(data));
+    req.on("error", () => resolve(""));
+  });
 }
 
 async function summary() {
@@ -364,10 +468,55 @@ const server = http.createServer(async (req, res) => {
       if (!streamId) return json(res, 400, { ok: false, error: "stream query parameter required" });
       return json(res, 200, await runProbe(streamId));
     }
+    if (url.pathname === "/api/ingest" && req.method === "POST") {
+      if (INGEST_TOKEN && req.headers["x-ingest-token"] !== INGEST_TOKEN) {
+        return json(res, 401, { ok: false, error: "bad ingest token" });
+      }
+      const body = await readBody(req);
+      let beacon;
+      try {
+        beacon = JSON.parse(body || "{}");
+      } catch {
+        return json(res, 400, { ok: false, error: "invalid JSON" });
+      }
+      const batch = Array.isArray(beacon) ? beacon : [beacon];
+      const results = batch.slice(0, 50).map((item) => ingest(item));
+      return json(res, 200, { ok: true, accepted: results.filter((r) => r.ok).length });
+    }
+    if (url.pathname === "/api/streams") {
+      const all = [...sessions.values()].map(sessionSummary);
+      const open = all.filter((s) => s.state === "open");
+      const stalled = all.filter((s) => s.state === "stalled-or-lost");
+      return json(res, 200, {
+        now: new Date().toISOString(),
+        counts: { open: open.length, stalledOrLost: stalled.length, total: all.length },
+        open,
+        stalledOrLost: stalled,
+        recent: all.filter((s) => s.state === "ended").slice(-25).reverse(),
+        readingGuide: {
+          "stalled-or-lost": `no beacon for over ${SESSION_STALE_MS}ms and no end reason — the stream is hung or the invocation died without reporting.`,
+          maxGapMs: "the longest silence between chunks; a large value on an open stream is the buffer draining in real time.",
+        },
+      });
+    }
+    if (url.pathname.startsWith("/api/streams/")) {
+      const id = decodeURIComponent(url.pathname.slice("/api/streams/".length));
+      const session = sessions.get(id);
+      if (!session) return json(res, 404, { ok: false, error: "unknown session" });
+      return json(res, 200, { ...sessionSummary(session), events: session.events });
+    }
     return json(res, 404, {
       ok: false,
       error: "not found",
-      routes: ["/health", "/api/summary", "/api/census", "POST /api/probe?stream=<id>"],
+      routes: [
+        "/health",
+        "/api/summary",
+        "/api/census",
+        "/api/streams",
+        "/api/streams/<sid>",
+        "POST /api/ingest",
+        "POST /api/probe?stream=<id>",
+      ],
     });
   } catch (error) {
     log("server_error", { message: String(error?.stack || error) });
