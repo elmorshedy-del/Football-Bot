@@ -1,0 +1,9 @@
+{
+  "name": "korazero-stream-diagnostic",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Provider-side stream diagnostic: polls the Xtream line's active connection census and correlates it with Cloudflare edge traffic.",
+  "engines": { "node": ">=20" },
+  "scripts": { "start": "node server.mjs" }
+}
