@@ -1,0 +1,89 @@
+tape                  demo_data/KXLALIGAGAME-26AUG22ESPRMA-TIE.jsonl
+prints                6739  (2026-08-22T20:55:00.422982+00:00 -> 2026-08-22T21:28:06.824744+00:00)
+executed NO bids      4231  (taker_side='yes' prints; 1976 with a fresh paired ask)
+
+--- calibration: the quiet market's own ceilings ---
+window                first 300.0s, 380 prints, 1.27 prints/s (median gap 431 ms)
+spread                median 1.00c  p90 1.00c
+worst quiet burst     2c across 2 levels
+quiet 1.0s move       2c max
+onset gate            >= 3c dislocation, >= 3 levels in 150 ms, then >= 10c still held 500 ms later
+rejected before it    20 burst(s) that dislocated but did not hold
+    21:03:04   4.0c /  3 levels -> only  +0.0c held
+    21:03:06   8.0c /  3 levels -> only  +1.0c held
+    21:03:06   8.0c /  3 levels -> only  +1.0c held
+    21:03:06   7.5c /  3 levels -> only  +1.0c held
+    21:03:06   8.0c /  4 levels -> only  +1.0c held
+    21:12:22   5.5c /  4 levels -> only  +0.0c held
+    21:12:24   3.0c /  3 levels -> only -10.0c held
+    21:12:24   7.0c /  4 levels -> only -10.0c held
+    21:12:24   7.5c /  5 levels -> only -10.0c held
+    21:12:24   8.0c /  5 levels -> only -10.0c held
+    21:12:24   8.0c /  5 levels -> only -10.0c held
+    21:12:24   7.0c /  6 levels -> only -10.0c held
+    21:12:24   8.0c /  6 levels -> only -10.0c held
+    21:12:24   3.0c /  8 levels -> only -10.0c held
+    21:12:25  11.0c /  3 levels -> only  +0.0c held
+    21:12:28   4.0c /  3 levels -> only  -5.0c held
+    21:12:29   6.0c /  4 levels -> only  -3.0c held
+    21:12:29   5.5c /  4 levels -> only  -3.0c held
+    21:12:29   5.5c /  5 levels -> only  -1.0c held
+    21:17:00   9.0c /  4 levels -> only  +0.0c held
+
+--- repricing episode ---
+T0                    2026-08-22T21:21:15.897180+00:00  NO bid 0.17 (Tie YES 0.83)
+T1                    2026-08-22T21:21:25.793224+00:00  NO bid 0.89 (Tie YES 0.11)
+duration              9.9s
+move over episode     72.0c on the executable NO bid  (0.17 -> 0.89)
+continuation waves    4
+  wave 1: 21:21:16.162982 -> 21:21:16.296696 (  0.1s,   11 abnormal prints, bid 0.36 -> 0.38)
+  wave 2: 21:21:17.940592 -> 21:21:19.484396 (  1.5s,   36 abnormal prints, bid 0.73 -> 0.73)
+  wave 3: 21:21:20.818731 -> 21:21:20.818731 (  0.0s,    1 abnormal prints, bid 0.77 -> 0.77)
+  wave 4: 21:21:23.172748 -> 21:21:25.793224 (  2.6s,   16 abnormal prints, bid 0.81 -> 0.89)
+internal pauses       3  (median 1.6s, max 2.4s)
+
+--- entry (causal: dislocation alone, no score, no clock) ---
+sweep at              2026-08-22T21:21:15.897180+00:00  (21c across 3 levels, 44 contracts)
+confirmed at          2026-08-22T21:21:16.397180+00:00  (bid had moved +21c and held)
+entry fill            NO ask 0.73 at 2026-08-22T21:21:16.715715+00:00
+                      819 ms after the sweep, latency budget 0 ms
+post-entry MFE        NO bid 0.99 (+26.0c vs entry)
+
+--- candidate exits, priced on the executable NO bid ---
+rule                                 exit  hold s   upd   gross     net  capture peak give left after
+-----------------------------------------------------------------------------------------------------
+A  continuation-failure  win= 10 upd   0.73     0.4    10    0.0c   -2.8c     0.0%      1.0c      26.0c
+A  continuation-failure  win= 25 upd   0.70     0.4    25   -3.0c   -5.9c   -11.5%      4.0c      29.0c
+A  continuation-failure  win= 50 upd   0.73     3.3    51    0.0c   -2.8c     0.0%      4.0c      26.0c
+A  continuation-failure  win=100 upd   0.94    35.2   236   21.0c   19.2c    80.8%      1.0c       5.0c
+B  reversal  10% of move             0.73     3.1    45    0.0c   -2.8c     0.0%      4.0c      26.0c
+B  reversal  20% of move             0.73     3.1    45    0.0c   -2.8c     0.0%      4.0c      26.0c
+B  reversal  30% of move             0.73     3.1    45    0.0c   -2.8c     0.0%      4.0c      26.0c
+B  reversal  40% of move             0.73     3.1    45    0.0c   -2.8c     0.0%      4.0c      26.0c
+C  spread blow-out  x2               0.69     0.4    21   -4.0c   -6.9c   -15.4%      5.0c      30.0c
+C  spread blow-out  x3               0.67     0.8    28   -6.0c   -8.9c   -23.1%      7.0c      32.0c
+D  velocity regime  h=0.5s           0.68     0.8    27   -5.0c   -7.9c   -19.2%      6.0c      31.0c
+D  velocity regime  h=1.0s           0.73     2.9    38    0.0c   -2.8c     0.0%      4.0c      26.0c
+D  velocity regime  h=2.0s           0.90    12.8    84   17.0c   15.0c    65.4%      0.0c       9.0c
+E  plateau   25 upd no new high      0.92    85.8   397   19.0c   17.1c    73.1%      5.0c       7.0c
+E  plateau   50 upd no new high      0.93    99.0   422   20.0c   18.2c    76.9%      4.0c       6.0c
+E  plateau  100 upd no new high      0.93   119.3   472   20.0c   18.2c    76.9%      4.0c       6.0c
+E  plateau  200 upd no new high      0.95   161.4   572   22.0c   20.3c    84.6%      2.0c       4.0c
+T  fixed   1s (diagnostic)           0.73     1.5    35    0.0c   -2.8c     0.0%      1.0c      26.0c
+T  fixed   2s (diagnostic)           0.77     2.9    36    4.0c    1.4c    15.4%      0.0c      22.0c
+T  fixed   5s (diagnostic)           0.81     5.2    54    8.0c    5.5c    30.8%      0.0c      18.0c
+T  fixed  10s (diagnostic)           0.90    10.2    74   17.0c   15.0c    65.4%      0.0c       9.0c
+T  fixed  20s (diagnostic)           0.94    20.1   135   21.0c   19.2c    80.8%      0.0c       5.0c
+T  fixed  30s (diagnostic)           0.95    30.0   209   22.0c   20.3c    84.6%      0.0c       4.0c
+T  fixed  60s (diagnostic)           0.96    60.1   305   23.0c   21.3c    88.5%      0.0c       3.0c
+T  fixed 120s (diagnostic)           0.93   121.2   473   20.0c   18.2c    76.9%      4.0c       6.0c
+R  hold to end of tape (ref)         0.99   408.9   807   26.0c   24.6c   100.0%      0.0c       0.0c
+
+--- what the confirmation delay costs ---
+  confirm          detect  entry ask  MFE after  false onsets
+       0ms   no confirmed onset
+     150ms    21:21:16.252       0.73      26.0c            50
+     500ms    21:21:16.397       0.73      26.0c            20
+    1000ms    21:21:16.897       0.75      24.0c            20
+
+wrote docs/evidence/repricing-pilot/2026-09-19/result.json

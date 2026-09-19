@@ -1,0 +1,25 @@
+{"ts": 1789797753.4041579, "label": "show_tables", "status": 403, "rows": 0, "secs": 2.26, "sql": "SHOW TABLES FROM prediction_markets"}
+{"ts": 1789797910.6419723, "label": "auth_probe_event", "status": 200, "n": 1, "secs": 0.7, "url": "https://api.pmxt.dev/api/kalshi/fetchEvent?eventId=KXLALIGAGAME-26AUG22ESPRMA"}
+{"ts": 1789797941.7278147, "label": "l2_feas_kalshi", "status": 502, "n": 0, "secs": 6.95, "url": "https://api.pmxt.dev/api/kalshi/fetchOrderBook"}
+{"ts": 1789797967.069995, "label": "v1_uuid_outcome", "status": 502, "n": 0, "secs": 6.65, "url": "https://api.pmxt.dev/api/kalshi/fetchOrderBook"}
+{"ts": 1789797973.391834, "label": "v2_ticker_since_only", "status": 502, "n": 0, "secs": 6.32, "url": "https://api.pmxt.dev/api/kalshi/fetchOrderBook"}
+{"ts": 1789797979.886649, "label": "v3_uuid_since_only", "status": 502, "n": 0, "secs": 6.49, "url": "https://api.pmxt.dev/api/kalshi/fetchOrderBook"}
+{"ts": 1789798007.0179195, "label": "l2_poly_docexample", "status": 400, "n": 0, "secs": 15.07, "url": "https://api.pmxt.dev/api/polymarket/fetchOrderBook"}
+{"ts": 1789798045.4273672, "label": "search_draw", "status": 200, "n": 50, "secs": 0.79, "url": "https://api.pmxt.dev/v0/markets?query=draw&exchange=polymarket&closed=true&limit=50"}
+{"ts": 1789798073.1304803, "label": "search_wcgame", "status": 200, "n": 100, "secs": 6.3, "url": "https://api.pmxt.dev/v0/events?query=KXWCGAME&closed=true&limit=100"}
+{"ts": 1789798099.1930149, "label": "search_wcgame2", "status": 200, "n": 200, "secs": 5.53, "url": "https://api.pmxt.dev/v0/events?query=KXWCGAME&closed=true&limit=200"}
+{"ts": 1789798129.922255, "label": "ohlcv_test", "status": 404, "n": 0, "secs": 0.67, "url": "https://api.pmxt.dev/api/kalshi/fetchOHLCV?outcomeId=KXWCGAME-26JUN25TURUSA-TIE&resolution=1m&since=1782388800000&limit=1000"}
+{"ts": 1789798146.1662054, "label": "trades_probe", "status": 200, "n": 0, "secs": 0.56, "url": "https://api.pmxt.dev/api/kalshi/fetchTrades?outcomeId=KXWCGAME-26JUN25TURUSA-TIE&limit=5"}
+{"ts": 1789798152.4686794, "label": "l2_probe_wc", "status": 502, "n": 0, "secs": 6.3, "url": "https://api.pmxt.dev/api/kalshi/fetchOrderBook"}
+{"ts": 1789798171.4950738, "label": "srch_epl", "status": 200, "n": 200, "secs": 2.19, "url": "https://api.pmxt.dev/v0/events?query=epl&closed=true&limit=200"}
+{"ts": 1789798173.2911813, "label": "srch_la-liga", "status": 200, "n": 200, "secs": 1.8, "url": "https://api.pmxt.dev/v0/events?query=la-liga&closed=true&limit=200"}
+{"ts": 1789798177.8510826, "label": "srch_champions-league", "status": 200, "n": 200, "secs": 4.55, "url": "https://api.pmxt.dev/v0/events?query=champions-league&closed=true&limit=200"}
+{"ts": 1789798201.3923578, "label": "poly_trades_probe", "status": 200, "n": 10, "secs": 1.24, "url": "https://api.pmxt.dev/api/polymarket/fetchTrades?outcomeId=45105978043736940399020460688923720821814878879331783138334562105702459648812&limit=10"}
+{"ts": 1789798207.6973968, "label": "poly_l2_probe", "status": 502, "n": 0, "secs": 6.3, "url": "https://api.pmxt.dev/api/polymarket/fetchOrderBook"}
+{"ts": 1789798233.4292812, "label": "find_active", "status": 200, "n": 5, "secs": 0.72, "url": "https://api.pmxt.dev/v0/markets?query=bitcoin&limit=5"}
+{"ts": 1789798254.8543723, "label": "poly_trades_window", "status": 200, "n": 1000, "secs": 1.16, "url": "https://api.pmxt.dev/api/polymarket/fetchTrades?outcomeId=45105978043736940399020460688923720821814878879331783138334562105702459648812&start=2026-06-14T00%3A00%3A00Z&end=2026-06-15T06%3A00%3A00Z&limit=1000"}
+{"ts": 1789798276.5772736, "label": "poly_l2_live", "status": 404, "n": 0, "secs": 0.67, "url": "https://api.pmxt.dev/api/polymarket/fetchOrderBook?outcomeId=45105978043736940399020460688923720821814878879331783138334562105702459648812"}
+{"ts": 1789798277.1570153, "label": "poly_l2_get_range", "status": 502, "n": 0, "secs": 0.58, "url": "https://api.pmxt.dev/api/polymarket/fetchOrderBook?outcomeId=45105978043736940399020460688923720821814878879331783138334562105702459648812&since=1781463600000&until=1781463900000&limit=5"}
+{"ts": 1789798283.5613587, "label": "poly_l2_cond_range", "status": 502, "n": 0, "secs": 6.4, "url": "https://api.pmxt.dev/api/polymarket/fetchOrderBook"}
+{"ts": 1789798284.0976822, "label": "poly_ohlcv", "status": 200, "n": 0, "secs": 0.54, "url": "https://api.pmxt.dev/api/polymarket/fetchOHLCV?outcomeId=45105978043736940399020460688923720821814878879331783138334562105702459648812&resolution=1m&limit=50"}
+{"ts": 1789798298.5349503, "label": "find_live_mkt", "status": 200, "n": 50, "secs": 0.72, "url": "https://api.pmxt.dev/v0/markets?exchange=polymarket&closed=false&limit=50"}
