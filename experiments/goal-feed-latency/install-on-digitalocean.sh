@@ -21,7 +21,7 @@ curl --fail --silent --show-error --location --retry 3 \
 node --check "$APP/push-observer.mjs"
 chmod 0644 "$APP/push-observer.mjs"
 if ! id -u barcaobserver >/dev/null 2>&1; then
-  useradd --system --no-create-home --shell /usr/sbin/nologin barcaobserver
+  useradd --system --user-group --no-create-home --shell /usr/sbin/nologin barcaobserver
 fi
 if [[ ! -f /etc/barca-goal-latency.env ]]; then
   echo "Enter the Sportradar API key (input hidden; never committed or logged):"
