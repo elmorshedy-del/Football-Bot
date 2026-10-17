@@ -231,6 +231,8 @@ def recommendation_blockers(meta, train, test, min_precision=.9, min_recall=.8):
         "feature_capture_complete": "feature_capture_incomplete",
     }
     reasons = [reason for field, reason in flags.items() if meta.get(field) is not True]
+    if meta.get("certified_control_market_minutes", 0) < 60:
+        reasons.append("fewer_than_60_certified_control_market_minutes")
     if meta.get("synthetic") is True:
         reasons.append("synthetic_data_only")
     if train.get("truth_matches", 0) < 20:
@@ -322,6 +324,42 @@ def validate_dataset(data):
             raise ValueError("Invalid coverage interval")
 
 
+def certified_control_minutes(coverage, truths):
+    """Union certified coverage per market; subtract target-association windows."""
+    intervals = defaultdict(list)
+    holes = defaultdict(list)
+    for c in coverage:
+        if c.get("negative_labels_complete") is True:
+            intervals[c["market"]].append((c["start_ts"], c["end_ts"]))
+    for t in truths:
+        holes[t["market"]].append((t["start_ts"], t["end_ts"]))
+    def union(xs):
+        merged = []
+        for start, end in sorted(xs):
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+            else:
+                merged.append((start, end))
+        return merged
+    seconds = 0.
+    for market, xs in intervals.items():
+        for start, end in union(xs):
+            remaining = [(start, end)]
+            for lo, hi in union(holes[market]):
+                pieces = []
+                for a, b in remaining:
+                    if hi <= a or lo >= b:
+                        pieces.append((a, b))
+                    else:
+                        if a < lo:
+                            pieces.append((a, lo))
+                        if hi < b:
+                            pieces.append((hi, b))
+                remaining = pieces
+            seconds += sum(b-a for a,b in remaining)
+    return seconds/60
+
+
 def run_search(data, grid, min_precision=.9, min_recall=.8, holdout_fraction=.3,
                cooldown_s=120, min_levels=5, min_size=200):
     validate_dataset(data)
@@ -346,6 +384,7 @@ def run_search(data, grid, min_precision=.9, min_recall=.8, holdout_fraction=.3,
         test = score_alerts(alerts, holdout["truths"], holdout["coverage"])
         test["cluster_intervals"] = cluster_intervals(test)
     meta = dict(data["metadata"])
+    meta["certified_control_market_minutes"] = certified_control_minutes(data["coverage"], data["truths"])
     if any(f.get("eligible") is None for f in data["features"]):
         meta["clock_coverage_complete"] = False
     reasons = recommendation_blockers(meta, chosen or {}, test, min_precision, min_recall)
@@ -353,7 +392,7 @@ def run_search(data, grid, min_precision=.9, min_recall=.8, holdout_fraction=.3,
         reasons.append("no_training_threshold_meets_quality_targets")
     recommended = frozen["threshold"] if frozen and not reasons else None
     return dict(recommended_threshold=recommended, frozen_training_candidate=frozen,
-                holdout_metrics=test, blockers=reasons, training_grid=rows,
+                holdout_metrics=test, blockers=reasons, data_coverage=meta, training_grid=rows,
                 training_frontier=pareto_frontier(rows),
                 split=dict(training_groups=sorted(train_groups), holdout_groups=sorted(test_groups)),
                 policy=dict(min_precision=min_precision, min_recall=min_recall,

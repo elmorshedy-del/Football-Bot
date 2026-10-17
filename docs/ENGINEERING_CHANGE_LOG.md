@@ -8,6 +8,40 @@ entries; correct them with a dated follow-up entry instead.
 
 ---
 
+## 2026-10-17
+
+**Branch:** `codex/log-threshold-optimizer-20261017`.
+**Base commit:** `1132c4b92ff1ede89a8e4a4275866b93ca265208`.
+**Commits:** red tests `9d844a7` / `1a52306`; offline implementation `cbe7193`; this validation refinement.
+**Diff scope:** additive research scripts, focused tests and read-only CI; no application or production-default changes.
+**Suite:** baseline 639 pre-existing tests pass; 15 expected new failures in run `38996859608`; first implementation's 17 focused tests pass in run `38997083907`. Expanded final validation pending.
+**Deployment:** none; branch remains an unmerged draft.
+
+### CHG-2026-10-17-001 — Add a causal offline search for log-move thresholds
+
+**Commit:** `cbe7193` and this validation refinement.
+**Components:** `research/threshold_optimizer.py`, `research/prepare_threshold_data.py`, `research/THRESHOLD_OPTIMIZER.md`, `tests/test_threshold_optimizer.py`, `.github/workflows/threshold-research.yml`.
+
+**Observed / original behaviour.** A selected-shock replay establishes detection on examples but cannot select a threshold by false/correct signal burden. The retained independent audit has 98 leg cases with 42 complete price windows and a feature capture floor of 0.2.
+
+**Root cause.** Detection examples and the observer-limited case cache do not provide complete ordinary-period negatives or a training/holdout selection mechanism.
+
+**Why necessary.** A lower threshold may alert earlier yet preempt a real shock during lockout. Silence can also look falsely precise if missed moves are omitted.
+
+**Exact change.** Add an offline grid replay with fixed remaining detector settings, whole-match/day chronological separation, one-to-one move matching, unknown/duplicate accounting, missed-move delay penalties, a Pareto frontier, training-only selection and a single frozen held-out evaluation. Resample match clusters for descriptive uncertainty. Refuse recommendations when ordinary periods, negative labels, clocks, support or held-out quality are insufficient. Count unioned certified ordinary market-time rather than duplicate coverage rows. Raw recorder JSONL can reconstruct features below the cache floor; as-of clock stamps preserve 90+ eligibility until final.
+
+**Before / after.** Before, only particular proposed thresholds were screened. After, a reproducible training grid exposes early/clean/missed-move trade-offs; partial cached windows can generate diagnostics but cannot produce a certified threshold.
+
+**Reasoning and trade-offs.** Default quality targets are configurable 90% precision and 80% recall, then earliest missed-move-penalized delay; these are explicit policy choices. No global optimum, causal goal timestamp or profitability claim is made.
+
+**Validation.** Test-first red baseline and focused green run cited above. Expanded tests exercise the CLI, cached-data adapter, future clock rejection, coverage unions, raw causality, independent volume, same-match splitting, false-alarm preemption, missing labels and holdout isolation. Final full-suite result is recorded in the draft PR.
+
+**Risks / limitations.** Current cache is truncated to features >=0.2 and centered on known events; normal-period negative labels and clock coverage are incomplete. Local execution workspace stopped responding, so validation moved to GitHub CI. No private dataset or credentials are committed; the adapter has synthetic fixtures only. This is a detector study, not a live strategy or execution optimizer.
+
+**Follow-up.** Run the completed search on an audited full late-match dataset; retain recommendation blockers until coverage is established. No merge or deployment is implied.
+
+---
+
 ## 2026-09-06
 
 **Branch:** `claude/football-bot-analysis-rxz1vz`

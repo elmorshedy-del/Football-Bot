@@ -118,6 +118,105 @@ class ThresholdOptimizerTests(unittest.TestCase):
         self.assertIn("continuous_ordinary_periods_incomplete",reasons)
         self.assertIn("negative_labels_incomplete",reasons)
 
+    def test_future_clock_cannot_qualify_a_past_alert(self):
+        stamps=[dict(id=1,group="G",observed_ts=100,minute=90,added_time=8,period=2,status="live")]
+        r=list(opt.attach_clocks([alert(99),alert(101)],stamps))
+        self.assertEqual([x["eligible"] for x in r],[False,True])
+
+    def test_control_exposure_is_union_not_duplicate_rows(self):
+        cs=coverage()+[dict(coverage()[0],start_ts=500,end_ts=1500)]
+        self.assertAlmostEqual(opt.certified_control_minutes(cs,[truth()]),(1500-31)/60)
+
+    def test_raw_nonfinite_values_are_rejected(self):
+        raw=[dict(market="G-A",group="G",exchange_ts=1,received_ts=1,
+                  yes_price_c=float("nan"),size=1,taker_side="yes")]
+        with self.assertRaises(ValueError):
+            list(opt.trade_features(raw))
+
+    @staticmethod
+    def dataset():
+        groups=[];fs=[];ts=[];cs=[]
+        for i in range(4):
+            group="match-"+str(i);base=i*86400;market=group+"-A"
+            groups.append(dict(id=group,start_ts=base))
+            fs.extend([alert(base+50,log=.3,market=market,group=group,eligible=True),
+                       alert(base+100,log=.8,market=market,group=group,eligible=True)])
+            ts.append(truth(base+100,market=market,group=group,ident=group))
+            cs.append(dict(start_ts=base,end_ts=base+1000,market=market,group=group,
+                           negative_labels_complete=True))
+        return dict(metadata=dict(feature_floor_log=0,synthetic=True),
+                    groups=groups,features=fs,truths=ts,coverage=cs)
+
+    def test_holdout_results_cannot_reselect_training_choice(self):
+        data=self.dataset()
+        first=opt.run_search(data,[.2,.5,.8])
+        self.assertEqual(first["frozen_training_candidate"]["threshold"],.5)
+        held=set(first["split"]["holdout_groups"])
+        data["features"]=[f for f in data["features"] if f["group"] not in held]
+        second=opt.run_search(data,[.2,.5,.8])
+        self.assertEqual(second["frozen_training_candidate"]["threshold"],.5)
+        self.assertEqual(second["holdout_metrics"]["tp"],0)
+        self.assertIsNone(second["recommended_threshold"])
+
+    def test_command_line_writes_complete_outputs(self):
+        import contextlib
+        import io
+        import json
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);source=root/"data.json";out=root/"result"
+            source.write_text(json.dumps(self.dataset()))
+            with contextlib.redirect_stdout(io.StringIO()):
+                status=opt.main(["--input",str(source),"--out",str(out),
+                                 "--start",".2","--stop",".8","--step",".3"])
+            self.assertEqual(status,0)
+            result=json.loads((out/"result.json").read_text())
+            self.assertEqual(result["frozen_training_candidate"]["threshold"],.5)
+            self.assertNotIn("holdout_grid",result)
+            self.assertIn("synthetic_data_only",result["blockers"])
+            self.assertTrue((out/"training_grid.csv").exists())
+            self.assertTrue((out/"training_frontier.json").exists())
+
+    def test_cache_adapter_does_not_certify_negative_periods(self):
+        import csv
+        import gzip
+        import json
+        import tempfile
+        from pathlib import Path
+        from research.prepare_threshold_data import prepare
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);p=root/"football-research";p.mkdir()
+            legs=[]
+            for market,side,role in [("G-A","yes","scoring_team_yes"),("G-TIE","no","draw_no")]:
+                legs.append(dict(record_id="1",event="G",ticker=market,held_side=side,
+                    role=role,anchor_ts="100",forward_end_ts="220",
+                    price_window_complete="True",large_move="True",stable_completion="True",
+                    reversal_record_id="",baseline_bid="20",peak_bid="80"))
+            with (p/"two_leg_event_paths.csv").open("w",newline="") as f:
+                writer=csv.DictWriter(f,fieldnames=list(legs[0]));writer.writeheader();writer.writerows(legs)
+            (p/"late_candidates.json").write_text(json.dumps([
+                dict(record_id="1",score_before="0-0",score_after="1-0")]))
+            qs={}
+            for market,side in [("G-A","yes"),("G-TIE","no")]:
+                points=[]
+                for n in range(300,1301):
+                    t=n/10;held_bid=20 if t<90 else 79
+                    y=held_bid if side=="yes" else 99-held_bid
+                    points.append(dict(time=t,exchange_age_ms=0,yes_bid=y,yes_ask=y+1,
+                        no_bid=99-y,no_ask=100-y,yes_bid_size=1000,yes_ask_size=1000,
+                        no_bid_size=1000,no_ask_size=1000))
+                qs[market]=points
+            cs={market:[dict(time=90.1,exchange_time=90,dl=.6,levels=5,volume=250,
+                            direction=1 if side=="yes" else -1)]
+                for market,side in [("G-A","yes"),("G-TIE","no")]}
+            with gzip.open(p/"two_leg_replay_cache.json.gz","wt") as f:
+                json.dump(dict(quotes=qs,candidates=cs),f)
+            result=prepare(root)
+            self.assertEqual(len(result["truths"]),2)
+            self.assertFalse(result["metadata"]["negative_labels_complete"])
+            self.assertTrue(all(c["negative_labels_complete"] is False for c in result["coverage"]))
+
 
 if __name__=="__main__":
     unittest.main()

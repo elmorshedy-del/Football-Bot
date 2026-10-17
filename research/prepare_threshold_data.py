@@ -98,8 +98,8 @@ def prepare(audit_root):
             coverage.append(dict(group=group,market=leg["ticker"],
                                  start_ts=anchor-45,
                                  end_ts=min(anchor+30,float(leg["forward_end_ts"])),
-                                 negative_labels_complete=True,
-                                 basis="complete case lacks a stable >=15c completed move"))
+                                 negative_labels_complete=False,
+                                 basis="non-large complete case; absence of other target moves is uncertified"))
         else:
             excluded.append(dict(record_id=leg["record_id"],market=leg["ticker"],
                                  reason="incomplete_price_window"))
