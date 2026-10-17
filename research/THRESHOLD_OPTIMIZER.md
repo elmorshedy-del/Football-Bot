@@ -3,6 +3,26 @@
 The tool searches for **early detection with few false alerts per correct alert**.
 It does not assume 0.5 is optimal, and it does not tune production or place trades.
 
+## Original detector baseline
+
+The original `DL_MIN` default is **0.8 log-odds**, from `app/config.py` at main
+`1132c4b`. The proposed 0.5 uses the same logit formula and burst/reference
+definition. These are displacement thresholds, not cent-denominated entry gates.
+Both are always included, even with a custom grid. `baseline_comparison` reports
+each prespecified baseline on training and held-out matches. Holdout results never
+select the winner. These are independent-leg, ungated log comparators: sibling
+confirmation, triplet/sleeve classification and entry-price gates are not applied.
+They do not reproduce the full deployed strategy.
+
+Raw extraction matches the original detector's already-received tape semantics,
+including late exchange timestamps. The alert cooldown remains the documented
+research policy rather than the original engine's complete admission stack.
+Cached features retain their earlier extraction semantics; they cannot establish
+exact parity for out-of-order prints without the original raw stream.
+
+The completed limited-data run is documented in
+[`THRESHOLD_SCREEN_2026-10-17.md`](THRESHOLD_SCREEN_2026-10-17.md).
+
 ## Selection rule
 
 - Keep burst=150ms, reference=150–2100ms, distinct prices>=5 and own-market volume>=200 fixed.
@@ -25,7 +45,8 @@ It does not assume 0.5 is optimal, and it does not tune production or place trad
 
 All legs from a physical match stay in the same chronological split. Whole UTC days stay
 together. The training winner is frozen before its single held-out evaluation; a holdout grid
-is intentionally not emitted. Uncertainty resamples whole matches, preserving leg dependence.
+is intentionally not emitted. Only the two prespecified baselines also receive held-out
+comparisons. Uncertainty resamples whole matches, preserving leg dependence.
 
 ## Cached independent audit: limited screening
 

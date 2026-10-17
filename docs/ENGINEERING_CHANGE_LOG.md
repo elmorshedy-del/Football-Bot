@@ -17,6 +17,29 @@ entries; correct them with a dated follow-up entry instead.
 **Suite:** baseline 639 pre-existing tests pass; 15 expected new failures in run `38996859608`; first implementation's 17 focused tests pass in run `38997083907`. Expanded final validation pending.
 **Deployment:** none; branch remains an unmerged draft.
 
+### CHG-2026-10-17-002 — Preserve the original log baseline and execute the recovered-data screen
+
+**Commit:** this follow-up to `580a85c`; exact head and full CI recorded in PR 19.
+**Components:** `research/threshold_optimizer.py`, `tests/test_threshold_optimizer.py`, `research/THRESHOLD_OPTIMIZER.md`, `research/THRESHOLD_SCREEN_2026-10-17.md`.
+
+**Observed / original behaviour.** Original main `1132c4b` uses DL_MIN=0.8. The default search already contained it but custom grids could omit it and no named comparator was reported. The execution workspace recovered, allowing the previously blocked real cached-data run.
+
+**Root cause.** Research baseline reporting was implicit. Separately, the raw feature extractor excluded already-received newer-exchange-stamped trades from an out-of-order print's burst and retained only 2.1 seconds, differing from the actual detector's prefix and retention semantics.
+
+**Why necessary.** Original detection quality must remain visible independently of sibling confirmation, sleeve classification and entry-price gates. A different feature definition must not be mistaken for the original detector.
+
+**Exact change.** Always include prespecified original 0.8 and proposed 0.5 candidates, report their training and held-out metrics without using holdout results for selection, enforce feature capture floors, and align raw extraction with original millisecond windows and 300-second head eviction. Leave cached feature provenance and operational coverage blockers explicit.
+
+**Before / after.** A custom [0.2,0.5] grid now also tests 0.8. On an out-of-order fixture, old research extraction reports displacement 0.391672 while the actual detector reports 0.539; corrected extraction agrees with the actual detector, including own-market size and levels.
+
+**Reasoning and trade-offs.** Preserve the original ungated log as a serious comparator rather than presuming lower is better. Two fixed baseline holdout comparisons are descriptive and cannot reselect the frozen training candidate. This does not replay the full production admission stack.
+
+**Validation.** Three new tests fail against the earlier implementation and all 26 focused tests pass after the change. Full local suite/static results and mandatory browser CI are recorded in PR 19. Actual cached search: 37 groups, 38,116 features, 21 reconstructible completed move legs. Original 0.8 catches 13/18 training moves with 99 unclassified alerts; 0.5 catches 14/18 with 123. Both catch 2/3 held-out moves. Actual Detector/ShadowBook replay at 0.8 catches all ten selected legs and reproduces net $1.86 for one contract per leg, the same as 0.5 under the earlier fixed execution assumptions.
+
+**Risks / limitations.** Corrects the preceding entry's unfinished-run status: the private cached-data run has now executed. It does not correct incomplete negative labels or clock coverage; recommendation remains null. Unknown alerts are not proven false. The selected ten-leg replay remains a smoke test. No production strategy, application, deployment, subscription or real order changes.
+
+**Follow-up.** Complete ordinary-period labels and verified clocks before interpreting false/correct ratios or accepting a threshold. PR remains draft and unmerged.
+
 ### CHG-2026-10-17-001 — Add a causal offline search for log-move thresholds
 
 **Commit:** `cbe7193` and this validation refinement.

@@ -17,6 +17,10 @@ from pathlib import Path
 import random
 import statistics
 
+# Prespecified comparators, never selected from holdout results. The original
+# value is the literal DL_MIN default in app/config.py at main 1132c4b.
+BASELINES = {"repository_original_log": .8, "previous_proposed_log": .5}
+
 
 def clock_eligible(stamp, now, min_minute=80, max_age_s=10):
     """Clock-only gate: never derive current minute from a scorer or goal."""
@@ -37,7 +41,6 @@ def _logit(cents):
 def trade_features(trades, min_log=0):
     """Yield prefix-only features; input order is receipt order, not sorted future tape."""
     tapes = defaultdict(deque)
-    newest = {}
     last_receipt = -math.inf
     for t in trades:
         market = t["market"]
@@ -51,14 +54,15 @@ def trade_features(trades, min_log=0):
             raise ValueError("Raw trades must be supplied in recorded receipt order")
         last_receipt = received
         tape = tapes[market]
-        tape.append((ts, price, size, t["taker_side"]))
-        newest[market] = max(ts, newest.get(market, ts))
-        # Handle late exchange timestamps without reading unreceived trades.
-        if any(x[0] < newest[market]-2.1 for x in tape):
-            tape = deque(x for x in tape if x[0] >= newest[market]-2.1)
-            tapes[market] = tape
-        burst = [x for x in tape if ts-.15 <= x[0] <= ts]
-        ref = sorted(x[1] for x in tape if ts-2.1 <= x[0] < ts-.15)
+        # Match the repository detector's millisecond windows, including its
+        # late-exchange-print semantics. Every member has already been received;
+        # a newer exchange stamp in this prefix is not future information.
+        ms = ts*1000
+        tape.append((ms, price, size, t["taker_side"]))
+        while tape and tape[0][0] < ms-300_000:
+            tape.popleft()
+        burst = [x for x in tape if x[0] >= ms-150]
+        ref = sorted(x[1] for x in tape if ms-2100 <= x[0] < ms-150)
         if not ref or not burst:
             continue
         reference = ref[len(ref)//2]
@@ -363,6 +367,7 @@ def certified_control_minutes(coverage, truths):
 def run_search(data, grid, min_precision=.9, min_recall=.8, holdout_fraction=.3,
                cooldown_s=120, min_levels=5, min_size=200):
     validate_dataset(data)
+    grid = sorted(set(grid) | set(BASELINES.values()))
     if grid and min(grid) < data["metadata"].get("feature_floor_log", 0)-1e-12:
         raise ValueError("Grid falls below feature capture floor")
     train_groups, test_groups = split_groups(data["groups"], holdout_fraction)
@@ -383,6 +388,14 @@ def run_search(data, grid, min_precision=.9, min_recall=.8, holdout_fraction=.3,
         alerts = make_alerts(holdout["features"], frozen["threshold"], min_levels, min_size, cooldown_s)
         test = score_alerts(alerts, holdout["truths"], holdout["coverage"])
         test["cluster_intervals"] = cluster_intervals(test)
+    baselines = {}
+    for name, threshold in BASELINES.items():
+        alerts = make_alerts(holdout["features"], threshold, min_levels, min_size, cooldown_s)
+        baselines[name] = dict(threshold=threshold,
+            training_metrics=next(r for r in rows if r["threshold"] == threshold),
+            holdout_metrics=score_alerts(alerts, holdout["truths"], holdout["coverage"]),
+            sibling_confirmation=False, entry_price_gates=False,
+            interpretation="Prespecified ungated log baseline; not the full deployed strategy")
     meta = dict(data["metadata"])
     meta["certified_control_market_minutes"] = certified_control_minutes(data["coverage"], data["truths"])
     if any(f.get("eligible") is None for f in data["features"]):
@@ -393,6 +406,7 @@ def run_search(data, grid, min_precision=.9, min_recall=.8, holdout_fraction=.3,
     recommended = frozen["threshold"] if frozen and not reasons else None
     return dict(recommended_threshold=recommended, frozen_training_candidate=frozen,
                 holdout_metrics=test, blockers=reasons, data_coverage=meta, training_grid=rows,
+                baseline_comparison=baselines,
                 training_frontier=pareto_frontier(rows),
                 split=dict(training_groups=sorted(train_groups), holdout_groups=sorted(test_groups)),
                 policy=dict(min_precision=min_precision, min_recall=min_recall,
@@ -424,9 +438,10 @@ def main(argv=None):
         parser.error("Cooldown cannot be negative")
     data = json.loads(args.input.read_text())
     if args.raw_trades:
+        capture_floor = min(args.start, *BASELINES.values())
         data["features"] = list(trade_features(
-            read_raw_trades(args.raw_trades, {g["id"] for g in data["groups"]}), min_log=args.start))
-        data["metadata"]["feature_floor_log"] = args.start
+            read_raw_trades(args.raw_trades, {g["id"] for g in data["groups"]}), min_log=capture_floor))
+        data["metadata"]["feature_floor_log"] = capture_floor
     if data.get("clock_observations"):
         data["features"] = list(attach_clocks(data["features"], data["clock_observations"]))
     grid = threshold_grid(args.start, args.stop, args.step,
@@ -448,7 +463,7 @@ def main(argv=None):
                           if result["frozen_training_candidate"] else None,
                           blockers=result["blockers"],
                           holdout_metrics=_compact(result["holdout_metrics"]),
-                          evaluated_thresholds=len(grid)), indent=2, allow_nan=False))
+                          evaluated_thresholds=len(result["training_grid"])), indent=2, allow_nan=False))
     return 0
 
 

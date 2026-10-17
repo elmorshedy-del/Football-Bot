@@ -20,6 +20,44 @@ def coverage(certified=True):
 
 
 class ThresholdOptimizerTests(unittest.TestCase):
+    def test_original_baseline_is_included_even_outside_custom_search(self):
+        data=self.dataset()
+        r=opt.run_search(data,[.2,.5])
+        original=r["baseline_comparison"]["repository_original_log"]
+        self.assertEqual(original["threshold"],.8)
+        self.assertEqual(original["training_metrics"]["tp"],3)
+        self.assertEqual(original["holdout_metrics"]["tp"],1)
+        self.assertFalse(original["sibling_confirmation"])
+        self.assertFalse(original["entry_price_gates"])
+        self.assertEqual({row["threshold"] for row in r["training_grid"]},{.2,.5,.8})
+
+    def test_cache_floor_cannot_silently_exclude_original_baseline(self):
+        data=self.dataset();data["metadata"]["feature_floor_log"]=.9
+        with self.assertRaises(ValueError):opt.run_search(data,[1])
+
+    def test_feature_shape_matches_actual_detector_on_late_exchange_print(self):
+        from app.detector import Detector
+        from app import config
+        from unittest.mock import patch
+        raw=[]
+        # Last received print has an older exchange stamp. Original detector
+        # includes already-received newer prints in its burst, still causal.
+        for ms,p in [(1000,20),(2900,22),(2920,24),(2940,26),(2960,28),(2980,30),(2950,27)]:
+            raw.append(dict(market="G-A",group="G",exchange_ts=ms/1000,
+                            received_ts=3+len(raw)/100,yes_price_c=p,size=100,taker_side="yes"))
+        with patch.object(config,"DL_MIN",0),patch.object(config,"LEVELS_MIN",0), \
+             patch.object(config,"SIZE_MIN",0),patch.object(config,"EPISODE_COOLDOWN_S",-1):
+            detector=Detector();actual=[]
+            for t in raw:
+                c=detector.on_trade(t["market"],round(t["exchange_ts"]*1000),
+                                    t["yes_price_c"],t["size"],t["taker_side"])
+                if c:actual.append(c)
+        fs=list(opt.trade_features(raw))
+        self.assertEqual(len(fs),len(actual))
+        for f,c in zip(fs,actual):
+            self.assertAlmostEqual(f["log_move"],c["dl"],places=3)
+            self.assertEqual((f["levels"],f["volume"]),(c["levels"],c["size"]))
+
     def test_unknown_is_not_false(self):
         r=opt.score_alerts([alert(50)], [truth()], [])
         self.assertEqual((r.get("tp"),r.get("fp"),r.get("unknown"),r.get("fn")),(0,0,1,1))
