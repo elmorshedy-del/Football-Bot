@@ -158,9 +158,13 @@ async function openPush(sourceProduct) {
   const redirect = new URL(location, url);
   if (redirect.protocol !== "https:") throw new Error("Non-HTTPS redirect refused");
   const sameHost = redirect.hostname === original.hostname;
+  const controller = new AbortController();
+  const maxLeftMs = Math.max(1000, deadline - Date.now());
+  const cutoff = setTimeout(() => controller.abort(), maxLeftMs);
+  const trusted = sameHost || redirect.hostname.endsWith(".sportradar.com");
   const stream = await fetch(redirect.toString(), {
-    headers: sameHost ? { "x-api-key": key } : {},
-    signal: AbortSignal.timeout(12000)
+    headers: trusted ? { "x-api-key": key } : {},
+    signal: controller.signal
   });
   if (!stream.ok || !stream.body) {
     log("PUSH_STREAM_HTTP", { product: sourceProduct, status: stream.status });
