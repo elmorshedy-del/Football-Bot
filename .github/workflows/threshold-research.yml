@@ -1,0 +1,25 @@
+name: threshold-research
+
+on:
+  pull_request:
+    paths:
+      - 'research/**'
+      - 'tests/test_threshold_optimizer.py'
+      - '.github/workflows/threshold-research.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  threshold-research:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Offline optimizer behavioral tests
+        run: python -X dev -W error::RuntimeWarning -m unittest discover -s tests -p test_threshold_optimizer.py -v
+      - name: Compile offline research modules
+        run: python -m compileall -q research
